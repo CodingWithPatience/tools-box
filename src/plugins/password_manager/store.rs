@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 
 use super::crypto;
-use super::models::{MasterConfig, NewPasswordEntry, PasswordEntry};
+use super::models::{ExportData, ExportEntry, MasterConfig, NewPasswordEntry, PasswordEntry};
 
 /// 密码数据库操作
 pub struct PasswordStore<'a> {
@@ -204,6 +204,45 @@ impl<'a> PasswordStore<'a> {
             .query_row("SELECT COUNT(*) FROM passwords", [], |row| row.get(0))
             .context("查询密码数量失败")?;
         Ok(count)
+    }
+
+    /// 导出所有密码条目为 JSON
+    pub fn export_entries(&self, key: &[u8; 32]) -> Result<String> {
+        let entries = self.get_all_entries(key)?;
+
+        let export_entries: Vec<ExportEntry> = entries
+            .iter()
+            .map(ExportEntry::from_password_entry)
+            .collect();
+
+        let export_data = ExportData {
+            version: "1.0".to_string(),
+            exported_at: chrono::Local::now().to_rfc3339(),
+            entries: export_entries,
+        };
+
+        serde_json::to_string_pretty(&export_data)
+            .context("序列化导出数据失败")
+    }
+
+    /// 从 JSON 导入密码条目
+    pub fn import_entries(&self, json: &str, key: &[u8; 32]) -> Result<usize> {
+        let export_data: ExportData =
+            serde_json::from_str(json).context("解析导入数据失败")?;
+
+        // 版本检查
+        if export_data.version != "1.0" {
+            anyhow::bail!("不支持的导出数据版本: {}", export_data.version);
+        }
+
+        let mut imported = 0;
+        for entry in &export_data.entries {
+            let new_entry = entry.to_new_entry();
+            self.add_entry(&new_entry, key)?;
+            imported += 1;
+        }
+
+        Ok(imported)
     }
 }
 

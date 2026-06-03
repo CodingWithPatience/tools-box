@@ -1,3 +1,5 @@
+use serde::{Deserialize, Serialize};
+
 /// 密码条目（解密后的视图）
 #[derive(Debug, Clone)]
 pub struct PasswordEntry {
@@ -26,6 +28,46 @@ pub struct NewPasswordEntry {
 pub struct MasterConfig {
     pub salt: Vec<u8>,
     pub verify_hash: Vec<u8>,
+}
+
+/// 导出数据格式
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ExportData {
+    pub version: String,
+    pub exported_at: String,
+    pub entries: Vec<ExportEntry>,
+}
+
+/// 导出的单条密码条目
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ExportEntry {
+    pub website: String,
+    pub url: Option<String>,
+    pub username: String,
+    pub password: String,
+    pub notes: Option<String>,
+}
+
+impl ExportEntry {
+    pub fn from_password_entry(entry: &PasswordEntry) -> Self {
+        Self {
+            website: entry.website.clone(),
+            url: entry.url.clone(),
+            username: entry.username.clone(),
+            password: entry.password.clone(),
+            notes: entry.notes.clone(),
+        }
+    }
+
+    pub fn to_new_entry(&self) -> NewPasswordEntry {
+        NewPasswordEntry {
+            website: self.website.clone(),
+            url: self.url.clone(),
+            username: self.username.clone(),
+            password: self.password.clone(),
+            notes: self.notes.clone(),
+        }
+    }
 }
 
 /// 密码编辑表单状态

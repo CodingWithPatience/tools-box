@@ -281,6 +281,17 @@ impl PasswordManagerUi {
 
             ui.separator();
 
+            // 导出/导入按钮
+            if ui.button("📤 导出").clicked() {
+                self.export_data(conn);
+            }
+
+            if ui.button("📥 导入").clicked() {
+                self.import_data(conn);
+            }
+
+            ui.separator();
+
             ui.label("🔍");
             let response = ui.add_sized(
                 [150.0, 24.0],
@@ -690,6 +701,65 @@ impl PasswordManagerUi {
 
         ui.add_space(8.0);
         self.render_messages(ui);
+    }
+
+    /// 导出密码数据
+    fn export_data(&mut self, conn: &Connection) {
+        self.clear_messages();
+
+        if let Some(key) = &self.derived_key {
+            let store = PasswordStore::new(conn);
+            match store.export_entries(key) {
+                Ok(json) => {
+                    // 复制到剪贴板
+                    self.copy_to_clipboard(&json);
+                    self.set_success(format!(
+                        "已导出 {} 条记录到剪贴板（JSON 格式）",
+                        self.entries.len()
+                    ));
+                    log::info!("密码数据已导出到剪贴板");
+                }
+                Err(e) => {
+                    self.set_error(format!("导出失败: {}", e));
+                }
+            }
+        }
+    }
+
+    /// 导入密码数据
+    fn import_data(&mut self, conn: &Connection) {
+        self.clear_messages();
+
+        // 从剪贴板读取
+        match arboard::Clipboard::new() {
+            Ok(mut clipboard) => match clipboard.get_text() {
+                Ok(text) => {
+                    if text.is_empty() {
+                        self.set_error("剪贴板为空".to_string());
+                        return;
+                    }
+
+                    if let Some(key) = &self.derived_key {
+                        let store = PasswordStore::new(conn);
+                        match store.import_entries(&text, key) {
+                            Ok(count) => {
+                                self.set_success(format!("成功导入 {} 条记录", count));
+                                self.load_entries(conn);
+                            }
+                            Err(e) => {
+                                self.set_error(format!("导入失败: {}", e));
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    self.set_error(format!("读取剪贴板失败: {}", e));
+                }
+            },
+            Err(e) => {
+                self.set_error(format!("无法访问剪贴板: {}", e));
+            }
+        }
     }
 
     /// 复制到剪贴板

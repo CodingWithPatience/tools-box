@@ -3,6 +3,54 @@ use crate::plugins;
 use crate::storage::Database;
 use egui::FontFamily;
 
+/// 默认字体大小
+const DEFAULT_FONT_SIZE: f32 = 14.0;
+/// 最小字体大小
+const MIN_FONT_SIZE: f32 = 10.0;
+/// 最大字体大小
+const MAX_FONT_SIZE: f32 = 24.0;
+/// 字体大小步长
+const FONT_SIZE_STEP: f32 = 1.0;
+
+/// 主题模式
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Theme {
+    Light,
+    Dark,
+}
+
+impl Theme {
+    /// 切换主题
+    pub fn toggle(&self) -> Self {
+        match self {
+            Theme::Light => Theme::Dark,
+            Theme::Dark => Theme::Light,
+        }
+    }
+
+    /// 获取主题图标
+    pub fn icon(&self) -> &str {
+        match self {
+            Theme::Light => "🌙",
+            Theme::Dark => "☀️",
+        }
+    }
+
+    /// 获取主题名称
+    pub fn name(&self) -> &str {
+        match self {
+            Theme::Light => "亮色",
+            Theme::Dark => "暗色",
+        }
+    }
+}
+
+impl Default for Theme {
+    fn default() -> Self {
+        Theme::Dark
+    }
+}
+
 /// 主应用状态
 pub struct App {
     /// 已注册的插件列表
@@ -15,6 +63,18 @@ pub struct App {
     _db: Database,
     /// 状态栏消息
     status_message: String,
+    /// 当前主题
+    theme: Theme,
+    /// 是否聚焦搜索框
+    focus_search: bool,
+    /// 字体大小
+    font_size: f32,
+    /// 是否已应用字体设置
+    font_applied: bool,
+    /// 侧边栏宽度（手动管理，防止自动扩展）
+    sidebar_width: f32,
+    /// 是否正在拖拽侧边栏
+    dragging_sidebar: bool,
 }
 
 /// 配置中文字体
@@ -74,6 +134,12 @@ impl App {
             search_query: String::new(),
             _db: db,
             status_message: "就绪".to_string(),
+            theme: Theme::default(),
+            focus_search: false,
+            font_size: DEFAULT_FONT_SIZE,
+            font_applied: false,
+            sidebar_width: 200.0,  // 默认侧边栏宽度
+            dragging_sidebar: false,
         }
     }
 
@@ -81,22 +147,135 @@ impl App {
     fn render_top_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.heading("🛠 Tools Box");
+
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // 主题切换按钮
+                let theme_btn = ui.button(format!("{} {}", self.theme.icon(), self.theme.name()));
+                if theme_btn.clicked() {
+                    self.toggle_theme(ui.ctx());
+                }
+                theme_btn.on_hover_text("切换主题");
+
+                ui.separator();
+
+                // 字体大小调节
+                ui.horizontal(|ui| {
+                    if ui.small_button("A-").clicked() && self.font_size > MIN_FONT_SIZE {
+                        self.font_size -= FONT_SIZE_STEP;
+                        self.apply_font_size(ui.ctx());
+                    }
+
+                    ui.label(format!("字体: {:.0}", self.font_size));
+
+                    if ui.small_button("A+").clicked() && self.font_size < MAX_FONT_SIZE {
+                        self.font_size += FONT_SIZE_STEP;
+                        self.apply_font_size(ui.ctx());
+                    }
+                });
+
+                ui.separator();
+
+                // 状态消息
                 ui.label(&self.status_message);
             });
         });
         ui.separator();
     }
 
+    /// 应用字体大小设置
+    fn apply_font_size(&self, ctx: &egui::Context) {
+        let mut style = (*ctx.style()).clone();
+        style.text_styles = [
+            (egui::TextStyle::Body, egui::FontId::new(self.font_size, FontFamily::Proportional)),
+            (egui::TextStyle::Button, egui::FontId::new(self.font_size, FontFamily::Proportional)),
+            (egui::TextStyle::Small, egui::FontId::new(self.font_size - 2.0, FontFamily::Proportional)),
+            (egui::TextStyle::Heading, egui::FontId::new(self.font_size + 4.0, FontFamily::Proportional)),
+            (egui::TextStyle::Monospace, egui::FontId::new(self.font_size, FontFamily::Monospace)),
+        ]
+        .into();
+        ctx.set_style(style);
+        log::info!("字体大小已设置为: {}", self.font_size);
+    }
+
+    /// 切换主题
+    fn toggle_theme(&mut self, ctx: &egui::Context) {
+        self.theme = self.theme.toggle();
+        match self.theme {
+            Theme::Light => ctx.set_visuals(egui::Visuals::light()),
+            Theme::Dark => ctx.set_visuals(egui::Visuals::dark()),
+        }
+        self.status_message = format!("已切换到{}主题", self.theme.name());
+    }
+
+    /// 处理快捷键
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        ctx.input(|i| {
+            // Ctrl+数字 切换插件 (1-9)
+            let num_keys = [
+                egui::Key::Num1,
+                egui::Key::Num2,
+                egui::Key::Num3,
+                egui::Key::Num4,
+                egui::Key::Num5,
+                egui::Key::Num6,
+                egui::Key::Num7,
+                egui::Key::Num8,
+                egui::Key::Num9,
+            ];
+
+            for (idx, key) in num_keys.iter().enumerate() {
+                if i.key_pressed(*key) && i.modifiers.ctrl {
+                    if idx < self.plugins.len() {
+                        self.selected = idx;
+                        self.status_message = format!("已切换到: {}", self.plugins[idx].name());
+                    }
+                }
+            }
+
+            // Ctrl+F 聚焦搜索框
+            if i.key_pressed(egui::Key::F) && i.modifiers.ctrl {
+                self.focus_search = true;
+            }
+
+            // Escape 清空搜索
+            if i.key_pressed(egui::Key::Escape) {
+                if !self.search_query.is_empty() {
+                    self.search_query.clear();
+                    self.status_message = "已清空搜索".to_string();
+                }
+            }
+        });
+    }
+
     /// 渲染左侧边栏
     fn render_sidebar(&mut self, ui: &mut egui::Ui) {
-        // 搜索框
+        // 搜索框 - 使用固定宽度，防止自动扩展
         ui.horizontal(|ui| {
             ui.label("🔍");
-            ui.text_edit_singleline(&mut self.search_query);
+
+            // 使用固定的搜索框宽度，基于侧边栏宽度
+            let search_width = self.sidebar_width - 50.0; // 减去图标和清空按钮的空间
+            let response = ui.add_sized(
+                [search_width, ui.spacing().interact_size.y],
+                egui::TextEdit::singleline(&mut self.search_query)
+                    .hint_text("搜索插件... (Ctrl+F)"),
+            );
+
+            // 自动聚焦搜索框
+            if self.focus_search {
+                response.request_focus();
+                self.focus_search = false;
+            }
+
+            // 清空按钮
+            if !self.search_query.is_empty() {
+                if ui.button("✕").clicked() {
+                    self.search_query.clear();
+                }
+            }
         });
 
-        ui.add_space(8.0);
+        ui.add_space(4.0);
 
         // 过滤后的插件索引列表
         let query = self.search_query.to_lowercase();
@@ -112,31 +291,58 @@ impl App {
             .map(|(i, _)| i)
             .collect();
 
+        // 搜索结果提示
+        if !self.search_query.is_empty() {
+            ui.horizontal(|ui| {
+                ui.weak(format!(
+                    "找到 {} 个插件",
+                    filtered.len()
+                ));
+            });
+            ui.add_space(4.0);
+        }
+
         // 插件列表
         egui::ScrollArea::vertical()
             .id_salt("sidebar_plugin_list")
             .show(ui, |ui| {
-            for &idx in &filtered {
-                let plugin = &self.plugins[idx];
-                let is_selected = self.selected == idx;
+                for (list_idx, &idx) in filtered.iter().enumerate() {
+                    let plugin = &self.plugins[idx];
+                    let is_selected = self.selected == idx;
 
-                let text = format!("{} {}", plugin.icon(), plugin.name());
+                    // 显示快捷键提示
+                    let shortcut = if list_idx < 9 {
+                        format!("Ctrl+{}", list_idx + 1)
+                    } else {
+                        String::new()
+                    };
 
-                let response = ui.add_sized(
-                    [ui.available_width(), 36.0],
-                    egui::SelectableLabel::new(is_selected, text),
-                );
+                    let text = if shortcut.is_empty() {
+                        format!("{} {}", plugin.icon(), plugin.name())
+                    } else {
+                        format!("{} {} [{}]", plugin.icon(), plugin.name(), shortcut)
+                    };
 
-                if response.clicked() {
-                    self.selected = idx;
+                    let response = ui.add_sized(
+                        [ui.available_width(), 36.0],
+                        egui::SelectableLabel::new(is_selected, text),
+                    );
+
+                    if response.clicked() {
+                        self.selected = idx;
+                    }
+
+                    // 鼠标悬停时显示描述
+                    if response.hovered() {
+                        let hover_text = if shortcut.is_empty() {
+                            plugin.description().to_string()
+                        } else {
+                            format!("{}\n快捷键: {}", plugin.description(), shortcut)
+                        };
+                        response.on_hover_text(hover_text);
+                    }
                 }
-
-                // 鼠标悬停时显示描述
-                if response.hovered() {
-                    response.on_hover_text(plugin.description());
-                }
-            }
-        });
+            });
     }
 
     /// 渲染右侧插件内容区
@@ -160,6 +366,15 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 首次运行时应用字体大小
+        if !self.font_applied {
+            self.apply_font_size(ctx);
+            self.font_applied = true;
+        }
+
+        // 处理快捷键
+        self.handle_shortcuts(ctx);
+
         // 顶部面板
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             self.render_top_bar(ui);
@@ -169,20 +384,51 @@ impl eframe::App for App {
         egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(format!(
-                    "就绪 | 已注册插件: {}",
+                    "就绪 | 已注册插件: {} | Ctrl+F 搜索 | Ctrl+1-9 切换 | Esc 清空",
                     self.plugins.len()
                 ));
             });
         });
 
-        // 左侧边栏
+        // 左侧边栏 - 使用 exact_width 固定宽度，完全禁用自动调整
         egui::SidePanel::left("sidebar")
-            .resizable(true)
-            .default_width(200.0)
-            .min_width(150.0)
+            .exact_width(self.sidebar_width)
             .show(ctx, |ui| {
                 self.render_sidebar(ui);
             });
+
+        // 侧边栏右侧的拖拽条 - 手动处理宽度调整
+        let sidebar_rect = ctx.screen_rect();
+        let drag_bar_rect = egui::Rect::from_min_max(
+            egui::pos2(self.sidebar_width, sidebar_rect.min.y),
+            egui::pos2(self.sidebar_width + 4.0, sidebar_rect.max.y),
+        );
+
+        let drag_response = ctx.input(|i| {
+            if i.pointer.any_pressed() {
+                let pointer_pos = i.pointer.latest_pos().unwrap_or_default();
+                if drag_bar_rect.contains(pointer_pos) {
+                    return Some(pointer_pos);
+                }
+            }
+            None
+        });
+
+        if let Some(_pos) = drag_response {
+            // 开始拖拽
+            self.dragging_sidebar = true;
+        }
+
+        if self.dragging_sidebar {
+            ctx.input(|i| {
+                if let Some(pointer_pos) = i.pointer.latest_pos() {
+                    self.sidebar_width = pointer_pos.x.clamp(150.0, 400.0);
+                }
+                if i.pointer.any_released() {
+                    self.dragging_sidebar = false;
+                }
+            });
+        }
 
         // 中央内容区
         egui::CentralPanel::default().show(ctx, |ui| {
