@@ -1,3 +1,4 @@
+pub mod diff_viewer;
 pub mod hosts_manager;
 pub mod json_editor;
 pub mod password_manager;
@@ -12,6 +13,7 @@ pub fn register_all_plugins() -> Vec<Box<dyn Plugin>> {
         Box::new(password_manager::PasswordManagerPlugin::new()),
         Box::new(json_editor::JsonEditorPlugin::new()),
         Box::new(hosts_manager::HostsManagerPlugin::new()),
+        Box::new(diff_viewer::DiffViewerPlugin::new()),
     ];
 
     log::info!("已注册 {} 个插件", plugins.len());
