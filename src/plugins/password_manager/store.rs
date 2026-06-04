@@ -2,7 +2,9 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 
 use super::crypto;
-use super::models::{ExportData, ExportEntry, MasterConfig, NewPasswordEntry, PasswordEntry};
+use super::models::{
+    EncryptedPasswordEntry, ExportData, ExportEntry, MasterConfig, NewPasswordEntry, PasswordEntry,
+};
 
 /// 密码数据库操作
 pub struct PasswordStore<'a> {
@@ -52,10 +54,10 @@ impl<'a> PasswordStore<'a> {
             None => return Ok(None), // 未设置主密码
         };
 
-        let hash = crypto::hash_master_password(password, &config.salt);
+        // 使用新函数一次性计算 key 和 hash，避免重复 PBKDF2
+        let (key, hash) = crypto::hash_master_password_with_key(password, &config.salt);
 
         if hash == config.verify_hash {
-            let key = crypto::derive_key(password, &config.salt);
             Ok(Some(key))
         } else {
             Ok(None)
@@ -65,8 +67,8 @@ impl<'a> PasswordStore<'a> {
     /// 初始化主密码
     pub fn setup_master_password(&self, password: &str) -> Result<[u8; 32]> {
         let salt = crypto::generate_salt();
-        let verify_hash = crypto::hash_master_password(password, &salt);
-        let key = crypto::derive_key(password, &salt);
+        // 使用新函数一次性计算 key 和 hash，避免重复 PBKDF2
+        let (key, verify_hash) = crypto::hash_master_password_with_key(password, &salt);
 
         let config = MasterConfig {
             salt: salt.to_vec(),
@@ -77,8 +79,8 @@ impl<'a> PasswordStore<'a> {
         Ok(key)
     }
 
-    /// 获取所有密码条目
-    pub fn get_all_entries(&self, key: &[u8; 32]) -> Result<Vec<PasswordEntry>> {
+    /// 获取所有密码条目（加密版本，延迟解密）
+    pub fn get_all_entries_encrypted(&self) -> Result<Vec<EncryptedPasswordEntry>> {
         let mut stmt = self
             .conn
             .prepare(
@@ -93,22 +95,19 @@ impl<'a> PasswordStore<'a> {
                 let website: String = row.get(1)?;
                 let url: Option<String> = row.get(2)?;
                 let username: String = row.get(3)?;
-                let encrypted_pwd: Vec<u8> = row.get(4)?;
+                let encrypted_password: Vec<u8> = row.get(4)?;
                 let iv: Vec<u8> = row.get(5)?;
                 let notes: Option<String> = row.get(6)?;
                 let created_at: String = row.get(7)?;
                 let updated_at: String = row.get(8)?;
 
-                // 解密密码
-                let password =
-                    crypto::decrypt_password(key, &encrypted_pwd, &iv).unwrap_or_default();
-
-                Ok(PasswordEntry {
+                Ok(EncryptedPasswordEntry {
                     id,
                     website,
                     url,
                     username,
-                    password,
+                    encrypted_password,
+                    iv,
                     notes,
                     created_at,
                     updated_at,
@@ -120,8 +119,18 @@ impl<'a> PasswordStore<'a> {
         Ok(entries)
     }
 
-    /// 搜索密码条目
-    pub fn search_entries(&self, query: &str, key: &[u8; 32]) -> Result<Vec<PasswordEntry>> {
+    /// 获取所有密码条目（解密版本，兼容旧代码）
+    pub fn get_all_entries(&self, key: &[u8; 32]) -> Result<Vec<PasswordEntry>> {
+        let encrypted_entries = self.get_all_entries_encrypted()?;
+        let entries: Vec<PasswordEntry> = encrypted_entries
+            .iter()
+            .map(|e| e.to_decrypted(key))
+            .collect();
+        Ok(entries)
+    }
+
+    /// 搜索密码条目（加密版本，延迟解密）
+    pub fn search_entries_encrypted(&self, query: &str) -> Result<Vec<EncryptedPasswordEntry>> {
         let search_pattern = format!("%{}%", query);
         let mut stmt = self
             .conn
@@ -139,21 +148,19 @@ impl<'a> PasswordStore<'a> {
                 let website: String = row.get(1)?;
                 let url: Option<String> = row.get(2)?;
                 let username: String = row.get(3)?;
-                let encrypted_pwd: Vec<u8> = row.get(4)?;
+                let encrypted_password: Vec<u8> = row.get(4)?;
                 let iv: Vec<u8> = row.get(5)?;
                 let notes: Option<String> = row.get(6)?;
                 let created_at: String = row.get(7)?;
                 let updated_at: String = row.get(8)?;
 
-                let password =
-                    crypto::decrypt_password(key, &encrypted_pwd, &iv).unwrap_or_default();
-
-                Ok(PasswordEntry {
+                Ok(EncryptedPasswordEntry {
                     id,
                     website,
                     url,
                     username,
-                    password,
+                    encrypted_password,
+                    iv,
                     notes,
                     created_at,
                     updated_at,
@@ -162,6 +169,16 @@ impl<'a> PasswordStore<'a> {
             .context("搜索密码失败")?
             .collect::<Result<Vec<_>, _>>()?;
 
+        Ok(entries)
+    }
+
+    /// 搜索密码条目（解密版本，兼容旧代码）
+    pub fn search_entries(&self, query: &str, key: &[u8; 32]) -> Result<Vec<PasswordEntry>> {
+        let encrypted_entries = self.search_entries_encrypted(query)?;
+        let entries: Vec<PasswordEntry> = encrypted_entries
+            .iter()
+            .map(|e| e.to_decrypted(key))
+            .collect();
         Ok(entries)
     }
 

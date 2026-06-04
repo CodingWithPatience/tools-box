@@ -24,7 +24,7 @@ enum UiState {
 /// 密码管理器 UI
 pub struct PasswordManagerUi {
     state: UiState,
-    entries: Vec<PasswordEntry>,
+    entries: Vec<EncryptedPasswordEntry>,
     search_query: String,
     master_password: String,
     confirm_password: String,
@@ -238,18 +238,16 @@ impl PasswordManagerUi {
         }
     }
 
-    /// 加载密码列表
+    /// 加载密码列表（延迟解密，不立即解密密码）
     fn load_entries(&mut self, conn: &Connection) {
-        if let Some(key) = &self.derived_key {
-            let store = PasswordStore::new(conn);
-            match store.get_all_entries(key) {
-                Ok(entries) => {
-                    self.entries = entries;
-                    self.visible_passwords.clear();
-                }
-                Err(e) => {
-                    self.set_error(format!("加载密码列表失败: {}", e));
-                }
+        let store = PasswordStore::new(conn);
+        match store.get_all_entries_encrypted() {
+            Ok(entries) => {
+                self.entries = entries;
+                self.visible_passwords.clear();
+            }
+            Err(e) => {
+                self.set_error(format!("加载密码列表失败: {}", e));
             }
         }
     }
@@ -323,9 +321,10 @@ impl PasswordManagerUi {
         });
     }
 
-    /// 渲染密码表格
+    /// 渲染密码表格（延迟解密版本）
     fn render_password_table(&mut self, ui: &mut egui::Ui, conn: &Connection) {
         let entries = self.entries.clone();
+        let key = self.derived_key;
 
         egui::Grid::new("password_table")
             .striped(true)
@@ -354,10 +353,10 @@ impl PasswordManagerUi {
                     // 账号
                     ui.label(&entry.username);
 
-                    // 密码（可切换显示/隐藏）
+                    // 密码（可切换显示/隐藏，按需解密）
                     ui.horizontal(|ui| {
-                        if self.visible_passwords.contains_key(&entry.id) {
-                            ui.label(self.visible_passwords.get(&entry.id).unwrap());
+                        if let Some(pwd) = self.visible_passwords.get(&entry.id) {
+                            ui.label(pwd);
                         } else {
                             ui.label("••••••••");
                         }
@@ -365,7 +364,7 @@ impl PasswordManagerUi {
 
                     // 操作按钮
                     ui.horizontal(|ui| {
-                        // 显示/隐藏密码
+                        // 显示/隐藏密码（按需解密）
                         let eye_icon = if self.visible_passwords.contains_key(&entry.id) {
                             "🙈"
                         } else {
@@ -374,23 +373,30 @@ impl PasswordManagerUi {
                         if ui.button(eye_icon).clicked() {
                             if self.visible_passwords.contains_key(&entry.id) {
                                 self.visible_passwords.remove(&entry.id);
-                            } else {
-                                self.visible_passwords
-                                    .insert(entry.id, entry.password.clone());
+                            } else if let Some(key) = key {
+                                // 按需解密单个密码
+                                let decrypted = entry.decrypt_password(&key);
+                                self.visible_passwords.insert(entry.id, decrypted);
                             }
                         }
 
-                        // 复制密码
+                        // 复制密码（按需解密）
                         if ui.button("📋").clicked() {
-                            self.copy_to_clipboard(&entry.password);
-                            self.set_success("密码已复制到剪贴板".to_string());
+                            if let Some(key) = key {
+                                let decrypted = entry.decrypt_password(&key);
+                                self.copy_to_clipboard(&decrypted);
+                                self.set_success("密码已复制到剪贴板".to_string());
+                            }
                         }
 
-                        // 编辑
+                        // 编辑（按需解密）
                         if ui.button("✏️").clicked() {
-                            self.state = UiState::EditEntry(entry.id);
-                            self.form = PasswordForm::from_entry(entry);
-                            self.clear_messages();
+                            if let Some(key) = key {
+                                let decrypted_entry = entry.to_decrypted(&key);
+                                self.state = UiState::EditEntry(entry.id);
+                                self.form = PasswordForm::from_entry(&decrypted_entry);
+                                self.clear_messages();
+                            }
                         }
 
                         // 删除
@@ -404,25 +410,23 @@ impl PasswordManagerUi {
             });
     }
 
-    /// 搜索密码
+    /// 搜索密码（延迟解密）
     fn search_entries(&mut self, conn: &Connection) {
-        if let Some(key) = &self.derived_key {
-            let store = PasswordStore::new(conn);
+        let store = PasswordStore::new(conn);
 
-            let result = if self.search_query.is_empty() {
-                store.get_all_entries(key)
-            } else {
-                store.search_entries(&self.search_query, key)
-            };
+        let result = if self.search_query.is_empty() {
+            store.get_all_entries_encrypted()
+        } else {
+            store.search_entries_encrypted(&self.search_query)
+        };
 
-            match result {
-                Ok(entries) => {
-                    self.entries = entries;
-                    self.visible_passwords.clear();
-                }
-                Err(e) => {
-                    self.set_error(format!("搜索失败: {}", e));
-                }
+        match result {
+            Ok(entries) => {
+                self.entries = entries;
+                self.visible_passwords.clear();
+            }
+            Err(e) => {
+                self.set_error(format!("搜索失败: {}", e));
             }
         }
     }

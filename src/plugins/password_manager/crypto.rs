@@ -51,12 +51,21 @@ pub fn derive_key(master_password: &str, salt: &[u8]) -> [u8; 32] {
 /// 计算主密码的验证哈希
 ///
 /// 用于验证用户输入的主密码是否正确
-pub fn hash_master_password(password: &str, salt: &[u8]) -> Vec<u8> {
+/// 返回 (派生密钥, 验证哈希)，避免重复 PBKDF2 计算
+pub fn hash_master_password_with_key(password: &str, salt: &[u8]) -> ([u8; 32], Vec<u8>) {
     let key = derive_key(password, salt);
     // 对派生密钥进行 SHA-256 哈希作为验证值
     use sha2::{Digest, Sha256};
     let hash = Sha256::digest(&key);
-    hash.to_vec()
+    (key, hash.to_vec())
+}
+
+/// 计算主密码的验证哈希（兼容旧代码）
+///
+/// 用于验证用户输入的主密码是否正确
+pub fn hash_master_password(password: &str, salt: &[u8]) -> Vec<u8> {
+    let (_, hash) = hash_master_password_with_key(password, salt);
+    hash
 }
 
 /// 使用 AES-256-GCM 加密密码
@@ -149,6 +158,7 @@ pub fn generate_password(config: &PasswordConfig) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     #[test]
     fn test_encrypt_decrypt() {
@@ -203,5 +213,125 @@ mod tests {
 
         let hash3 = hash_master_password("wrong_password", &salt);
         assert_ne!(hash1, hash3);
+    }
+
+    #[test]
+    fn test_derive_key_performance() {
+        let salt = generate_salt();
+        let password = "test_password_123";
+
+        let start = Instant::now();
+        let _key = derive_key(password, &salt);
+        let duration = start.elapsed();
+
+        println!("PBKDF2 derive_key 耗时: {:?}", duration);
+        assert!(duration.as_millis() < 5000, "derive_key 耗时过长: {:?}", duration);
+    }
+
+    #[test]
+    fn test_hash_master_password_performance() {
+        let salt = generate_salt();
+        let password = "test_password_123";
+
+        let start = Instant::now();
+        let _hash = hash_master_password(password, &salt);
+        let duration = start.elapsed();
+
+        println!("hash_master_password 耗时: {:?}", duration);
+        assert!(duration.as_millis() < 5000, "hash_master_password 耗时过长: {:?}", duration);
+    }
+
+    #[test]
+    fn test_hash_master_password_with_key_performance() {
+        let salt = generate_salt();
+        let password = "test_password_123";
+
+        let start = Instant::now();
+        let (_key, _hash) = hash_master_password_with_key(password, &salt);
+        let duration = start.elapsed();
+
+        println!("hash_master_password_with_key 耗时: {:?}", duration);
+        assert!(duration.as_millis() < 5000, "hash_master_password_with_key 耗时过长: {:?}", duration);
+    }
+
+    #[test]
+    fn test_encrypt_performance() {
+        let key = derive_key("test_password", &generate_salt());
+        let plaintext = "my_secret_password_123";
+
+        let start = Instant::now();
+        let (_ciphertext, _iv) = encrypt_password(&key, plaintext).unwrap();
+        let duration = start.elapsed();
+
+        println!("encrypt_password 耗时: {:?}", duration);
+        assert!(duration.as_millis() < 100, "encrypt_password 耗时过长: {:?}", duration);
+    }
+
+    #[test]
+    fn test_decrypt_performance() {
+        let key = derive_key("test_password", &generate_salt());
+        let plaintext = "my_secret_password_123";
+        let (ciphertext, iv) = encrypt_password(&key, plaintext).unwrap();
+
+        let start = Instant::now();
+        let _decrypted = decrypt_password(&key, &ciphertext, &iv).unwrap();
+        let duration = start.elapsed();
+
+        println!("decrypt_password 耗时: {:?}", duration);
+        assert!(duration.as_millis() < 100, "decrypt_password 耗时过长: {:?}", duration);
+    }
+
+    #[test]
+    fn test_batch_decrypt_performance() {
+        let key = derive_key("test_password", &generate_salt());
+        let count = 100;
+
+        // 准备加密数据
+        let mut encrypted_data = Vec::new();
+        for i in 0..count {
+            let plaintext = format!("password_{}", i);
+            let (ciphertext, iv) = encrypt_password(&key, &plaintext).unwrap();
+            encrypted_data.push((ciphertext, iv));
+        }
+
+        // 测试批量解密性能
+        let start = Instant::now();
+        for (ciphertext, iv) in &encrypted_data {
+            let _decrypted = decrypt_password(&key, ciphertext, iv).unwrap();
+        }
+        let duration = start.elapsed();
+
+        println!("批量解密 {} 条记录耗时: {:?}", count, duration);
+        println!("平均每条记录耗时: {:?}", duration / count);
+        assert!(duration.as_secs() < 5, "批量解密耗时过长: {:?}", duration);
+    }
+
+    #[test]
+    fn test_full_verify_flow_performance() {
+        let salt = generate_salt();
+        let password = "my_master_password";
+
+        // 模拟完整的验证流程
+        let start = Instant::now();
+
+        // 1. 计算 key 和 hash
+        let (key, hash) = hash_master_password_with_key(password, &salt);
+
+        // 2. 验证 hash（模拟比较）
+        let _verify = hash == hash;
+
+        let duration = start.elapsed();
+        println!("完整验证流程耗时: {:?}", duration);
+        assert!(duration.as_millis() < 5000, "完整验证流程耗时过长: {:?}", duration);
+
+        // 测试加密和解密
+        let plaintext = "test_password";
+        let start = Instant::now();
+        let (ciphertext, iv) = encrypt_password(&key, plaintext).unwrap();
+        let _decrypted = decrypt_password(&key, &ciphertext, &iv).unwrap();
+        let duration = start.elapsed();
+
+        println!("加密+解密单条记录耗时: {:?}", duration);
+        assert!(duration.as_millis() < 100, "加密+解密耗时过长: {:?}", duration);
     }
 }

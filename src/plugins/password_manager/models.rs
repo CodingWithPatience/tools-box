@@ -13,6 +13,42 @@ pub struct PasswordEntry {
     pub updated_at: String,
 }
 
+/// 密码条目（加密存储，延迟解密）
+#[derive(Debug, Clone)]
+pub struct EncryptedPasswordEntry {
+    pub id: i64,
+    pub website: String,
+    pub url: Option<String>,
+    pub username: String,
+    pub encrypted_password: Vec<u8>,
+    pub iv: Vec<u8>,
+    pub notes: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl EncryptedPasswordEntry {
+    /// 解密密码字段
+    pub fn decrypt_password(&self, key: &[u8; 32]) -> String {
+        super::crypto::decrypt_password(key, &self.encrypted_password, &self.iv)
+            .unwrap_or_default()
+    }
+
+    /// 转换为 PasswordEntry（解密）
+    pub fn to_decrypted(&self, key: &[u8; 32]) -> PasswordEntry {
+        PasswordEntry {
+            id: self.id,
+            website: self.website.clone(),
+            url: self.url.clone(),
+            username: self.username.clone(),
+            password: self.decrypt_password(key),
+            notes: self.notes.clone(),
+            created_at: self.created_at.clone(),
+            updated_at: self.updated_at.clone(),
+        }
+    }
+}
+
 /// 新增密码条目的表单数据
 #[derive(Debug, Clone)]
 pub struct NewPasswordEntry {

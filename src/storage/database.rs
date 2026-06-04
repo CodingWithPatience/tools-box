@@ -41,6 +41,9 @@ impl Database {
 
     /// 初始化所有插件所需的数据库表
     fn init_tables(&self) -> Result<()> {
+        // 启用 WAL 模式，提升并发读取性能
+        self.conn.execute_batch("PRAGMA journal_mode = WAL;")?;
+
         // 启用外键约束
         self.conn.execute_batch("PRAGMA foreign_keys = ON;")?;
 

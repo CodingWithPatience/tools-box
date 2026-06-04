@@ -73,26 +73,25 @@ pub struct App {
     font_applied: bool,
     /// 侧边栏宽度（手动管理，防止自动扩展）
     sidebar_width: f32,
-    /// 是否正在拖拽侧边栏
-    dragging_sidebar: bool,
 }
 
-/// 配置中文字体
+/// 配置中文字体和 Emoji 字体
 ///
-/// 从 Windows 系统字体目录加载 Microsoft YaHei，确保中文正常显示。
+/// 从 Windows 系统字体目录加载 Microsoft YaHei（中文）和 Segoe UI Emoji（表情符号），
+/// 确保中文和 Emoji 图标正常显示。
 pub fn setup_chinese_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
 
-    // 尝试加载 Microsoft YaHei 字体
-    let font_paths = [
+    // 尝试加载 Microsoft YaHei 字体（中文支持）
+    let chinese_font_paths = [
         r"C:\Windows\Fonts\msyh.ttc",
         r"C:\Windows\Fonts\msyhbd.ttc",
         r"C:\Windows\Fonts\simhei.ttf",
         r"C:\Windows\Fonts\simsun.ttc",
     ];
 
-    let mut loaded = false;
-    for path in &font_paths {
+    let mut chinese_loaded = false;
+    for path in &chinese_font_paths {
         if let Ok(font_data) = std::fs::read(path) {
             fonts
                 .font_data
@@ -107,13 +106,44 @@ pub fn setup_chinese_fonts(ctx: &egui::Context) {
             }
 
             log::info!("已加载中文字体: {}", path);
-            loaded = true;
+            chinese_loaded = true;
             break;
         }
     }
 
-    if !loaded {
+    if !chinese_loaded {
         log::warn!("未找到中文字体，中文可能显示为乱码");
+    }
+
+    // 尝试加载 Emoji 字体（支持 Unicode 表情符号）
+    let emoji_font_paths = [
+        r"C:\Windows\Fonts\seguiemj.ttf",  // Segoe UI Emoji
+        r"C:\Windows\Fonts\seguisym.ttf",  // Segoe UI Symbol
+    ];
+
+    let mut emoji_loaded = false;
+    for path in &emoji_font_paths {
+        if let Ok(font_data) = std::fs::read(path) {
+            fonts
+                .font_data
+                .insert("emoji".to_owned(), egui::FontData::from_owned(font_data).into());
+
+            // 将 Emoji 字体添加为 fallback
+            if let Some(family) = fonts.families.get_mut(&FontFamily::Proportional) {
+                family.push("emoji".to_owned());
+            }
+            if let Some(family) = fonts.families.get_mut(&FontFamily::Monospace) {
+                family.push("emoji".to_owned());
+            }
+
+            log::info!("已加载 Emoji 字体: {}", path);
+            emoji_loaded = true;
+            break;
+        }
+    }
+
+    if !emoji_loaded {
+        log::warn!("未找到 Emoji 字体，部分图标可能显示为方框");
     }
 
     ctx.set_fonts(fonts);
@@ -139,7 +169,6 @@ impl App {
             font_size: DEFAULT_FONT_SIZE,
             font_applied: false,
             sidebar_width: 200.0,  // 默认侧边栏宽度
-            dragging_sidebar: false,
         }
     }
 
@@ -249,12 +278,18 @@ impl App {
 
     /// 渲染左侧边栏
     fn render_sidebar(&mut self, ui: &mut egui::Ui) {
-        // 搜索框 - 使用固定宽度，防止自动扩展
+        // 搜索框 - 限制宽度不超过侧边栏
         ui.horizontal(|ui| {
+            // 设置布局宽度为可用宽度，防止扩展侧边栏
+            let available_width = ui.available_width();
+            ui.set_min_width(available_width);
+
             ui.label("🔍");
 
-            // 使用固定的搜索框宽度，基于侧边栏宽度
-            let search_width = self.sidebar_width - 50.0; // 减去图标和清空按钮的空间
+            // 计算搜索框宽度：可用宽度减去图标和清空按钮的空间
+            let button_space = if !self.search_query.is_empty() { 30.0 } else { 0.0 };
+            let search_width = (available_width - 50.0 - button_space).max(100.0);
+
             let response = ui.add_sized(
                 [search_width, ui.spacing().interact_size.y],
                 egui::TextEdit::singleline(&mut self.search_query)
@@ -390,45 +425,14 @@ impl eframe::App for App {
             });
         });
 
-        // 左侧边栏 - 使用 exact_width 固定宽度，完全禁用自动调整
+        // 左侧边栏 - 使用 egui 内置的可调整宽度
         egui::SidePanel::left("sidebar")
-            .exact_width(self.sidebar_width)
+            .resizable(true)
+            .default_width(self.sidebar_width)
+            .width_range(150.0..=400.0)
             .show(ctx, |ui| {
                 self.render_sidebar(ui);
             });
-
-        // 侧边栏右侧的拖拽条 - 手动处理宽度调整
-        let sidebar_rect = ctx.screen_rect();
-        let drag_bar_rect = egui::Rect::from_min_max(
-            egui::pos2(self.sidebar_width, sidebar_rect.min.y),
-            egui::pos2(self.sidebar_width + 4.0, sidebar_rect.max.y),
-        );
-
-        let drag_response = ctx.input(|i| {
-            if i.pointer.any_pressed() {
-                let pointer_pos = i.pointer.latest_pos().unwrap_or_default();
-                if drag_bar_rect.contains(pointer_pos) {
-                    return Some(pointer_pos);
-                }
-            }
-            None
-        });
-
-        if let Some(_pos) = drag_response {
-            // 开始拖拽
-            self.dragging_sidebar = true;
-        }
-
-        if self.dragging_sidebar {
-            ctx.input(|i| {
-                if let Some(pointer_pos) = i.pointer.latest_pos() {
-                    self.sidebar_width = pointer_pos.x.clamp(150.0, 400.0);
-                }
-                if i.pointer.any_released() {
-                    self.dragging_sidebar = false;
-                }
-            });
-        }
 
         // 中央内容区
         egui::CentralPanel::default().show(ctx, |ui| {
