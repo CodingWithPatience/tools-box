@@ -28,16 +28,24 @@ impl Theme {
         }
     }
 
-    /// 获取主题图标
+    /// 获取主题图标（显示切换后的主题图标，与文字一致）
     pub fn icon(&self) -> &str {
         match self {
-            Theme::Light => "🌙",
-            Theme::Dark => "☀️",
+            Theme::Light => "🌙",  // 当前亮色，切换到暗色，显示月亮
+            Theme::Dark => "☀",   // 当前暗色，切换到亮色，显示太阳
         }
     }
 
-    /// 获取主题名称
+    /// 获取主题名称（显示切换后的主题名称，用于按钮文字）
     pub fn name(&self) -> &str {
+        match self {
+            Theme::Light => "暗色",  // 当前亮色，点击后切换到暗色
+            Theme::Dark => "亮色",   // 当前暗色，点击后切换到亮色
+        }
+    }
+
+    /// 获取当前主题的实际名称（用于提示信息）
+    pub fn current_name(&self) -> &str {
         match self {
             Theme::Light => "亮色",
             Theme::Dark => "暗色",
@@ -233,7 +241,7 @@ impl App {
             Theme::Light => ctx.set_visuals(egui::Visuals::light()),
             Theme::Dark => ctx.set_visuals(egui::Visuals::dark()),
         }
-        self.status_message = format!("已切换到{}主题", self.theme.name());
+        self.status_message = format!("已切换到{}主题", self.theme.current_name());
     }
 
     /// 处理快捷键

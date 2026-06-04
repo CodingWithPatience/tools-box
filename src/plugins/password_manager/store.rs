@@ -48,6 +48,11 @@ impl<'a> PasswordStore<'a> {
     }
 
     /// 验证主密码
+    ///
+    /// 返回值：
+    /// - `Ok(Some(key))` - 验证成功，返回派生密钥
+    /// - `Ok(None)` - 主密码未设置
+    /// - `Err(...)` - 主密码错误或其他错误
     pub fn verify_master_password(&self, password: &str) -> Result<Option<[u8; 32]>> {
         let config = match self.get_master_config()? {
             Some(c) => c,
@@ -60,7 +65,7 @@ impl<'a> PasswordStore<'a> {
         if hash == config.verify_hash {
             Ok(Some(key))
         } else {
-            Ok(None)
+            Err(anyhow::anyhow!("主密码错误"))
         }
     }
 

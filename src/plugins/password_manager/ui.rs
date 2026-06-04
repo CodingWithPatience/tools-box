@@ -141,6 +141,13 @@ impl PasswordManagerUi {
     /// 尝试解锁
     fn try_unlock(&mut self, conn: &Connection) {
         self.clear_messages();
+
+        // 检查是否输入了主密码
+        if self.master_password.is_empty() {
+            self.set_error("请输入主密码".to_string());
+            return;
+        }
+
         let store = PasswordStore::new(conn);
 
         match store.verify_master_password(&self.master_password) {
@@ -154,7 +161,7 @@ impl PasswordManagerUi {
                 self.set_error("主密码未设置，请先设置主密码".to_string());
             }
             Err(e) => {
-                self.set_error(format!("验证失败: {}", e));
+                self.set_error(format!("{}", e));
             }
         }
     }
