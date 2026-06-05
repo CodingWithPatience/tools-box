@@ -41,29 +41,38 @@ impl DiffViewerUi {
         // 双栏输入区域
         let available_height = ui.available_height() - 100.0;
 
-        ui.horizontal(|ui| {
+        // 使用 columns 实现双栏布局
+        ui.columns(2, |columns| {
             // 左侧文本
-            ui.vertical(|ui| {
+            columns[0].vertical(|ui| {
                 ui.label("原始文本 (左侧):");
-                ui.add_sized(
-                    [ui.available_width() / 2.0 - 10.0, available_height],
-                    egui::TextEdit::multiline(&mut self.left_text)
-                        .hint_text("在此输入原始文本...")
-                        .code_editor(),
-                );
+                egui::ScrollArea::vertical()
+                    .id_salt("diff_edit_left")
+                    .max_height(available_height)
+                    .show(ui, |ui| {
+                        egui::TextEdit::multiline(&mut self.left_text)
+                            .hint_text("在此输入原始文本...")
+                            .code_editor()
+                            .desired_width(f32::INFINITY)
+                            .min_size(egui::vec2(0.0, available_height))
+                            .show(ui);
+                    });
             });
 
-            ui.separator();
-
             // 右侧文本
-            ui.vertical(|ui| {
+            columns[1].vertical(|ui| {
                 ui.label("对比文本 (右侧):");
-                ui.add_sized(
-                    [ui.available_width(), available_height],
-                    egui::TextEdit::multiline(&mut self.right_text)
-                        .hint_text("在此输入对比文本...")
-                        .code_editor(),
-                );
+                egui::ScrollArea::vertical()
+                    .id_salt("diff_edit_right")
+                    .max_height(available_height)
+                    .show(ui, |ui| {
+                        egui::TextEdit::multiline(&mut self.right_text)
+                            .hint_text("在此输入对比文本...")
+                            .code_editor()
+                            .desired_width(f32::INFINITY)
+                            .min_size(egui::vec2(0.0, available_height))
+                            .show(ui);
+                    });
             });
         });
 
