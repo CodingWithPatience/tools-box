@@ -108,73 +108,81 @@ impl DiffViewerUi {
         ui.separator();
 
         if let Some(result) = &self.diff_result {
-            let available_height = ui.available_height() - 60.0;
+            // 先计算统计栏所需高度（分隔线 + 文本高度 + 间距）
+            let text_style = egui::TextStyle::Small;
+            let stats_height = ui.text_style_height(&text_style) + 16.0;
 
-            // Split 视图：左右并排显示
-            ui.horizontal(|ui| {
-                // 左侧标题
-                ui.vertical(|ui| {
-                    ui.label(
-                        RichText::new("原始文本")
-                            .strong()
+            // 使用 bottom_panel 固定统计栏在底部
+            egui::TopBottomPanel::bottom("diff_split_stats")
+                .exact_height(stats_height)
+                .show_inside(ui, |ui| {
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "统计：新增 {} 行 | 删除 {} 行 | 相似度：{:.1}%",
+                                result.added_count,
+                                result.removed_count,
+                                result.similarity * 100.0
+                            ))
                             .color(Color32::from_rgb(100, 100, 100)),
-                    );
+                        );
+                    });
+                });
+
+            // 剩余空间用于内容区域
+            ui.vertical(|ui| {
+                // Split 视图：左右并排显示
+                ui.horizontal(|ui| {
+                    // 左侧标题
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new("原始文本")
+                                .strong()
+                                .color(Color32::from_rgb(100, 100, 100)),
+                        );
+                    });
+
+                    ui.separator();
+
+                    // 右侧标题
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new("对比文本")
+                                .strong()
+                                .color(Color32::from_rgb(100, 100, 100)),
+                        );
+                    });
                 });
 
                 ui.separator();
 
-                // 右侧标题
-                ui.vertical(|ui| {
-                    ui.label(
-                        RichText::new("对比文本")
-                            .strong()
-                            .color(Color32::from_rgb(100, 100, 100)),
-                    );
-                });
-            });
+                // 使用 ScrollArea 支持横向和纵向滚动
+                // 当内容超出可用高度时才显示滚动条
+                egui::ScrollArea::both()
+                    .auto_shrink([false, false])  // 不自动缩小，内容不足时不显示滚动条
+                    .id_salt("diff_split_view")
+                    .show(ui, |ui| {
+                        // 获取当前字体大小
+                        let font_size = ui.style().text_styles.get(&egui::TextStyle::Monospace)
+                            .map(|font_id| font_id.size)
+                            .unwrap_or(14.0);
 
-            ui.separator();
+                        // 设置等宽字体
+                        let code_style = egui::TextStyle::Monospace;
+                        let row_height = ui.text_style_height(&code_style) + 4.0;
 
-            // 使用 ScrollArea 支持横向和纵向滚动
-            // 当内容超出可用高度时才显示滚动条
-            egui::ScrollArea::both()
-                .max_height(available_height)
-                .auto_shrink([false, false])  // 不自动缩小，内容不足时不显示滚动条
-                .id_salt("diff_split_view")
-                .show(ui, |ui| {
-                    // 获取当前字体大小
-                    let font_size = ui.style().text_styles.get(&egui::TextStyle::Monospace)
-                        .map(|font_id| font_id.size)
-                        .unwrap_or(14.0);
-
-                    // 设置等宽字体
-                    let code_style = egui::TextStyle::Monospace;
-                    let row_height = ui.text_style_height(&code_style) + 4.0;
-
-                    egui::Grid::new("diff_split_grid")
-                        .striped(true)
-                        .spacing([0.0, 0.0])
-                        .min_col_width(ui.available_width() / 2.0)
-                        .show(ui, |ui| {
-                            for line in &result.split_lines {
-                                self.render_split_line(ui, line, row_height, font_size);
-                                ui.end_row();
-                            }
-                        });
-                });
-
-            // 统计信息
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(format!(
-                        "统计：新增 {} 行 | 删除 {} 行 | 相似度：{:.1}%",
-                        result.added_count,
-                        result.removed_count,
-                        result.similarity * 100.0
-                    ))
-                    .color(Color32::from_rgb(100, 100, 100)),
-                );
+                        egui::Grid::new("diff_split_grid")
+                            .striped(true)
+                            .spacing([0.0, 0.0])
+                            .min_col_width(ui.available_width() / 2.0)
+                            .show(ui, |ui| {
+                                for line in &result.split_lines {
+                                    self.render_split_line(ui, line, row_height, font_size);
+                                    ui.end_row();
+                                }
+                            });
+                    });
             });
         }
     }
@@ -324,75 +332,83 @@ impl DiffViewerUi {
         ui.separator();
 
         if let Some(result) = &self.diff_result {
-            let available_height = ui.available_height() - 60.0;
+            // 先计算统计栏所需高度（分隔线 + 文本高度 + 间距）
+            let text_style = egui::TextStyle::Small;
+            let stats_height = ui.text_style_height(&text_style) + 16.0;
 
             // 获取当前主题的文字颜色
             let text_color = ui.visuals().text_color();
             let dim_color = Color32::from_rgb(128, 128, 128);
 
-            // Unified 视图
-            egui::ScrollArea::both()
-                .max_height(available_height)
-                .auto_shrink([false, false])  // 不自动缩小，内容不足时不显示滚动条
-                .id_salt("diff_unified_view")
-                .show(ui, |ui| {
-                    // 设置等宽字体
-                    let code_style = egui::TextStyle::Monospace;
-                    let row_height = ui.text_style_height(&code_style) + 4.0;
-
-                    for line in &result.unified_lines {
-                        let bg_color = match line.diff_type {
-                            DiffType::Added => Color32::from_rgb(220, 255, 220),
-                            DiffType::Removed => Color32::from_rgb(255, 220, 220),
-                            DiffType::Equal => Color32::TRANSPARENT,
-                        };
-
-                        let line_num = match (line.line_number_left, line.line_number_right) {
-                            (Some(l), Some(r)) => format!("{:>4} {:>4} │ ", l, r),
-                            (Some(l), None) => format!("{:>4}      │ ", l),
-                            (None, Some(r)) => format!("     {:>4} │ ", r),
-                            _ => "           │ ".to_string(),
-                        };
-
-                        let prefix = match line.diff_type {
-                            DiffType::Added => "+ ",
-                            DiffType::Removed => "- ",
-                            DiffType::Equal => "  ",
-                        };
-
-                        let text = format!("{}{}{}", line_num, prefix, line.content);
-                        let rich_text = RichText::new(text).monospace();
-
-                        let rich_text = match line.diff_type {
-                            DiffType::Added => rich_text.color(Color32::from_rgb(0, 150, 0)),
-                            DiffType::Removed => rich_text.color(Color32::from_rgb(180, 0, 0)),
-                            _ => rich_text.color(text_color), // 使用主题文字颜色
-                        };
-
-                        // 绘制背景
-                        let rect = ui.available_rect_before_wrap();
-                        let rect = egui::Rect::from_min_size(
-                            rect.min,
-                            egui::vec2(rect.width(), row_height),
+            // 使用 bottom_panel 固定统计栏在底部
+            egui::TopBottomPanel::bottom("diff_unified_stats")
+                .exact_height(stats_height)
+                .show_inside(ui, |ui| {
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "统计：新增 {} 行 | 删除 {} 行 | 相似度：{:.1}%",
+                                result.added_count,
+                                result.removed_count,
+                                result.similarity * 100.0
+                            ))
+                            .color(dim_color),
                         );
-                        ui.painter().rect_filled(rect, 0.0, bg_color);
-
-                        ui.label(rich_text);
-                    }
+                    });
                 });
 
-            // 统计信息
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(format!(
-                        "统计：新增 {} 行 | 删除 {} 行 | 相似度：{:.1}%",
-                        result.added_count,
-                        result.removed_count,
-                        result.similarity * 100.0
-                    ))
-                    .color(dim_color),
-                );
+            // 剩余空间用于内容区域
+            ui.vertical(|ui| {
+                // Unified 视图
+                egui::ScrollArea::both()
+                    .auto_shrink([false, false])  // 不自动缩小，内容不足时不显示滚动条
+                    .id_salt("diff_unified_view")
+                    .show(ui, |ui| {
+                        // 设置等宽字体
+                        let code_style = egui::TextStyle::Monospace;
+                        let row_height = ui.text_style_height(&code_style) + 4.0;
+
+                        for line in &result.unified_lines {
+                            let bg_color = match line.diff_type {
+                                DiffType::Added => Color32::from_rgb(220, 255, 220),
+                                DiffType::Removed => Color32::from_rgb(255, 220, 220),
+                                DiffType::Equal => Color32::TRANSPARENT,
+                            };
+
+                            let line_num = match (line.line_number_left, line.line_number_right) {
+                                (Some(l), Some(r)) => format!("{:>4} {:>4} │ ", l, r),
+                                (Some(l), None) => format!("{:>4}      │ ", l),
+                                (None, Some(r)) => format!("     {:>4} │ ", r),
+                                _ => "           │ ".to_string(),
+                            };
+
+                            let prefix = match line.diff_type {
+                                DiffType::Added => "+ ",
+                                DiffType::Removed => "- ",
+                                DiffType::Equal => "  ",
+                            };
+
+                            let text = format!("{}{}{}", line_num, prefix, line.content);
+                            let rich_text = RichText::new(text).monospace();
+
+                            let rich_text = match line.diff_type {
+                                DiffType::Added => rich_text.color(Color32::from_rgb(0, 150, 0)),
+                                DiffType::Removed => rich_text.color(Color32::from_rgb(180, 0, 0)),
+                                _ => rich_text.color(text_color), // 使用主题文字颜色
+                            };
+
+                            // 绘制背景
+                            let rect = ui.available_rect_before_wrap();
+                            let rect = egui::Rect::from_min_size(
+                                rect.min,
+                                egui::vec2(rect.width(), row_height),
+                            );
+                            ui.painter().rect_filled(rect, 0.0, bg_color);
+
+                            ui.label(rich_text);
+                        }
+                    });
             });
         }
     }
