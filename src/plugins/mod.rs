@@ -2,6 +2,7 @@ pub mod api_tester;
 pub mod diff_viewer;
 pub mod hosts_manager;
 pub mod json_editor;
+pub mod note_taker;
 pub mod password_manager;
 
 use crate::plugin::Plugin;
@@ -16,6 +17,7 @@ pub fn register_all_plugins() -> Vec<Box<dyn Plugin>> {
         Box::new(hosts_manager::HostsManagerPlugin::new()),
         Box::new(diff_viewer::DiffViewerPlugin::new()),
         Box::new(api_tester::ApiTesterPlugin::new()),
+        Box::new(note_taker::NoteTakerPlugin::new()),
     ];
 
     log::info!("已注册 {} 个插件", plugins.len());
