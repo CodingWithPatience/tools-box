@@ -9,6 +9,7 @@
 - JSON 编辑器，格式化处理，JSON 字符串解析；压缩、转义 JSON
 - diff 文本代码对比工具
 - 轻量级 Postman HTTP API 调试工具
+- 临时文本记录，支持 markdown 格式
 - 其他插件后续补充添加
 
 # 本地数据存储
