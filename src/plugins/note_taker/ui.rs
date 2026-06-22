@@ -47,6 +47,8 @@ pub struct NoteTakerUi {
     error: Option<String>,
     /// Markdown 渲染器
     markdown_renderer: MarkdownRenderer,
+    /// 左侧面板宽度
+    left_panel_width: f32,
 }
 
 impl NoteTakerUi {
@@ -68,6 +70,7 @@ impl NoteTakerUi {
             sort_by: SortBy::UpdatedAt,
             error: None,
             markdown_renderer: MarkdownRenderer::new(),
+            left_panel_width: 200.0, // 默认宽度
         }
     }
 
@@ -184,16 +187,59 @@ impl NoteTakerUi {
             }
         }
 
-        // 主内容区域 - 左右分栏
+        // 主内容区域 - 左右分栏（可拖拽调整宽度）
+        let available_width = ui.available_width();
+        let min_left_width = 150.0;
+        let max_left_width = (available_width * 0.5).min(400.0);
+
         ui.horizontal_top(|ui| {
-            // 左侧面板
+            // 左侧面板（使用固定宽度）
+            let left_width = self.left_panel_width.clamp(min_left_width, max_left_width);
             ui.vertical(|ui| {
-                ui.set_min_width(200.0);
-                ui.set_max_width(300.0);
+                ui.set_min_width(left_width);
+                ui.set_max_width(left_width);
                 self.render_left_panel(ui, conn);
             });
 
-            ui.separator();
+            // 可拖拽的分隔线
+            let separator_rect = ui.available_rect_before_wrap();
+            let separator_x = separator_rect.left();
+            let separator_response = ui.allocate_rect(
+                egui::Rect::from_min_max(
+                    egui::pos2(separator_x, separator_rect.top()),
+                    egui::pos2(separator_x + 8.0, separator_rect.bottom()),
+                ),
+                egui::Sense::drag(),
+            );
+
+            // 绘制分隔线
+            let painter = ui.painter();
+            let line_color = if separator_response.hovered() || separator_response.dragged() {
+                ui.visuals().selection.bg_fill
+            } else {
+                ui.visuals().widgets.noninteractive.bg_stroke.color
+            };
+            painter.line_segment(
+                [
+                    egui::pos2(separator_x + 4.0, separator_rect.top()),
+                    egui::pos2(separator_x + 4.0, separator_rect.bottom()),
+                ],
+                egui::Stroke::new(2.0, line_color),
+            );
+
+            // 处理拖拽
+            if separator_response.dragged() {
+                let delta = separator_response.drag_delta().x;
+                self.left_panel_width = (self.left_panel_width + delta)
+                    .clamp(min_left_width, max_left_width);
+            }
+
+            // 鼠标样式
+            if separator_response.hovered() || separator_response.dragged() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeColumn);
+            }
+
+            ui.add_space(4.0);
 
             // 右侧编辑区
             ui.vertical(|ui| {
@@ -239,10 +285,10 @@ impl NoteTakerUi {
             .id_salt("folder_scroll")
             .max_height(ui.available_height() * 0.4)
             .show(ui, |ui| {
-                // 全部笔记
-                let all_selected = self.selected_folder_id.is_none() && !self.show_favorites;
+                // 未分类笔记
+                let uncategorized_selected = self.selected_folder_id.is_none() && !self.show_favorites;
                 if ui
-                    .selectable_label(all_selected, "📁 全部笔记")
+                    .selectable_label(uncategorized_selected, "📁 未分类")
                     .clicked()
                 {
                     self.selected_folder_id = None;
@@ -339,8 +385,8 @@ impl NoteTakerUi {
                     clicked = true;
                 }
 
-                // 编辑按钮
-                if ui.small_button("⋮").clicked() {
+                // 编辑按钮（使用 "..." 代替特殊字符）
+                if ui.small_button("...").clicked() {
                     edit_clicked = true;
                 }
             });
@@ -408,16 +454,18 @@ impl NoteTakerUi {
 
         ui.add_space(5.0);
 
-        // 内容编辑区
+        // 内容编辑区（占据剩余空间）
+        let bottom_bar_height = 40.0;
+        let content_height = (ui.available_height() - bottom_bar_height).max(200.0);
+
         match self.view_mode {
             NoteViewMode::Edit => {
-                let available_height = ui.available_height() - 80.0;
                 egui::ScrollArea::vertical()
                     .id_salt("note_content_scroll")
-                    .max_height(available_height.max(200.0))
+                    .max_height(content_height)
                     .show(ui, |ui| {
                         ui.add_sized(
-                            [ui.available_width(), available_height.max(200.0)],
+                            [ui.available_width(), content_height],
                             egui::TextEdit::multiline(&mut self.form.content)
                                 .hint_text("输入笔记内容，支持 Markdown 格式")
                                 .code_editor(),
@@ -425,82 +473,83 @@ impl NoteTakerUi {
                     });
             }
             NoteViewMode::Preview => {
-                let available_height = ui.available_height() - 80.0;
                 egui::ScrollArea::vertical()
                     .id_salt("note_preview_scroll")
-                    .max_height(available_height.max(200.0))
+                    .max_height(content_height)
                     .show(ui, |ui| {
                         self.markdown_renderer.render(ui, &self.form.content);
                     });
             }
         }
 
-        ui.add_space(5.0);
-
-        // 底部操作栏
-        ui.horizontal(|ui| {
-            // 目录选择
-            ui.label("目录:");
-            egui::ComboBox::from_id_salt("note_folder_select")
-                .selected_text(self.get_folder_display_name())
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.form.folder_id, None, "未分类");
-                    for folder in &self.folders {
-                        let name = if let Some(parent_id) = folder.parent_id {
-                            if let Some(parent) = self.folders.iter().find(|f| f.id == parent_id) {
-                                format!("{} > {}", parent.name, folder.name)
+        // 底部操作栏（使用 with_layout 推到底部）
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
+            ui.horizontal(|ui| {
+                // 目录选择
+                ui.label("目录:");
+                egui::ComboBox::from_id_salt("note_folder_select")
+                    .selected_text(self.get_folder_display_name())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.form.folder_id, None, "未分类");
+                        for folder in &self.folders {
+                            let name = if let Some(parent_id) = folder.parent_id {
+                                if let Some(parent) =
+                                    self.folders.iter().find(|f| f.id == parent_id)
+                                {
+                                    format!("{} > {}", parent.name, folder.name)
+                                } else {
+                                    folder.name.clone()
+                                }
                             } else {
                                 folder.name.clone()
-                            }
-                        } else {
-                            folder.name.clone()
-                        };
-                        ui.selectable_value(
-                            &mut self.form.folder_id,
-                            Some(folder.id),
-                            &name,
-                        );
-                    }
-                });
+                            };
+                            ui.selectable_value(
+                                &mut self.form.folder_id,
+                                Some(folder.id),
+                                &name,
+                            );
+                        }
+                    });
 
-            ui.separator();
+                ui.separator();
 
-            // 标签
-            ui.label("标签:");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.form.tags)
-                    .hint_text("标签1, 标签2")
-                    .desired_width(150.0),
-            );
+                // 标签
+                ui.label("标签:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.form.tags)
+                        .hint_text("标签1, 标签2")
+                        .desired_width(150.0),
+                );
 
-            ui.separator();
+                ui.separator();
 
-            // 操作按钮
-            if ui
-                .button(RichText::new("💾 保存").strong())
-                .clicked()
-            {
-                self.save_note(conn);
-            }
+                // 操作按钮
+                if ui
+                    .button(RichText::new("💾 保存").strong())
+                    .clicked()
+                {
+                    self.save_note(conn);
+                }
 
-            let is_favorite = self
-                .notes
-                .iter()
-                .find(|n| n.id == note_id)
-                .map(|n| n.is_favorite)
-                .unwrap_or(false);
+                let is_favorite = self
+                    .notes
+                    .iter()
+                    .find(|n| n.id == note_id)
+                    .map(|n| n.is_favorite)
+                    .unwrap_or(false);
 
-            let fav_text = if is_favorite { "⭐ 已收藏" } else { "☆ 收藏" };
-            if ui.button(fav_text).clicked() {
-                self.toggle_favorite(note_id, conn);
-            }
+                let fav_text = if is_favorite { "⭐ 已收藏" } else { "☆ 收藏" };
+                if ui.button(fav_text).clicked() {
+                    self.toggle_favorite(note_id, conn);
+                }
 
-            if ui
-                .button(RichText::new("🗑 删除").color(Color32::from_rgb(200, 0, 0)))
-                .clicked()
-            {
-                self.delete_note(note_id, conn);
-            }
+                if ui
+                    .button(RichText::new("🗑 删除").color(Color32::from_rgb(200, 0, 0)))
+                    .clicked()
+                {
+                    self.delete_note(note_id, conn);
+                }
+            });
         });
     }
 

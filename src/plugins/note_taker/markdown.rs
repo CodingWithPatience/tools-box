@@ -100,15 +100,35 @@ impl MarkdownRenderer {
                             }
                         }
                         TagEnd::BlockQuote(_) => {
+                            // 先渲染带样式的文本，再重置状态
+                            if !current_text.is_empty() {
+                                self.render_text(ui, &current_text, in_emphasis, in_strong, true);
+                                current_text.clear();
+                            }
                             in_blockquote = false;
                         }
                         TagEnd::Emphasis => {
+                            // 先渲染带样式的文本，再重置状态
+                            if !current_text.is_empty() {
+                                self.render_text(ui, &current_text, true, in_strong, in_blockquote);
+                                current_text.clear();
+                            }
                             in_emphasis = false;
                         }
                         TagEnd::Strong => {
+                            // 先渲染带样式的文本，再重置状态
+                            if !current_text.is_empty() {
+                                self.render_text(ui, &current_text, in_emphasis, true, in_blockquote);
+                                current_text.clear();
+                            }
                             in_strong = false;
                         }
                         TagEnd::Strikethrough => {
+                            // 先渲染带样式的文本，再重置状态
+                            if !current_text.is_empty() {
+                                self.render_text(ui, &current_text, in_emphasis, in_strong, in_blockquote);
+                                current_text.clear();
+                            }
                             self.in_strikethrough = false;
                         }
                         TagEnd::CodeBlock => {
