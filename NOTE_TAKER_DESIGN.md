@@ -186,7 +186,7 @@ src/plugins/note_taker/
 | 3 | 实现目录管理 | 目录树展示、新增/编辑/删除目录 | ✅ |
 | 4 | 实现笔记列表 | 按目录筛选笔记列表 | ✅ |
 | 5 | 实现笔记编辑 | 标题、内容编辑器 | ✅ |
-| 6 | 实现 Markdown 预览 | 简化版 Markdown 渲染（纯文本） | ✅ |
+| 6 | 实现 Markdown 预览 | 使用 pulldown-cmark 完整渲染 | ✅ |
 | 7 | 实现搜索功能 | 按标题和内容搜索 | ✅ |
 | 8 | 实现收藏功能 | 收藏/取消收藏 | ✅ |
 | 9 | 实现标签功能 | 添加/删除标签 | ✅ |
@@ -198,18 +198,25 @@ src/plugins/note_taker/
 ## 七、依赖库
 
 ```toml
-# 无新增依赖，使用现有依赖
-# - rusqlite: SQLite 数据库
-# - serde/serde_json: 序列化
-# - anyhow: 错误处理
+[dependencies]
+pulldown-cmark = "0.13.4"  # Markdown 解析渲染
 ```
+
+其他使用现有依赖：
+- `rusqlite`: SQLite 数据库
+- `serde/serde_json`: 序列化
+- `anyhow`: 错误处理
 
 ---
 
 ## 八、技术要点
 
 1. **目录树实现**：使用递归方式渲染目录树，支持无限层级
-2. **Markdown 渲染**：简化版实现，将 Markdown 转换为带格式的纯文本显示
+2. **Markdown 渲染**：使用 `pulldown-cmark` 解析 Markdown，通过 egui RichText API 渲染
+   - 支持标题（H1-H6，不同大小）
+   - 支持粗体、斜体、删除线
+   - 支持行内代码和代码块
+   - 支持引用、列表、分割线
 3. **标签管理**：标签存储为逗号分隔字符串，解析为 Vec 显示
 4. **延迟操作模式**：使用 UiAction 枚举避免 egui 渲染期间的借用冲突
 
