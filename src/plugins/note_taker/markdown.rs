@@ -9,6 +9,8 @@ pub struct MarkdownRenderer {
     in_code_block: bool,
     /// 当前代码块内容
     code_buffer: String,
+    /// 是否在删除线中
+    in_strikethrough: bool,
 }
 
 impl MarkdownRenderer {
@@ -17,6 +19,7 @@ impl MarkdownRenderer {
         Self {
             in_code_block: false,
             code_buffer: String::new(),
+            in_strikethrough: false,
         }
     }
 
@@ -63,6 +66,9 @@ impl MarkdownRenderer {
                         Tag::Strong => {
                             in_strong = true;
                         }
+                        Tag::Strikethrough => {
+                            self.in_strikethrough = true;
+                        }
                         Tag::CodeBlock(_) => {
                             self.in_code_block = true;
                             ui.separator();
@@ -101,6 +107,9 @@ impl MarkdownRenderer {
                         }
                         TagEnd::Strong => {
                             in_strong = false;
+                        }
+                        TagEnd::Strikethrough => {
+                            self.in_strikethrough = false;
                         }
                         TagEnd::CodeBlock => {
                             self.in_code_block = false;
@@ -187,6 +196,9 @@ impl MarkdownRenderer {
         }
         if emphasis {
             rich_text = rich_text.italics();
+        }
+        if self.in_strikethrough {
+            rich_text = rich_text.strikethrough();
         }
         if blockquote {
             rich_text = rich_text.italics().color(Color32::GRAY);
