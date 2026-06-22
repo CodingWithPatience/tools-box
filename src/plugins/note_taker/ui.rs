@@ -45,6 +45,8 @@ pub struct NoteTakerUi {
     sort_by: SortBy,
     /// 错误信息
     error: Option<String>,
+    /// Markdown 渲染器
+    markdown_renderer: MarkdownRenderer,
 }
 
 impl NoteTakerUi {
@@ -65,6 +67,7 @@ impl NoteTakerUi {
             editing_folder_id: None,
             sort_by: SortBy::UpdatedAt,
             error: None,
+            markdown_renderer: MarkdownRenderer::new(),
         }
     }
 
@@ -427,12 +430,7 @@ impl NoteTakerUi {
                     .id_salt("note_preview_scroll")
                     .max_height(available_height.max(200.0))
                     .show(ui, |ui| {
-                        let plain_text = MarkdownRenderer::render_plain(&self.form.content);
-                        ui.add(
-                            egui::TextEdit::multiline(&mut plain_text.as_str())
-                                .code_editor()
-                                .desired_width(f32::INFINITY),
-                        );
+                        self.markdown_renderer.render(ui, &self.form.content);
                     });
             }
         }

@@ -1,145 +1,201 @@
-use egui::RichText;
+use egui::{Color32, RichText, Ui};
+use pulldown_cmark::{Options, Parser, Event, Tag, TagEnd};
 
 /// Markdown 渲染器
 ///
-/// 将 Markdown 文本转换为 egui 可显示的富文本段落
-pub struct MarkdownRenderer;
+/// 使用 pulldown-cmark 解析 Markdown，用 egui RichText 渲染
+pub struct MarkdownRenderer {
+    /// 是否在代码块中
+    in_code_block: bool,
+    /// 当前代码块内容
+    code_buffer: String,
+}
 
 impl MarkdownRenderer {
-    /// 渲染 Markdown 文本为纯文本（简化版本）
-    ///
-    /// 由于 egui 原生不支持完整 HTML 渲染，
-    /// 这里提供一个简化版本，保留 Markdown 结构但以纯文本显示
-    pub fn render_plain(markdown: &str) -> String {
-        let mut result = String::new();
-        let mut in_code_block = false;
+    /// 创建新的渲染器实例
+    pub fn new() -> Self {
+        Self {
+            in_code_block: false,
+            code_buffer: String::new(),
+        }
+    }
 
-        for line in markdown.lines() {
-            // 代码块处理
-            if line.starts_with("```") {
-                in_code_block = !in_code_block;
-                if in_code_block {
-                    result.push_str("--- 代码块 ---\n");
-                } else {
-                    result.push_str("--- /代码块 ---\n");
+    /// 渲染 Markdown 内容到 egui UI
+    pub fn render(&mut self, ui: &mut Ui, markdown: &str) {
+        let options = Options::ENABLE_STRIKETHROUGH
+            | Options::ENABLE_TABLES
+            | Options::ENABLE_TASKLISTS;
+
+        let parser = Parser::new_ext(markdown, options);
+        let mut current_text = String::new();
+        let mut heading_level = 0;
+        let mut list_depth = 0;
+        let mut in_blockquote = false;
+        let mut in_emphasis = false;
+        let mut in_strong = false;
+
+        for event in parser {
+            match event {
+                Event::Start(tag) => {
+                    // 先输出之前累积的文本
+                    if !current_text.is_empty() {
+                        self.render_text(ui, &current_text, in_emphasis, in_strong, in_blockquote);
+                        current_text.clear();
+                    }
+
+                    match tag {
+                        Tag::Heading { level, .. } => {
+                            heading_level = level as u32;
+                        }
+                        Tag::List(_) => {
+                            list_depth += 1;
+                        }
+                        Tag::Item => {
+                            let indent = "  ".repeat(list_depth - 1);
+                            current_text.push_str(&format!("{}• ", indent));
+                        }
+                        Tag::BlockQuote(_) => {
+                            in_blockquote = true;
+                        }
+                        Tag::Emphasis => {
+                            in_emphasis = true;
+                        }
+                        Tag::Strong => {
+                            in_strong = true;
+                        }
+                        Tag::CodeBlock(_) => {
+                            self.in_code_block = true;
+                            ui.separator();
+                            ui.label(RichText::new("代码块:").strong().small());
+                        }
+                        Tag::Paragraph => {}
+                        _ => {}
+                    }
                 }
-                continue;
-            }
-
-            if in_code_block {
-                result.push_str(line);
-                result.push('\n');
-                continue;
-            }
-
-            // 标题处理
-            if line.starts_with("# ") {
-                result.push_str(&format!["📌 {}\n", &line[2..]]);
-            } else if line.starts_with("## ") {
-                result.push_str(&format!["📌 {}\n", &line[3..]]);
-            } else if line.starts_with("### ") {
-                result.push_str(&format!["📌 {}\n", &line[4..]]);
-            } else if line.starts_with("#### ") {
-                result.push_str(&format!["📌 {}\n", &line[5..]]);
-            }
-            // 列表处理
-            else if line.starts_with("- ") || line.starts_with("* ") {
-                result.push_str(&format!["  • {}\n", &line[2..]]);
-            } else if line.starts_with("  - ") || line.starts_with("  * ") {
-                result.push_str(&format!["    ◦ {}\n", &line[4..]]);
-            }
-            // 有序列表
-            else if let Some(pos) = line.find(". ") {
-                if line[..pos].chars().all(|c| c.is_ascii_digit()) {
-                    result.push_str(&format!["  {}\n", line]);
-                } else {
-                    result.push_str(line);
-                    result.push('\n');
+                Event::End(tag_end) => {
+                    match tag_end {
+                        TagEnd::Heading(_) => {
+                            if !current_text.is_empty() {
+                                self.render_heading(ui, &current_text, heading_level);
+                                current_text.clear();
+                            }
+                            heading_level = 0;
+                        }
+                        TagEnd::List(_) => {
+                            list_depth -= 1;
+                            if list_depth == 0 {
+                                ui.add_space(4.0);
+                            }
+                        }
+                        TagEnd::Item => {
+                            if !current_text.is_empty() {
+                                self.render_text(ui, &current_text, false, false, false);
+                                current_text.clear();
+                            }
+                        }
+                        TagEnd::BlockQuote(_) => {
+                            in_blockquote = false;
+                        }
+                        TagEnd::Emphasis => {
+                            in_emphasis = false;
+                        }
+                        TagEnd::Strong => {
+                            in_strong = false;
+                        }
+                        TagEnd::CodeBlock => {
+                            self.in_code_block = false;
+                            if !self.code_buffer.is_empty() {
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut self.code_buffer.as_str())
+                                        .code_editor()
+                                        .desired_width(f32::INFINITY),
+                                );
+                                self.code_buffer.clear();
+                            }
+                            ui.separator();
+                        }
+                        TagEnd::Paragraph => {
+                            if !current_text.is_empty() {
+                                self.render_text(ui, &current_text, in_emphasis, in_strong, in_blockquote);
+                                current_text.clear();
+                            }
+                        }
+                        _ => {}
+                    }
                 }
-            }
-            // 引用
-            else if line.starts_with("> ") {
-                result.push_str(&format!["  │ {}\n", &line[2..]]);
-            }
-            // 分割线
-            else if line.starts_with("---") || line.starts_with("***") || line.starts_with("___") {
-                result.push_str("────────────────────────────\n");
-            }
-            // 普通行
-            else {
-                result.push_str(line);
-                result.push('\n');
+                Event::Text(text) => {
+                    if self.in_code_block {
+                        self.code_buffer.push_str(&text);
+                    } else {
+                        current_text.push_str(&text);
+                    }
+                }
+                Event::Code(code) => {
+                    if !current_text.is_empty() {
+                        self.render_text(ui, &current_text, false, false, in_blockquote);
+                        current_text.clear();
+                    }
+                    ui.label(RichText::new(code.to_string()).monospace().background_color(Color32::from_rgb(240, 240, 240)));
+                }
+                Event::Rule => {
+                    if !current_text.is_empty() {
+                        self.render_text(ui, &current_text, false, false, in_blockquote);
+                        current_text.clear();
+                    }
+                    ui.separator();
+                }
+                Event::SoftBreak | Event::HardBreak => {
+                    current_text.push('\n');
+                }
+                _ => {}
             }
         }
 
-        result
-    }
-
-    /// 渲染 Markdown 为 RichText 段落列表
-    ///
-    /// 返回 (文本, 是否代码块) 的列表
-    pub fn render_to_segments(markdown: &str) -> Vec<(String, bool)> {
-        let mut segments = Vec::new();
-        let mut current_segment = String::new();
-        let mut in_code_block = false;
-
-        for line in markdown.lines() {
-            if line.starts_with("```") {
-                // 保存当前段落
-                if !current_segment.is_empty() {
-                    segments.push((current_segment.clone(), false));
-                    current_segment.clear();
-                }
-                in_code_block = !in_code_block;
-                continue;
-            }
-
-            if in_code_block {
-                current_segment.push_str(line);
-                current_segment.push('\n');
-            } else {
-                // 标题前添加空行
-                if line.starts_with('#') && !current_segment.is_empty() {
-                    segments.push((current_segment.clone(), false));
-                    current_segment.clear();
-                    current_segment.push('\n');
-                }
-
-                current_segment.push_str(line);
-                current_segment.push('\n');
-
-                // 标题后添加空行
-                if line.starts_with('#') {
-                    segments.push((current_segment.clone(), false));
-                    current_segment.clear();
-                }
-            }
+        // 输出剩余文本
+        if !current_text.is_empty() {
+            self.render_text(ui, &current_text, in_emphasis, in_strong, in_blockquote);
         }
+    }
 
-        if !current_segment.is_empty() {
-            segments.push((current_segment, in_code_block));
+    /// 渲染标题
+    fn render_heading(&self, ui: &mut Ui, text: &str, level: u32) {
+        let rich_text = match level {
+            1 => RichText::new(text).strong().size(24.0),
+            2 => RichText::new(text).strong().size(20.0),
+            3 => RichText::new(text).strong().size(16.0),
+            4 => RichText::new(text).strong().size(14.0),
+            _ => RichText::new(text).strong().size(13.0),
+        };
+        ui.add_space(8.0);
+        ui.label(rich_text);
+        ui.add_space(4.0);
+    }
+
+    /// 渲染普通文本
+    fn render_text(
+        &self,
+        ui: &mut Ui,
+        text: &str,
+        emphasis: bool,
+        strong: bool,
+        blockquote: bool,
+    ) {
+        let mut rich_text = RichText::new(text.to_string());
+
+        if strong {
+            rich_text = rich_text.strong();
         }
-
-        segments
-    }
-
-    /// 创建标题样式
-    pub fn heading_text(text: &str) -> RichText {
-        RichText::new(text).strong().size(16.0)
-    }
-
-    /// 创建二级标题样式
-    pub fn heading2_text(text: &str) -> RichText {
-        RichText::new(text).strong().size(14.0)
-    }
-
-    /// 创建代码样式
-    pub fn code_text(text: &str) -> RichText {
-        RichText::new(text).monospace()
-    }
-
-    /// 创建引用样式
-    pub fn quote_text(text: &str) -> RichText {
-        RichText::new(text).italics()
+        if emphasis {
+            rich_text = rich_text.italics();
+        }
+        if blockquote {
+            rich_text = rich_text.italics().color(Color32::GRAY);
+            ui.horizontal(|ui| {
+                ui.label("│");
+                ui.label(rich_text);
+            });
+        } else {
+            ui.label(rich_text);
+        }
     }
 }
