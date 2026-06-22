@@ -132,12 +132,22 @@ impl ApiTesterUi {
                     ui.separator();
                 }
 
-                if ui
-                    .button(RichText::new("历史").strong())
-                    .on_hover_text("显示/隐藏请求历史")
-                    .clicked()
-                {
-                    self.show_history = !self.show_history;
+                if self.show_history {
+                    if ui
+                        .button(RichText::new("返回").strong())
+                        .on_hover_text("返回主界面")
+                        .clicked()
+                    {
+                        self.show_history = false;
+                    }
+                } else {
+                    if ui
+                        .button(RichText::new("历史").strong())
+                        .on_hover_text("显示请求历史")
+                        .clicked()
+                    {
+                        self.show_history = true;
+                    }
                 }
             });
         });
@@ -148,7 +158,7 @@ impl ApiTesterUi {
             ui.horizontal_top(|ui| {
                 // 左侧历史面板
                 ui.vertical(|ui| {
-                    ui.set_min_width(200.0);
+                    ui.set_min_width(360.0);
                     ui.label(RichText::new("请求历史").strong());
                     ui.separator();
                     self.render_history_panel(ui, conn);
@@ -427,62 +437,160 @@ impl ApiTesterUi {
     fn render_history_panel(&mut self, ui: &mut Ui, conn: &rusqlite::Connection) {
         let mut to_load: Option<i64> = None;
         let mut to_delete: Option<i64> = None;
+        let mut clear_all = false;
 
+        // 工具栏：显示记录数和清空按钮
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!("共 {} 条记录", self.history.len()))
+                    .color(Color32::GRAY)
+                    .small(),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .small_button(RichText::new("清空").color(Color32::from_rgb(200, 0, 0)))
+                    .on_hover_text("清空所有历史记录")
+                    .clicked()
+                {
+                    clear_all = true;
+                }
+            });
+        });
+        ui.separator();
+
+        // 使用 Grid 实现表格，参考 Hosts 管理器的实现方式
         egui::ScrollArea::vertical()
             .id_salt("api_history_scroll")
-            .max_height(ui.available_height() - 50.0)
+            .auto_shrink([false, false])
             .show(ui, |ui| {
-                for (idx, history) in self.history.iter().enumerate() {
-                    ui.push_id(idx, |ui| {
-                        ui.horizontal(|ui| {
+                egui::Grid::new("api_history_table")
+                    .striped(true)
+                    .num_columns(5)
+                    .spacing([8.0, 4.0])
+                    .min_col_width(40.0)
+                    .show(ui, |ui| {
+                        // 表头
+                        ui.strong("方法");
+                        ui.strong("URL");
+                        ui.strong("状态");
+                        ui.strong("耗时");
+                        ui.strong("操作");
+                        ui.end_row();
+
+                        // 历史记录列表
+                        for history in &self.history {
                             let method_color = match history.method.as_str() {
                                 "GET" => Color32::from_rgb(0, 150, 0),
                                 "POST" => Color32::from_rgb(0, 0, 200),
                                 "PUT" => Color32::from_rgb(200, 150, 0),
                                 "DELETE" => Color32::from_rgb(200, 0, 0),
+                                "PATCH" => Color32::from_rgb(200, 100, 0),
                                 _ => Color32::GRAY,
                             };
 
+                            // 格式化耗时显示
+                            let elapsed_display = if let Some(ms) = history.elapsed_ms {
+                                if ms < 1000 {
+                                    format!("{}ms", ms)
+                                } else {
+                                    format!("{:.1}s", ms as f64 / 1000.0)
+                                }
+                            } else {
+                                "-".to_string()
+                            };
+
+                            // 方法列
                             ui.label(
                                 RichText::new(&history.method)
                                     .color(method_color)
                                     .strong()
-                                    .monospace(),
+                                    .monospace()
+                                    .small(),
                             );
 
-                            let url_display = if history.url.chars().count() > 30 {
-                                let truncated: String = history.url.chars().take(30).collect();
-                                format!("{}...", truncated)
-                            } else {
-                                history.url.clone()
-                            };
-
-                            if ui
-                                .link(&url_display)
-                                .on_hover_text(&history.url)
-                                .clicked()
-                            {
+                            // URL 列（可点击）
+                            let url_label = ui
+                                .label(
+                                    RichText::new(&history.url)
+                                        .small()
+                                        .color(Color32::from_rgb(100, 149, 237)),
+                                )
+                                .on_hover_text(&history.url);
+                            if url_label.clicked() {
                                 to_load = Some(history.id);
                             }
 
+                            // 状态码列
                             if let Some(status) = history.status_code {
                                 let status_color = if status < 300 {
                                     Color32::from_rgb(0, 150, 0)
                                 } else if status < 400 {
-                                    Color32::from_rgb(200, 200, 0)
+                                    Color32::from_rgb(200, 180, 0)
                                 } else {
                                     Color32::from_rgb(200, 0, 0)
                                 };
-                                ui.label(RichText::new(status.to_string()).color(status_color));
+                                ui.label(
+                                    RichText::new(status.to_string())
+                                        .color(status_color)
+                                        .small(),
+                                );
+                            } else {
+                                ui.label(RichText::new("-").color(Color32::GRAY).small());
                             }
-                        });
+
+                            // 耗时列
+                            ui.label(
+                                RichText::new(&elapsed_display)
+                                    .color(Color32::GRAY)
+                                    .small(),
+                            );
+
+                            // 删除按钮
+                            if ui
+                                .small_button(
+                                    RichText::new("×")
+                                        .color(Color32::from_rgb(200, 0, 0)),
+                                )
+                                .on_hover_text("删除此记录")
+                                .clicked()
+                            {
+                                to_delete = Some(history.id);
+                            }
+
+                            ui.end_row();
+                        }
                     });
-                }
             });
 
-        // 加载历史记录
+        // 执行操作
+        let store = ApiStore::new(conn);
+
         if let Some(id) = to_load {
             self.load_history_item(id, conn);
+        }
+
+        if let Some(id) = to_delete {
+            match store.delete_history(id) {
+                Ok(_) => {
+                    self.load_history(conn);
+                    log::info!("已删除历史记录: id={}", id);
+                }
+                Err(e) => {
+                    self.error = Some(format!("删除历史记录失败: {}", e));
+                }
+            }
+        }
+
+        if clear_all {
+            match store.clear_history() {
+                Ok(_) => {
+                    self.history.clear();
+                    log::info!("已清空所有历史记录");
+                }
+                Err(e) => {
+                    self.error = Some(format!("清空历史记录失败: {}", e));
+                }
+            }
         }
     }
 
