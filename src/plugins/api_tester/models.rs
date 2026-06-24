@@ -126,6 +126,7 @@ pub struct ApiRequest {
     pub method: HttpMethod,
     pub url: String,
     pub headers: Vec<HeaderEntry>,
+    pub params: Vec<HeaderEntry>,
     pub body_type: BodyType,
     pub body: String,
 }
@@ -140,9 +141,33 @@ impl ApiRequest {
             headers: vec![
                 HeaderEntry::new("Content-Type", "application/json"),
             ],
+            params: Vec::new(),
             body_type: BodyType::None,
             body: String::new(),
         }
+    }
+
+    /// 构建完整的 URL（包含查询参数）
+    pub fn build_url(&self) -> String {
+        let mut url = self.url.clone();
+        let enabled_params: Vec<_> = self.params.iter().filter(|p| p.enabled && !p.key.is_empty()).collect();
+
+        if !enabled_params.is_empty() {
+            let query_string: String = enabled_params
+                .iter()
+                .map(|p| format!("{}={}", urlencoding::encode(&p.key), urlencoding::encode(&p.value)))
+                .collect::<Vec<_>>()
+                .join("&");
+
+            if url.contains('?') {
+                url.push('&');
+            } else {
+                url.push('?');
+            }
+            url.push_str(&query_string);
+        }
+
+        url
     }
 }
 
@@ -210,4 +235,78 @@ pub enum RequestTab {
     Headers,
     Body,
     Params,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_url_no_params() {
+        let request = ApiRequest {
+            url: "https://example.com/api".to_string(),
+            params: vec![],
+            ..ApiRequest::new()
+        };
+        assert_eq!(request.build_url(), "https://example.com/api");
+    }
+
+    #[test]
+    fn test_build_url_with_params() {
+        let request = ApiRequest {
+            url: "https://example.com/api".to_string(),
+            params: vec![
+                HeaderEntry::new("key1", "value1"),
+                HeaderEntry::new("key2", "value2"),
+            ],
+            ..ApiRequest::new()
+        };
+        assert_eq!(request.build_url(), "https://example.com/api?key1=value1&key2=value2");
+    }
+
+    #[test]
+    fn test_build_url_with_existing_query() {
+        let request = ApiRequest {
+            url: "https://example.com/api?existing=param".to_string(),
+            params: vec![HeaderEntry::new("key1", "value1")],
+            ..ApiRequest::new()
+        };
+        assert_eq!(request.build_url(), "https://example.com/api?existing=param&key1=value1");
+    }
+
+    #[test]
+    fn test_build_url_skip_disabled_params() {
+        let mut param = HeaderEntry::new("key1", "value1");
+        param.enabled = false;
+
+        let request = ApiRequest {
+            url: "https://example.com/api".to_string(),
+            params: vec![param, HeaderEntry::new("key2", "value2")],
+            ..ApiRequest::new()
+        };
+        assert_eq!(request.build_url(), "https://example.com/api?key2=value2");
+    }
+
+    #[test]
+    fn test_build_url_skip_empty_key() {
+        let request = ApiRequest {
+            url: "https://example.com/api".to_string(),
+            params: vec![
+                HeaderEntry::empty(),
+                HeaderEntry::new("key2", "value2"),
+            ],
+            ..ApiRequest::new()
+        };
+        assert_eq!(request.build_url(), "https://example.com/api?key2=value2");
+    }
+
+    #[test]
+    fn test_build_url_encode_special_chars() {
+        let request = ApiRequest {
+            url: "https://example.com/api".to_string(),
+            params: vec![HeaderEntry::new("key", "value with spaces&special=chars")],
+            ..ApiRequest::new()
+        };
+        assert_eq!(request.build_url(), "https://example.com/api?key=value%20with%20spaces%26special%3Dchars");
+    }
 }

@@ -23,6 +23,7 @@ impl<'a> ApiStore<'a> {
                 method       TEXT NOT NULL,
                 url          TEXT NOT NULL,
                 headers      TEXT,
+                params       TEXT,
                 body_type    TEXT DEFAULT 'none',
                 body         TEXT,
                 status_code  INTEGER,
@@ -43,6 +44,20 @@ impl<'a> ApiStore<'a> {
             [],
         )?;
 
+        // 添加 params 列（如果不存在）
+        match self.conn.execute(
+            "ALTER TABLE api_history ADD COLUMN params TEXT",
+            [],
+        ) {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.extended_code == rusqlite::ffi::SQLITE_ERROR =>
+            {
+                // 列已存在，忽略错误
+            }
+            Err(e) => return Err(e.into()),
+        }
+
         Ok(())
     }
 
@@ -53,6 +68,7 @@ impl<'a> ApiStore<'a> {
         method: &str,
         url: &str,
         headers: &str,
+        params: &str,
         body_type: &str,
         body: &str,
         status_code: Option<i32>,
@@ -60,13 +76,14 @@ impl<'a> ApiStore<'a> {
         elapsed_ms: Option<i64>,
     ) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO api_history (request_id, method, url, headers, body_type, body, status_code, response, elapsed_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO api_history (request_id, method, url, headers, params, body_type, body, status_code, response, elapsed_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 request_id,
                 method,
                 url,
                 headers,
+                params,
                 body_type,
                 body,
                 status_code,
@@ -105,9 +122,9 @@ impl<'a> ApiStore<'a> {
     }
 
     /// 根据 ID 获取历史记录详情
-    pub fn get_history_by_id(&self, id: i64) -> Result<Option<(String, String, String, String)>> {
+    pub fn get_history_by_id(&self, id: i64) -> Result<Option<(String, String, String, String, String)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT method, url, headers, body FROM api_history WHERE id = ?1",
+            "SELECT method, url, headers, params, body FROM api_history WHERE id = ?1",
         )?;
 
         let result = stmt
@@ -117,6 +134,7 @@ impl<'a> ApiStore<'a> {
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2).unwrap_or_default(),
                     row.get::<_, String>(3).unwrap_or_default(),
+                    row.get::<_, String>(4).unwrap_or_default(),
                 ))
             })
             .optional()?;

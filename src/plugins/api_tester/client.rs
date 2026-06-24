@@ -6,6 +6,11 @@ use std::time::Instant;
 
 use super::models::{ApiRequest, ApiResponse, BodyType, HttpMethod};
 
+/// 解析 form 数据，失败时返回错误
+fn parse_form_data(body: &str) -> Result<Vec<(String, String)>> {
+    serde_json::from_str(body).context("解析 Form 数据失败，请检查 JSON 格式")
+}
+
 /// HTTP 客户端封装
 pub struct HttpClient {
     client: Client,
@@ -54,8 +59,7 @@ impl HttpClient {
                 }
                 BodyType::Form => {
                     // 解析 form 数据
-                    let form_data: Vec<(String, String)> =
-                        serde_json::from_str(&request.body).unwrap_or_default();
+                    let form_data = parse_form_data(&request.body)?;
                     req_builder = req_builder.form(&form_data);
                 }
                 BodyType::Raw => {
@@ -82,7 +86,12 @@ impl HttpClient {
         let headers: Vec<(String, String)> = response
             .headers()
             .iter()
-            .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+            .map(|(k, v)| {
+                (
+                    k.to_string(),
+                    v.to_str().unwrap_or("<非 UTF-8 值>").to_string(),
+                )
+            })
             .collect();
 
         // 获取响应体

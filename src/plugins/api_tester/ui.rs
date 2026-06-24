@@ -19,6 +19,8 @@ pub struct ApiTesterUi {
     response: Option<ApiResponse>,
     /// 请求头编辑临时数据
     headers: Vec<HeaderEntry>,
+    /// 查询参数编辑临时数据
+    params: Vec<HeaderEntry>,
     /// 请求体类型
     body_type: BodyType,
     /// 请求体内容
@@ -51,6 +53,7 @@ impl ApiTesterUi {
                 HeaderEntry::new("Content-Type", "application/json"),
                 HeaderEntry::new("Accept", "*/*"),
             ],
+            params: Vec::new(),
             body_type: BodyType::None,
             body: String::new(),
             request_tab: RequestTab::Headers,
@@ -90,7 +93,7 @@ impl ApiTesterUi {
     pub fn render(&mut self, ui: &mut Ui, conn: &rusqlite::Connection) {
         // 顶部标题栏
         ui.horizontal(|ui| {
-            ui.heading("🌐 API 调试工具");
+            ui.heading("🔍 API 调试工具");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // Mock 服务控制（仅 debug 模式）
                 #[cfg(debug_assertions)]
@@ -346,11 +349,49 @@ impl ApiTesterUi {
 
     /// 渲染查询参数编辑器
     fn render_params_editor(&mut self, ui: &mut Ui) {
-        ui.label("查询参数将自动添加到 URL 中");
-        ui.add_space(5.0);
+        let mut to_remove = Vec::new();
 
-        // TODO: 实现查询参数编辑器
-        ui.label("功能开发中...");
+        egui::Grid::new("params_grid")
+            .striped(true)
+            .num_columns(3)
+            .min_col_width(150.0)
+            .show(ui, |ui| {
+                // 表头
+                ui.label(RichText::new("启用").strong());
+                ui.label(RichText::new("Key").strong());
+                ui.label(RichText::new("Value").strong());
+                ui.end_row();
+
+                // 查询参数列表
+                for (i, param) in self.params.iter_mut().enumerate() {
+                    ui.checkbox(&mut param.enabled, "");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut param.key)
+                            .hint_text("Parameter Name")
+                            .desired_width(200.0),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut param.value)
+                            .hint_text("Parameter Value")
+                            .desired_width(ui.available_width() - 60.0),
+                    );
+
+                    if ui.button("删除").clicked() {
+                        to_remove.push(i);
+                    }
+                    ui.end_row();
+                }
+            });
+
+        // 删除标记的查询参数
+        for i in to_remove.into_iter().rev() {
+            self.params.remove(i);
+        }
+
+        ui.add_space(5.0);
+        if ui.button("添加查询参数").clicked() {
+            self.params.push(HeaderEntry::empty());
+        }
     }
 
     /// 渲染响应区域
@@ -598,7 +639,7 @@ impl ApiTesterUi {
     fn load_history_item(&mut self, id: i64, conn: &rusqlite::Connection) {
         let store = ApiStore::new(conn);
         match store.get_history_by_id(id) {
-            Ok(Some((method, url, headers, body))) => {
+            Ok(Some((method, url, headers, params, body))) => {
                 if let Some(m) = HttpMethod::from_str(&method) {
                     self.request.method = m;
                 }
@@ -610,6 +651,15 @@ impl ApiTesterUi {
                     {
                         self.headers = parsed_headers;
                     }
+                }
+
+                // 解析查询参数
+                if !params.is_empty() {
+                    if let Ok(parsed_params) = serde_json::from_str::<Vec<HeaderEntry>>(&params) {
+                        self.params = parsed_params;
+                    }
+                } else {
+                    self.params = Vec::new();
                 }
 
                 // 解析请求体
@@ -645,28 +695,35 @@ impl ApiTesterUi {
 
         // 更新请求配置
         self.request.headers = self.headers.clone();
+        self.request.params = self.params.clone();
         self.request.body_type = self.body_type.clone();
         self.request.body = self.body.clone();
 
-        // 发送请求
+        // 发送请求（使用 build_url 构建包含查询参数的完整 URL）
         if let Some(client) = &self.client {
-            match client.send(&self.request) {
+            let mut request_with_params = self.request.clone();
+            request_with_params.url = self.request.build_url();
+
+            match client.send(&request_with_params) {
                 Ok(response) => {
                     // 保存到历史记录
                     let store = ApiStore::new(conn);
                     let headers_json =
                         serde_json::to_string(&self.request.headers).unwrap_or_default();
+                    let params_json =
+                        serde_json::to_string(&self.request.params).unwrap_or_default();
 
                     match store.save_history(
                         &self.request.id,
                         self.request.method.as_str(),
                         &self.request.url,
                         &headers_json,
+                        &params_json,
                         self.request.body_type.as_str(),
                         &self.request.body,
-                        Some(response.status_code as i32),
+                        Some(i32::from(response.status_code)),
                         Some(&response.body),
-                        Some(response.elapsed_ms as i64),
+                        Some(i64::try_from(response.elapsed_ms).unwrap_or(i64::MAX)),
                     ) {
                         Ok(_) => {
                             // 重新加载历史记录

@@ -280,6 +280,7 @@ similar = "2.6"  # 文本差异对比库
 | 请求方法选择 | GET/POST/PUT/DELETE/PATCH | P0 |
 | URL 输入 | 请求地址输入框 | P0 |
 | 请求头编辑 | Key-Value 形式编辑请求头 | P0 |
+| 查询参数编辑 | Key-Value 形式编辑查询参数，自动添加到 URL | P0 |
 | 请求体编辑 | JSON/Form/Raw 格式请求体 | P0 |
 | 发送请求 | 发送 HTTP 请求 | P0 |
 | 响应显示 | 显示响应状态码、响应头、响应体 | P0 |
@@ -291,7 +292,7 @@ similar = "2.6"  # 文本差异对比库
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│  🌐 API 调试工具                     [ 发送 ] [ 保存 ] [ 历史 ]      │
+│  🔍 API 调试工具                     [ 发送 ] [ 保存 ] [ 历史 ]      │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                     │
 │  请求配置：                                                          │
@@ -361,6 +362,14 @@ pub enum HttpMethod {
     Patch,
 }
 
+/// 请求头/查询参数键值对
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeaderEntry {
+    pub key: String,
+    pub value: String,
+    pub enabled: bool,
+}
+
 /// 请求配置
 #[derive(Debug, Clone)]
 pub struct ApiRequest {
@@ -368,10 +377,19 @@ pub struct ApiRequest {
     pub name: String,                  // 请求名称
     pub method: HttpMethod,            // 请求方法
     pub url: String,                   // 请求 URL
-    pub headers: Vec<(String, String)>, // 请求头
+    pub headers: Vec<HeaderEntry>,     // 请求头
+    pub params: Vec<HeaderEntry>,      // 查询参数
     pub body_type: BodyType,           // 请求体类型
     pub body: String,                  // 请求体内容
-    pub created_at: String,            // 创建时间
+}
+
+impl ApiRequest {
+    /// 构建完整的 URL（包含查询参数）
+    pub fn build_url(&self) -> String {
+        // 过滤启用且非空 key 的参数
+        // 使用 urlencoding 编码参数
+        // 拼接到原始 URL
+    }
 }
 
 /// 请求体类型
@@ -397,9 +415,13 @@ pub struct ApiResponse {
 /// 请求历史记录
 #[derive(Debug, Clone)]
 pub struct RequestHistory {
-    pub request: ApiRequest,           // 请求配置
-    pub response: ApiResponse,         // 响应结果
-    pub executed_at: String,           // 执行时间
+    pub id: i64,
+    pub request_id: String,
+    pub method: String,
+    pub url: String,
+    pub status_code: Option<i32>,
+    pub elapsed_ms: Option<i64>,
+    pub executed_at: String,
 }
 ```
 
@@ -416,16 +438,17 @@ src/plugins/api_tester/
 
 ### 2.4 实现步骤
 
-| 步骤 | 任务 | 说明 |
-|------|------|------|
-| 2.4.1 | 创建插件骨架 | 创建目录结构，实现 Plugin trait |
-| 2.4.2 | 实现请求配置 UI | URL 输入、方法选择、请求头/体编辑 |
-| 2.4.3 | 实现 HTTP 客户端 | 使用 reqwest 发送请求 |
-| 2.4.4 | 实现响应显示 | 状态码、响应头、响应体（JSON 格式化） |
-| 2.4.5 | 实现请求历史 | SQLite 存储历史记录 |
-| 2.4.6 | 添加 JSON 格式化 | 响应体 JSON 自动格式化显示 |
-| 2.4.7 | 实现导入/导出 | 请求配置的导入导出 |
-| 2.4.8 | 添加环境变量 | 支持 {{variable}} 变量替换 |
+| 步骤 | 任务 | 说明 | 状态 |
+|------|------|------|------|
+| 2.4.1 | 创建插件骨架 | 创建目录结构，实现 Plugin trait | ✅ |
+| 2.4.2 | 实现请求配置 UI | URL 输入、方法选择、请求头/体编辑 | ✅ |
+| 2.4.3 | 实现查询参数编辑 | Key-Value 形式编辑，自动添加到 URL | ✅ |
+| 2.4.4 | 实现 HTTP 客户端 | 使用 reqwest 发送请求 | ✅ |
+| 2.4.5 | 实现响应显示 | 状态码、响应头、响应体（JSON 格式化） | ✅ |
+| 2.4.6 | 实现请求历史 | SQLite 存储历史记录（含查询参数） | ✅ |
+| 2.4.7 | 添加 JSON 格式化 | 响应体 JSON 自动格式化显示 | ✅ |
+| 2.4.8 | 实现导入/导出 | 请求配置的导入导出 | ⏳ |
+| 2.4.9 | 添加环境变量 | 支持 {{variable}} 变量替换 | ⏳ |
 
 ### 2.5 依赖库
 
@@ -433,6 +456,7 @@ src/plugins/api_tester/
 [dependencies]
 reqwest = { version = "0.12", features = ["blocking", "json"] }  # HTTP 客户端
 uuid = { version = "1.0", features = ["v4"] }  # 生成唯一 ID
+urlencoding = "2.1"  # URL 参数编码
 ```
 
 ### 2.6 数据库设计
@@ -445,6 +469,7 @@ CREATE TABLE api_history (
     method       TEXT NOT NULL,           -- HTTP 方法
     url          TEXT NOT NULL,           -- 请求 URL
     headers      TEXT,                    -- 请求头 JSON
+    params       TEXT,                    -- 查询参数 JSON
     body_type    TEXT DEFAULT 'none',     -- 请求体类型
     body         TEXT,                    -- 请求体内容
     status_code  INTEGER,                -- 响应状态码
