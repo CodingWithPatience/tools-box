@@ -1,15 +1,24 @@
 use egui::{Color32, RichText, Ui};
+use std::collections::HashMap;
 
 use super::client::{HttpClient, format_json};
 use super::mock::MockServer;
 use super::models::{
-    ApiRequest, ApiResponse, BodyType, HeaderEntry, HttpMethod, RequestHistory, RequestTab,
-    ResponseTab,
+    ApiCollection, ApiRequest, ApiResponse, BodyType, Environment, EnvironmentVariable,
+    HeaderEntry, HttpMethod, RequestHistory, RequestTab, ResponseTab, SavedApiRequest,
+    VariableReplacer,
 };
 use super::store::ApiStore;
 
 /// Mock 服务器默认端口
 const MOCK_SERVER_PORT: u16 = 8089;
+
+/// 左侧面板视图
+#[derive(Debug, Clone, PartialEq)]
+enum LeftPanelView {
+    Collections,
+    History,
+}
 
 /// API 调试工具 UI
 pub struct ApiTesterUi {
@@ -42,6 +51,43 @@ pub struct ApiTesterUi {
     /// Mock 服务器（仅 debug 模式）
     #[cfg(debug_assertions)]
     mock_server: Option<MockServer>,
+
+    // ========== 集合相关 ==========
+    /// 集合列表
+    collections: Vec<ApiCollection>,
+    /// 保存的请求列表
+    saved_requests: Vec<SavedApiRequest>,
+    /// 当前选中的集合 ID
+    selected_collection_id: Option<i64>,
+    /// 左侧面板视图
+    left_panel_view: LeftPanelView,
+    /// 是否显示集合管理弹窗
+    show_collection_dialog: bool,
+    /// 集合编辑表单 - 名称
+    collection_form_name: String,
+    /// 集合编辑表单 - 描述
+    collection_form_description: String,
+    /// 编辑中的集合 ID
+    editing_collection_id: Option<i64>,
+
+    // ========== 环境相关 ==========
+    /// 环境列表
+    environments: Vec<Environment>,
+    /// 当前激活的环境
+    active_environment: Option<Environment>,
+    /// 环境变量列表
+    environment_variables: Vec<EnvironmentVariable>,
+    /// 是否显示环境管理弹窗
+    show_environment_dialog: bool,
+    /// 是否显示环境变量编辑弹窗
+    show_env_var_dialog: bool,
+    /// 编辑中的环境 ID
+    editing_environment_id: Option<i64>,
+    /// 环境变量编辑表单
+    env_var_form_key: String,
+    env_var_form_value: String,
+    /// 编辑中的环境变量 ID
+    editing_env_var_id: Option<i64>,
 }
 
 impl ApiTesterUi {
@@ -65,6 +111,25 @@ impl ApiTesterUi {
             is_sending: false,
             #[cfg(debug_assertions)]
             mock_server: None,
+
+            collections: Vec::new(),
+            saved_requests: Vec::new(),
+            selected_collection_id: None,
+            left_panel_view: LeftPanelView::Collections,
+            show_collection_dialog: false,
+            collection_form_name: String::new(),
+            collection_form_description: String::new(),
+            editing_collection_id: None,
+
+            environments: Vec::new(),
+            active_environment: None,
+            environment_variables: Vec::new(),
+            show_environment_dialog: false,
+            show_env_var_dialog: false,
+            editing_environment_id: None,
+            env_var_form_key: String::new(),
+            env_var_form_value: String::new(),
+            editing_env_var_id: None,
         }
     }
 
@@ -76,7 +141,9 @@ impl ApiTesterUi {
             Err(e) => self.error = Some(format!("初始化客户端失败: {}", e)),
         }
 
-        // 加载历史记录
+        // 加载数据
+        self.load_collections(conn);
+        self.load_environments(conn);
         self.load_history(conn);
     }
 
@@ -89,11 +156,125 @@ impl ApiTesterUi {
         }
     }
 
+    /// 加载集合列表
+    fn load_collections(&mut self, conn: &rusqlite::Connection) {
+        let store = ApiStore::new(conn);
+        match store.get_all_collections() {
+            Ok(collections) => self.collections = collections,
+            Err(e) => self.error = Some(format!("加载集合失败: {}", e)),
+        }
+    }
+
+    /// 加载集合下的请求
+    fn load_saved_requests(&mut self, conn: &rusqlite::Connection) {
+        let store = ApiStore::new(conn);
+        match store.get_requests_by_collection(self.selected_collection_id) {
+            Ok(requests) => self.saved_requests = requests,
+            Err(e) => self.error = Some(format!("加载请求失败: {}", e)),
+        }
+    }
+
+    /// 加载环境列表
+    fn load_environments(&mut self, conn: &rusqlite::Connection) {
+        let store = ApiStore::new(conn);
+        match store.get_all_environments() {
+            Ok(environments) => {
+                self.environments = environments;
+                self.active_environment = self.environments.iter().find(|e| e.is_active).cloned();
+            }
+            Err(e) => self.error = Some(format!("加载环境失败: {}", e)),
+        }
+    }
+
+    /// 加载环境变量
+    fn load_environment_variables(&mut self, conn: &rusqlite::Connection) {
+        let store = ApiStore::new(conn);
+        match store.get_all_active_variables() {
+            Ok(variables) => self.environment_variables = variables,
+            Err(e) => self.error = Some(format!("加载环境变量失败: {}", e)),
+        }
+    }
+
+    /// 获取变量替换器
+    fn get_variable_replacer(&self) -> VariableReplacer {
+        let mut variables = HashMap::new();
+        for var in &self.environment_variables {
+            if var.enabled {
+                variables.insert(var.key.clone(), var.value.clone());
+            }
+        }
+        VariableReplacer::new(variables)
+    }
+
+    /// 替换请求中的变量
+    fn replace_variables_in_request(&self, request: &ApiRequest) -> ApiRequest {
+        let replacer = self.get_variable_replacer();
+        let mut replaced = request.clone();
+        replaced.url = replacer.replace(&request.url);
+        replaced.body = replacer.replace(&request.body);
+
+        // 替换请求头中的变量
+        for header in &mut replaced.headers {
+            header.key = replacer.replace(&header.key);
+            header.value = replacer.replace(&header.value);
+        }
+
+        // 替换查询参数中的变量
+        for param in &mut replaced.params {
+            param.key = replacer.replace(&param.key);
+            param.value = replacer.replace(&param.value);
+        }
+
+        replaced
+    }
+
     /// 渲染主界面
     pub fn render(&mut self, ui: &mut Ui, conn: &rusqlite::Connection) {
         // 顶部标题栏
         ui.horizontal(|ui| {
             ui.heading("🔍 API 调试工具");
+
+            // 环境选择
+            ui.separator();
+            let env_name = self
+                .active_environment
+                .as_ref()
+                .map(|e| e.name.clone())
+                .unwrap_or_else(|| "全局".to_string());
+            let envs = self.environments.clone();
+            let mut env_to_activate: Option<i64> = None;
+            let mut show_env_dialog = false;
+
+            egui::ComboBox::from_id_salt("environment_select")
+                .selected_text(format!("环境: {}", env_name))
+                .show_ui(ui, |ui| {
+                    for env in &envs {
+                        if ui
+                            .selectable_label(env.is_active, &env.name)
+                            .clicked()
+                        {
+                            env_to_activate = Some(env.id);
+                        }
+                    }
+                    ui.separator();
+                    if ui.button("管理环境...").clicked() {
+                        show_env_dialog = true;
+                    }
+                });
+
+            if let Some(env_id) = env_to_activate {
+                let store = ApiStore::new(conn);
+                if let Err(e) = store.activate_environment(env_id) {
+                    self.error = Some(format!("切换环境失败: {}", e));
+                } else {
+                    self.load_environments(conn);
+                    self.load_environment_variables(conn);
+                }
+            }
+            if show_env_dialog {
+                self.show_environment_dialog = true;
+            }
+
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // Mock 服务控制（仅 debug 模式）
                 #[cfg(debug_assertions)]
@@ -135,13 +316,32 @@ impl ApiTesterUi {
                     ui.separator();
                 }
 
-                if self.show_history {
+                // 新建请求按钮
+                if ui
+                    .button(RichText::new("+ 新建请求").strong())
+                    .clicked()
+                {
+                    self.request = ApiRequest::new();
+                    self.headers = vec![
+                        HeaderEntry::new("Content-Type", "application/json"),
+                        HeaderEntry::new("Accept", "*/*"),
+                    ];
+                    self.params = Vec::new();
+                    self.body_type = BodyType::None;
+                    self.body = String::new();
+                    self.response = None;
+                }
+
+                // 历史按钮
+                if self.left_panel_view == LeftPanelView::History {
                     if ui
-                        .button(RichText::new("返回").strong())
-                        .on_hover_text("返回主界面")
+                        .button(RichText::new("集合").strong())
+                        .on_hover_text("显示集合")
                         .clicked()
                     {
-                        self.show_history = false;
+                        self.left_panel_view = LeftPanelView::Collections;
+                        self.load_collections(conn);
+                        self.load_saved_requests(conn);
                     }
                 } else {
                     if ui
@@ -149,34 +349,519 @@ impl ApiTesterUi {
                         .on_hover_text("显示请求历史")
                         .clicked()
                     {
-                        self.show_history = true;
+                        self.left_panel_view = LeftPanelView::History;
+                        self.load_history(conn);
                     }
                 }
             });
         });
         ui.separator();
 
-        // 主内容区域
-        if self.show_history {
-            ui.horizontal_top(|ui| {
-                // 左侧历史面板
-                ui.vertical(|ui| {
-                    ui.set_min_width(360.0);
-                    ui.label(RichText::new("请求历史").strong());
-                    ui.separator();
-                    self.render_history_panel(ui, conn);
-                });
+        // 主内容区域 - 左右分栏
+        ui.horizontal_top(|ui| {
+            // 左侧面板
+            ui.vertical(|ui| {
+                ui.set_min_width(250.0);
+                ui.set_max_width(350.0);
 
+                match self.left_panel_view {
+                    LeftPanelView::Collections => {
+                        self.render_collections_panel(ui, conn);
+                    }
+                    LeftPanelView::History => {
+                        self.render_history_panel(ui, conn);
+                    }
+                }
+            });
+
+            ui.separator();
+
+            // 右侧主内容
+            ui.vertical(|ui| {
+                self.render_main_content(ui, conn);
+            });
+        });
+
+        // 弹窗
+        if self.show_collection_dialog {
+            self.render_collection_dialog(ui, conn);
+        }
+        if self.show_environment_dialog {
+            self.render_environment_dialog(ui, conn);
+        }
+        if self.show_env_var_dialog {
+            self.render_env_var_dialog(ui, conn);
+        }
+    }
+
+    /// 渲染集合面板
+    fn render_collections_panel(&mut self, ui: &mut Ui, conn: &rusqlite::Connection) {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("集合").strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("+").on_hover_text("新建集合").clicked() {
+                    self.editing_collection_id = None;
+                    self.collection_form_name.clear();
+                    self.collection_form_description.clear();
+                    self.show_collection_dialog = true;
+                }
+            });
+        });
+        ui.separator();
+
+        egui::ScrollArea::vertical()
+            .id_salt("collections_scroll")
+            .show(ui, |ui| {
+                // 全部请求（未分类）
+                let all_selected = self.selected_collection_id.is_none();
+                if ui
+                    .selectable_label(all_selected, "📁 全部请求")
+                    .clicked()
+                {
+                    self.selected_collection_id = None;
+                    self.load_saved_requests(conn);
+                }
+
+                ui.add_space(4.0);
+
+                // 渲染集合树
+                self.render_collection_tree(ui, conn, None, 0);
+            });
+
+        ui.add_space(10.0);
+
+        // 显示当前集合下的请求
+        ui.label(RichText::new("请求列表").strong());
+        ui.separator();
+
+        let saved_requests = self.saved_requests.clone();
+        let mut request_to_load: Option<SavedApiRequest> = None;
+        let mut request_to_delete: Option<i64> = None;
+
+        egui::ScrollArea::vertical()
+            .id_salt("requests_scroll")
+            .show(ui, |ui| {
+                if saved_requests.is_empty() {
+                    ui.label(RichText::new("暂无保存的请求").color(Color32::GRAY).small());
+                } else {
+                    for request in &saved_requests {
+                        let method_color = match request.method.as_str() {
+                            "GET" => Color32::from_rgb(0, 150, 0),
+                            "POST" => Color32::from_rgb(0, 0, 200),
+                            "PUT" => Color32::from_rgb(200, 150, 0),
+                            "DELETE" => Color32::from_rgb(200, 0, 0),
+                            "PATCH" => Color32::from_rgb(200, 100, 0),
+                            _ => Color32::GRAY,
+                        };
+
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(request.method.as_str())
+                                    .color(method_color)
+                                    .strong()
+                                    .monospace()
+                                    .small(),
+                            );
+
+                            if ui
+                                .selectable_label(false, &request.name)
+                                .on_hover_text(&format!("{} {}", request.method, request.url))
+                                .clicked()
+                            {
+                                request_to_load = Some(request.clone());
+                            }
+
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui
+                                    .small_button("×")
+                                    .on_hover_text("删除")
+                                    .clicked()
+                                {
+                                    request_to_delete = Some(request.id);
+                                }
+                            });
+                        });
+                    }
+                }
+            });
+
+        if let Some(request) = request_to_load {
+            self.request.name = request.name;
+            self.request.method = request.method;
+            self.request.url = request.url;
+            self.headers = request.headers;
+            self.params = request.params;
+            self.body_type = request.body_type;
+            self.body = request.body;
+            self.response = None;
+        }
+
+        if let Some(id) = request_to_delete {
+            let store = ApiStore::new(conn);
+            if let Err(e) = store.delete_saved_request(id) {
+                self.error = Some(format!("删除请求失败: {}", e));
+            } else {
+                self.load_saved_requests(conn);
+            }
+        }
+    }
+
+    /// 渲染集合树（递归）
+    fn render_collection_tree(
+        &mut self,
+        ui: &mut Ui,
+        conn: &rusqlite::Connection,
+        parent_id: Option<i64>,
+        depth: usize,
+    ) {
+        let collections: Vec<_> = self
+            .collections
+            .iter()
+            .filter(|c| c.parent_id == parent_id)
+            .cloned()
+            .collect();
+
+        let mut collection_to_select: Option<i64> = None;
+        let mut collection_to_edit: Option<ApiCollection> = None;
+
+        for collection in &collections {
+            let is_selected = self.selected_collection_id == Some(collection.id);
+            let indent = "  ".repeat(depth);
+            let label_text = format!("{}📁 {}", indent, collection.name);
+
+            ui.horizontal(|ui| {
+                if ui
+                    .selectable_label(is_selected, &label_text)
+                    .clicked()
+                {
+                    collection_to_select = Some(collection.id);
+                }
+
+                // 编辑按钮
+                if ui.small_button("...").clicked() {
+                    collection_to_edit = Some(collection.clone());
+                }
+            });
+
+            // 递归渲染子集合
+            self.render_collection_tree(ui, conn, Some(collection.id), depth + 1);
+        }
+
+        if let Some(id) = collection_to_select {
+            self.selected_collection_id = Some(id);
+            self.load_saved_requests(conn);
+        }
+
+        if let Some(collection) = collection_to_edit {
+            self.editing_collection_id = Some(collection.id);
+            self.collection_form_name = collection.name;
+            self.collection_form_description = collection.description;
+            self.show_collection_dialog = true;
+        }
+    }
+
+    /// 渲染集合管理弹窗
+    fn render_collection_dialog(&mut self, ui: &mut Ui, conn: &rusqlite::Connection) {
+        egui::Window::new(if self.editing_collection_id.is_some() {
+            "编辑集合"
+        } else {
+            "新建集合"
+        })
+        .collapsible(false)
+        .resizable(false)
+        .show(ui.ctx(), |ui| {
+            ui.horizontal(|ui| {
+                ui.label("集合名称:");
+                ui.text_edit_singleline(&mut self.collection_form_name);
+            });
+
+            ui.horizontal(|ui| {
+                ui.label("描述:");
+                ui.text_edit_singleline(&mut self.collection_form_description);
+            });
+
+            ui.add_space(10.0);
+
+            ui.horizontal(|ui| {
+                if ui.button("保存").clicked() {
+                    if self.collection_form_name.is_empty() {
+                        self.error = Some("集合名称不能为空".to_string());
+                    } else {
+                        let store = ApiStore::new(conn);
+                        if let Some(id) = self.editing_collection_id {
+                            if let Err(e) = store.update_collection(
+                                id,
+                                &self.collection_form_name,
+                                &self.collection_form_description,
+                            ) {
+                                self.error = Some(format!("更新集合失败: {}", e));
+                            }
+                        } else if let Err(e) = store.create_collection(
+                            &self.collection_form_name,
+                            None,
+                        ) {
+                            self.error = Some(format!("创建集合失败: {}", e));
+                        }
+                        self.load_collections(conn);
+                        self.show_collection_dialog = false;
+                    }
+                }
+
+                if self.editing_collection_id.is_some() {
+                    if ui
+                        .button(RichText::new("删除").color(Color32::from_rgb(200, 0, 0)))
+                        .clicked()
+                    {
+                        if let Some(id) = self.editing_collection_id {
+                            let store = ApiStore::new(conn);
+                            if let Err(e) = store.delete_collection(id) {
+                                self.error = Some(format!("删除集合失败: {}", e));
+                            } else {
+                                self.load_collections(conn);
+                                self.show_collection_dialog = false;
+                            }
+                        }
+                    }
+                }
+
+                if ui.button("取消").clicked() {
+                    self.show_collection_dialog = false;
+                }
+            });
+        });
+    }
+
+    /// 渲染环境管理弹窗
+    fn render_environment_dialog(&mut self, ui: &mut Ui, conn: &rusqlite::Connection) {
+        egui::Window::new("环境管理")
+            .collapsible(false)
+            .resizable(true)
+            .default_width(500.0)
+            .show(ui.ctx(), |ui| {
+                ui.label("环境列表:");
                 ui.separator();
 
-                // 右侧主内容
-                ui.vertical(|ui| {
-                    self.render_main_content(ui, conn);
+                egui::Grid::new("environments_grid")
+                    .striped(true)
+                    .num_columns(3)
+                    .show(ui, |ui| {
+                        // 表头
+                        ui.label(RichText::new("环境名称").strong());
+                        ui.label(RichText::new("状态").strong());
+                        ui.label(RichText::new("操作").strong());
+                        ui.end_row();
+
+                        let envs = self.environments.clone();
+                        for env in &envs {
+                            ui.label(&env.name);
+
+                            let status = if env.is_active {
+                                "当前选中"
+                            } else if env.is_default {
+                                "默认"
+                            } else {
+                                ""
+                            };
+                            ui.label(status);
+
+                            ui.horizontal(|ui| {
+                                if !env.is_default {
+                                    if ui.small_button("编辑").clicked() {
+                                        self.editing_environment_id = Some(env.id);
+                                        self.show_env_var_dialog = true;
+                                        self.load_environment_variables(conn);
+                                    }
+                                    if ui
+                                        .small_button(
+                                            RichText::new("删除")
+                                                .color(Color32::from_rgb(200, 0, 0)),
+                                        )
+                                        .clicked()
+                                    {
+                                        let store = ApiStore::new(conn);
+                                        if let Err(e) = store.delete_environment(env.id) {
+                                            self.error = Some(format!("删除环境失败: {}", e));
+                                        } else {
+                                            self.load_environments(conn);
+                                        }
+                                    }
+                                } else {
+                                    if ui.small_button("编辑变量").clicked() {
+                                        self.editing_environment_id = Some(env.id);
+                                        self.show_env_var_dialog = true;
+                                        self.load_environment_variables(conn);
+                                    }
+                                }
+                            });
+
+                            ui.end_row();
+                        }
+                    });
+
+                ui.add_space(10.0);
+
+                ui.horizontal(|ui| {
+                    if ui.button("+ 新增环境").clicked() {
+                        let store = ApiStore::new(conn);
+                        match store.create_environment("新环境") {
+                            Ok(_) => {
+                                self.load_environments(conn);
+                            }
+                            Err(e) => {
+                                self.error = Some(format!("创建环境失败: {}", e));
+                            }
+                        }
+                    }
+
+                    if ui.button("关闭").clicked() {
+                        self.show_environment_dialog = false;
+                    }
                 });
             });
-        } else {
-            self.render_main_content(ui, conn);
-        }
+    }
+
+    /// 渲染环境变量编辑弹窗
+    fn render_env_var_dialog(&mut self, ui: &mut Ui, conn: &rusqlite::Connection) {
+        let env_id = self.editing_environment_id.unwrap_or(0);
+        let env_name = self
+            .environments
+            .iter()
+            .find(|e| e.id == env_id)
+            .map(|e| e.name.clone())
+            .unwrap_or_default();
+
+        egui::Window::new(format!("编辑环境: {}", env_name))
+            .collapsible(false)
+            .resizable(true)
+            .default_width(500.0)
+            .show(ui.ctx(), |ui| {
+                // 环境名称编辑（非默认环境）
+                let is_default = self
+                    .environments
+                    .iter()
+                    .find(|e| e.id == env_id)
+                    .map(|e| e.is_default)
+                    .unwrap_or(false);
+
+                if !is_default {
+                    ui.horizontal(|ui| {
+                        ui.label("环境名称:");
+                        // 这里可以添加名称编辑功能
+                    });
+                    ui.add_space(5.0);
+                }
+
+                ui.label("变量列表:");
+                ui.separator();
+
+                egui::Grid::new("env_vars_grid")
+                    .striped(true)
+                    .num_columns(4)
+                    .min_col_width(100.0)
+                    .show(ui, |ui| {
+                        // 表头
+                        ui.label(RichText::new("启用").strong());
+                        ui.label(RichText::new("Key").strong());
+                        ui.label(RichText::new("Value").strong());
+                        ui.label(RichText::new("操作").strong());
+                        ui.end_row();
+
+                        let vars = self.environment_variables.clone();
+                        for var in &vars {
+                            if var.environment_id == env_id {
+                                let mut enabled = var.enabled;
+                                ui.checkbox(&mut enabled, "");
+                                // TODO: 更新 enabled 状态
+                                ui.label(&var.key);
+                                ui.label(&var.value);
+
+                                ui.horizontal(|ui| {
+                                    if ui.small_button("编辑").clicked() {
+                                        self.editing_env_var_id = Some(var.id);
+                                        self.env_var_form_key = var.key.clone();
+                                        self.env_var_form_value = var.value.clone();
+                                    }
+                                    if ui
+                                        .small_button(
+                                            RichText::new("删除")
+                                                .color(Color32::from_rgb(200, 0, 0)),
+                                        )
+                                        .clicked()
+                                    {
+                                        let store = ApiStore::new(conn);
+                                        if let Err(e) = store.delete_environment_variable(var.id) {
+                                            self.error =
+                                                Some(format!("删除变量失败: {}", e));
+                                        } else {
+                                            self.load_environment_variables(conn);
+                                        }
+                                    }
+                                });
+
+                                ui.end_row();
+                            }
+                        }
+                    });
+
+                ui.add_space(10.0);
+
+                // 添加/编辑变量
+                ui.horizontal(|ui| {
+                    ui.label("Key:");
+                    ui.text_edit_singleline(&mut self.env_var_form_key);
+                    ui.label("Value:");
+                    ui.text_edit_singleline(&mut self.env_var_form_value);
+
+                    let btn_text = if self.editing_env_var_id.is_some() {
+                        "更新"
+                    } else {
+                        "添加"
+                    };
+
+                    if ui.button(btn_text).clicked() {
+                        if self.env_var_form_key.is_empty() {
+                            self.error = Some("变量名不能为空".to_string());
+                        } else {
+                            let store = ApiStore::new(conn);
+                            if let Some(var_id) = self.editing_env_var_id {
+                                if let Err(e) = store.update_environment_variable(
+                                    var_id,
+                                    &self.env_var_form_key,
+                                    &self.env_var_form_value,
+                                    true,
+                                ) {
+                                    self.error = Some(format!("更新变量失败: {}", e));
+                                }
+                            } else if let Err(e) = store.create_environment_variable(
+                                env_id,
+                                &self.env_var_form_key,
+                                &self.env_var_form_value,
+                            ) {
+                                self.error = Some(format!("添加变量失败: {}", e));
+                            }
+                            self.env_var_form_key.clear();
+                            self.env_var_form_value.clear();
+                            self.editing_env_var_id = None;
+                            self.load_environment_variables(conn);
+                        }
+                    }
+
+                    if self.editing_env_var_id.is_some() && ui.button("取消").clicked() {
+                        self.env_var_form_key.clear();
+                        self.env_var_form_value.clear();
+                        self.editing_env_var_id = None;
+                    }
+                });
+
+                ui.add_space(10.0);
+
+                if ui.button("关闭").clicked() {
+                    self.show_env_var_dialog = false;
+                    self.editing_env_var_id = None;
+                    self.env_var_form_key.clear();
+                    self.env_var_form_value.clear();
+                }
+            });
     }
 
     /// 渲染主内容区域
@@ -699,10 +1384,13 @@ impl ApiTesterUi {
         self.request.body_type = self.body_type.clone();
         self.request.body = self.body.clone();
 
+        // 替换环境变量
+        let replaced_request = self.replace_variables_in_request(&self.request);
+
         // 发送请求（使用 build_url 构建包含查询参数的完整 URL）
         if let Some(client) = &self.client {
-            let mut request_with_params = self.request.clone();
-            request_with_params.url = self.request.build_url();
+            let mut request_with_params = replaced_request.clone();
+            request_with_params.url = replaced_request.build_url();
 
             match client.send(&request_with_params) {
                 Ok(response) => {

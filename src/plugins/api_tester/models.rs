@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// HTTP 请求方法
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -219,6 +220,75 @@ pub struct RequestHistory {
     pub status_code: Option<i32>,
     pub elapsed_ms: Option<i64>,
     pub executed_at: String,
+}
+
+/// API 集合（文件夹）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiCollection {
+    pub id: i64,
+    pub name: String,
+    pub parent_id: Option<i64>,
+    pub description: String,
+    pub sort_order: i32,
+    pub created_at: String,
+}
+
+/// 保存的 API 请求
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavedApiRequest {
+    pub id: i64,
+    pub collection_id: Option<i64>,
+    pub name: String,
+    pub method: HttpMethod,
+    pub url: String,
+    pub headers: Vec<HeaderEntry>,
+    pub params: Vec<HeaderEntry>,
+    pub body_type: BodyType,
+    pub body: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// 环境配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Environment {
+    pub id: i64,
+    pub name: String,
+    pub is_default: bool,
+    pub is_active: bool,
+    pub created_at: String,
+}
+
+/// 环境变量
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnvironmentVariable {
+    pub id: i64,
+    pub environment_id: i64,
+    pub key: String,
+    pub value: String,
+    pub enabled: bool,
+}
+
+/// 环境变量替换器
+pub struct VariableReplacer {
+    variables: HashMap<String, String>,
+}
+
+impl VariableReplacer {
+    /// 创建新的变量替换器
+    pub fn new(variables: HashMap<String, String>) -> Self {
+        Self { variables }
+    }
+
+    /// 替换字符串中的 {{variable}} 为实际值
+    pub fn replace(&self, input: &str) -> String {
+        let mut result = input.to_string();
+        for (key, value) in &self.variables {
+            let pattern = format!("{{{{{}}}}}", key);
+            result = result.replace(&pattern, value);
+        }
+        result
+    }
 }
 
 /// 响应标签页

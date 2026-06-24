@@ -284,53 +284,86 @@ similar = "2.6"  # 文本差异对比库
 | 请求体编辑 | JSON/Form/Raw 格式请求体 | P0 |
 | 发送请求 | 发送 HTTP 请求 | P0 |
 | 响应显示 | 显示响应状态码、响应头、响应体 | P0 |
+| 集合管理 | 创建集合/文件夹，保存请求到集合 | P1 |
+| 环境变量 | 支持变量替换（如 {{base_url}}） | P1 |
 | 请求历史 | 保存最近的请求记录 | P1 |
-| 环境变量 | 支持变量替换（如 {{base_url}}） | P2 |
-| 导入/导出 | 导入/导出请求配置 | P2 |
+| 导入/导出 | 导入/导出集合和环境配置 | P2 |
 
 ### 2.2 界面设计
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│  🔍 API 调试工具                     [ 发送 ] [ 保存 ] [ 历史 ]      │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                     │
-│  请求配置：                                                          │
-│  ┌─────────────────────────────────────────────────────────────┐   │
-│  │ [GET ▼]  [https://api.example.com/users]  [ 发送请求 ]      │   │
-│  └─────────────────────────────────────────────────────────────┘   │
-│                                                                     │
-│  [ 请求头 ] [ 请求体 ] [ 查询参数 ]                                  │
-│  ┌─────────────────────────────────────────────────────────────┐   │
-│  │  Key              │ Value                                    │   │
-│  │  ─────────────────┼─────────────────────────────────────   │   │
-│  │  Content-Type     │ application/json                        │   │
-│  │  Authorization    │ Bearer {{token}}                        │   │
-│  │  [+ 添加请求头]                                                │   │
-│  └─────────────────────────────────────────────────────────────┘   │
-│                                                                     │
-│  响应：                                                              │
-│  ┌─────────────────────────────────────────────────────────────┐   │
-│  │  状态：200 OK  |  耗时：125ms  |  大小：1.2 KB               │   │
-│  │  ─────────────────────────────────────────────────────────  │   │
-│  │  [ 响应体 ] [ 响应头 ] [ Cookies ]                           │   │
-│  │  ┌───────────────────────────────────────────────────────┐ │   │
-│  │  │ {                                                     │ │   │
-│  │  │   "id": 1,                                            │ │   │
-│  │  │   "name": "John Doe",                                 │ │   │
-│  │  │   "email": "john@example.com"                         │ │   │
-│  │  │ }                                                     │ │   │
-│  │  └───────────────────────────────────────────────────────┘ │   │
-│  └─────────────────────────────────────────────────────────────┘   │
-│                                                                     │
-│  请求历史：                                                          │
-│  ┌─────────────────────────────────────────────────────────────┐   │
-│  │  GET  https://api.example.com/users         200  125ms     │   │
-│  │  POST https://api.example.com/users         201  230ms     │   │
-│  │  GET  https://api.example.com/users/1       200  98ms      │   │
-│  └─────────────────────────────────────────────────────────────┘   │
-│                                                                     │
-└─────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│  🔍 API 调试工具          [ 环境: 开发 ▼ ] [ + 新建请求 ] [ 历史 ]        │
+├──────────────┬───────────────────────────────────────────────────────────┤
+│              │                                                           │
+│  集合：       │  请求名称: [ 用户列表 API                              ] │
+│  ┌────────┐  │                                                           │
+│  │📁 用户API│  │  [GET ▼]  [{{base_url}}/users]  [ 发送 ] [ 保存到集合 ]  │
+│  │  ├─ 列表 │  │                                                           │
+│  │  ├─ 详情 │  │  [ 请求头 ] [ 请求体 ] [ 查询参数 ]                       │
+│  │  └─ 创建 │  │  ┌─────────────────────────────────────────────────────┐ │
+│  │📁 订单API│  │  │  Key              │ Value                           │ │
+│  │  ├─ 列表 │  │  │  ─────────────────┼──────────────────────────────  │ │
+│  │  └─ 详情 │  │  │  Content-Type     │ application/json               │ │
+│  └────────┘  │  │  Authorization    │ Bearer {{token}}               │ │
+│              │  │  [+ 添加请求头]                                       │ │
+│  最近请求：   │  └─────────────────────────────────────────────────────┘ │
+│  ┌────────┐  │                                                           │
+│  │GET /user│  │  响应：                                                   │
+│  │POST /ord│  │  ┌─────────────────────────────────────────────────────┐ │
+│  └────────┘  │  │  状态：200 OK  |  耗时：125ms  |  大小：1.2 KB        │ │
+│              │  │  ┌───────────────────────────────────────────────────┐ │
+│              │  │  │ { "id": 1, "name": "John Doe" }                  │ │
+│              │  │  └───────────────────────────────────────────────────┘ │
+│              │  └─────────────────────────────────────────────────────┘ │
+├──────────────┴───────────────────────────────────────────────────────────┤
+│  共 5 个集合 | 当前环境: 开发环境                                         │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+### 2.2.1 环境管理弹窗
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  环境管理                                              [ ✕ ]    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  环境列表：                                                      │
+│  ┌──────────────┬────────┬────────────────────────────────────┐ │
+│  │ 环境名称       │ 状态    │ 操作                               │ │
+│  ├──────────────┼────────┼────────────────────────────────────┤ │
+│  │ ☑ 全局         │ 默认   │ [ 编辑 ]                           │ │
+│  │ ☐ 开发环境     │ 未选中  │ [ 编辑 ] [ 删除 ]                  │ │
+│  │ ☐ 测试环境     │ 未选中  │ [ 编辑 ] [ 删除 ]                  │ │
+│  │ ☐ 生产环境     │ 未选中  │ [ 编辑 ] [ 删除 ]                  │ │
+│  └──────────────┴────────┴────────────────────────────────────┘ │
+│                                                                 │
+│  [ + 新增环境 ]                                                   │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 2.2.2 环境变量编辑弹窗
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  编辑环境: 开发环境                                      [ ✕ ]   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  变量列表：                                                      │
+│  ┌──────────────────┬──────────────────────────────────────────┐│
+│  │ Key              │ Value                                    ││
+│  ├──────────────────┼──────────────────────────────────────────┤│
+│  │ base_url         │ http://localhost:3000                    ││
+│  │ token            │ eyJhbGciOiJIUzI1NiIs...                  ││
+│  │ api_key          │ sk-test-1234567890                       ││
+│  └──────────────────┴──────────────────────────────────────────┘│
+│                                                                 │
+│  [ + 添加变量 ]                                                   │
+│                                                                 │
+│  [ 保存 ] [ 取消 ]                                                │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ### 2.3 技术方案
@@ -371,12 +404,12 @@ pub struct HeaderEntry {
 }
 
 /// 请求配置
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiRequest {
     pub id: String,                    // 请求 ID
     pub name: String,                  // 请求名称
     pub method: HttpMethod,            // 请求方法
-    pub url: String,                   // 请求 URL
+    pub url: String,                   // 请求 URL（可包含 {{variable}}）
     pub headers: Vec<HeaderEntry>,     // 请求头
     pub params: Vec<HeaderEntry>,      // 查询参数
     pub body_type: BodyType,           // 请求体类型
@@ -385,11 +418,7 @@ pub struct ApiRequest {
 
 impl ApiRequest {
     /// 构建完整的 URL（包含查询参数）
-    pub fn build_url(&self) -> String {
-        // 过滤启用且非空 key 的参数
-        // 使用 urlencoding 编码参数
-        // 拼接到原始 URL
-    }
+    pub fn build_url(&self) -> String { ... }
 }
 
 /// 请求体类型
@@ -401,15 +430,72 @@ pub enum BodyType {
     Raw,
 }
 
+/// API 集合（文件夹）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiCollection {
+    pub id: i64,
+    pub name: String,
+    pub parent_id: Option<i64>,        // 支持嵌套集合
+    pub description: String,
+    pub sort_order: i32,
+    pub created_at: String,
+}
+
+/// 保存的 API 请求
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavedApiRequest {
+    pub id: i64,
+    pub collection_id: Option<i64>,    // 所属集合（None 表示未分类）
+    pub name: String,
+    pub method: HttpMethod,
+    pub url: String,
+    pub headers: Vec<HeaderEntry>,
+    pub params: Vec<HeaderEntry>,
+    pub body_type: BodyType,
+    pub body: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// 环境配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Environment {
+    pub id: i64,
+    pub name: String,
+    pub is_default: bool,              // 是否为默认（全局）环境
+    pub is_active: bool,               // 是否当前选中
+    pub created_at: String,
+}
+
+/// 环境变量
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnvironmentVariable {
+    pub id: i64,
+    pub environment_id: i64,
+    pub key: String,
+    pub value: String,
+    pub enabled: bool,
+}
+
+/// 环境变量替换
+pub struct VariableReplacer {
+    variables: HashMap<String, String>,
+}
+
+impl VariableReplacer {
+    /// 替换字符串中的 {{variable}} 为实际值
+    pub fn replace(&self, input: &str) -> String { ... }
+}
+
 /// 响应结果
 #[derive(Debug, Clone)]
 pub struct ApiResponse {
-    pub status_code: u16,              // 状态码
-    pub status_text: String,           // 状态文本
-    pub headers: Vec<(String, String)>, // 响应头
-    pub body: String,                  // 响应体
-    pub elapsed_ms: u64,               // 耗时（毫秒）
-    pub size_bytes: usize,             // 响应大小（字节）
+    pub status_code: u16,
+    pub status_text: String,
+    pub headers: Vec<(String, String)>,
+    pub body: String,
+    pub elapsed_ms: u64,
+    pub size_bytes: usize,
 }
 
 /// 请求历史记录
@@ -447,8 +533,9 @@ src/plugins/api_tester/
 | 2.4.5 | 实现响应显示 | 状态码、响应头、响应体（JSON 格式化） | ✅ |
 | 2.4.6 | 实现请求历史 | SQLite 存储历史记录（含查询参数） | ✅ |
 | 2.4.7 | 添加 JSON 格式化 | 响应体 JSON 自动格式化显示 | ✅ |
-| 2.4.8 | 实现导入/导出 | 请求配置的导入导出 | ⏳ |
-| 2.4.9 | 添加环境变量 | 支持 {{variable}} 变量替换 | ⏳ |
+| 2.4.8 | 实现集合管理 | 创建集合/文件夹，保存请求到集合 | ✅ |
+| 2.4.9 | 实现环境变量 | 支持多环境、变量替换 {{variable}} | ✅ |
+| 2.4.10 | 实现导入/导出 | 集合和环境配置的导入导出 | ⏳ |
 
 ### 2.5 依赖库
 
@@ -462,19 +549,70 @@ urlencoding = "2.1"  # URL 参数编码
 ### 2.6 数据库设计
 
 ```sql
+-- API 集合
+CREATE TABLE api_collections (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    name         TEXT NOT NULL,
+    parent_id    INTEGER,                -- 支持嵌套集合
+    description  TEXT DEFAULT '',
+    sort_order   INTEGER DEFAULT 0,
+    created_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (parent_id) REFERENCES api_collections(id) ON DELETE CASCADE
+);
+
+-- 保存的 API 请求
+CREATE TABLE api_saved_requests (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    collection_id  INTEGER,              -- 所属集合
+    name           TEXT NOT NULL,
+    method         TEXT NOT NULL,
+    url            TEXT NOT NULL,
+    headers        TEXT,                  -- JSON
+    params         TEXT,                  -- JSON
+    body_type      TEXT DEFAULT 'none',
+    body           TEXT,
+    sort_order     INTEGER DEFAULT 0,
+    created_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (collection_id) REFERENCES api_collections(id) ON DELETE SET NULL
+);
+
+CREATE INDEX idx_api_saved_requests_collection ON api_saved_requests(collection_id);
+
+-- 环境配置
+CREATE TABLE api_environments (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    name         TEXT NOT NULL,
+    is_default   BOOLEAN DEFAULT FALSE,  -- 是否为全局环境
+    is_active    BOOLEAN DEFAULT FALSE,  -- 是否当前选中
+    created_at   DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 环境变量
+CREATE TABLE api_environment_variables (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    environment_id INTEGER NOT NULL,
+    key            TEXT NOT NULL,
+    value          TEXT DEFAULT '',
+    enabled        BOOLEAN DEFAULT TRUE,
+    FOREIGN KEY (environment_id) REFERENCES api_environments(id) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_api_env_vars_environment ON api_environment_variables(environment_id);
+
 -- API 请求历史
 CREATE TABLE api_history (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    request_id   TEXT NOT NULL,           -- 请求配置 ID
-    method       TEXT NOT NULL,           -- HTTP 方法
-    url          TEXT NOT NULL,           -- 请求 URL
-    headers      TEXT,                    -- 请求头 JSON
-    params       TEXT,                    -- 查询参数 JSON
-    body_type    TEXT DEFAULT 'none',     -- 请求体类型
-    body         TEXT,                    -- 请求体内容
-    status_code  INTEGER,                -- 响应状态码
-    response     TEXT,                    -- 响应体
-    elapsed_ms   INTEGER,                -- 耗时
+    request_id   TEXT NOT NULL,
+    method       TEXT NOT NULL,
+    url          TEXT NOT NULL,
+    headers      TEXT,
+    params       TEXT,
+    body_type    TEXT DEFAULT 'none',
+    body         TEXT,
+    status_code  INTEGER,
+    response     TEXT,
+    elapsed_ms   INTEGER,
     executed_at  DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
