@@ -8,10 +8,16 @@ pub struct DiffViewerUi {
     left_text: String,
     /// 右侧文本
     right_text: String,
+    /// 左侧文件名
+    left_file_name: Option<String>,
+    /// 右侧文件名
+    right_file_name: Option<String>,
     /// 视图模式
     view_mode: ViewMode,
     /// 差异结果
     diff_result: Option<DiffResult>,
+    /// 错误信息
+    error: Option<String>,
 }
 
 impl DiffViewerUi {
@@ -19,8 +25,11 @@ impl DiffViewerUi {
         Self {
             left_text: String::new(),
             right_text: String::new(),
+            left_file_name: None,
+            right_file_name: None,
             view_mode: ViewMode::Edit,
             diff_result: None,
+            error: None,
         }
     }
 
@@ -39,13 +48,27 @@ impl DiffViewerUi {
         ui.separator();
 
         // 双栏输入区域
-        let available_height = ui.available_height() - 100.0;
+        let available_height = ui.available_height() - 120.0;
 
         // 使用 columns 实现双栏布局
         ui.columns(2, |columns| {
             // 左侧文本
             columns[0].vertical(|ui| {
-                ui.label("原始文本 (左侧):");
+                ui.horizontal(|ui| {
+                    ui.label("原始文本 (左侧):");
+                    if let Some(name) = &self.left_file_name {
+                        ui.label(
+                            RichText::new(format!("📄 {}", name))
+                                .color(Color32::from_rgb(100, 100, 100))
+                                .small(),
+                        );
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("📂 加载文件").clicked() {
+                            self.load_file_to_left();
+                        }
+                    });
+                });
                 egui::ScrollArea::vertical()
                     .id_salt("diff_edit_left")
                     .max_height(available_height)
@@ -61,7 +84,21 @@ impl DiffViewerUi {
 
             // 右侧文本
             columns[1].vertical(|ui| {
-                ui.label("对比文本 (右侧):");
+                ui.horizontal(|ui| {
+                    ui.label("对比文本 (右侧):");
+                    if let Some(name) = &self.right_file_name {
+                        ui.label(
+                            RichText::new(format!("📄 {}", name))
+                                .color(Color32::from_rgb(100, 100, 100))
+                                .small(),
+                        );
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("📂 加载文件").clicked() {
+                            self.load_file_to_right();
+                        }
+                    });
+                });
                 egui::ScrollArea::vertical()
                     .id_salt("diff_edit_right")
                     .max_height(available_height)
@@ -78,16 +115,26 @@ impl DiffViewerUi {
 
         ui.add_space(10.0);
 
+        // 错误信息
+        if let Some(err) = &self.error {
+            ui.label(RichText::new(err).color(Color32::RED));
+            ui.add_space(5.0);
+        }
+
         // 操作按钮
         ui.horizontal(|ui| {
             if ui.button("🔄 交换内容").clicked() {
                 std::mem::swap(&mut self.left_text, &mut self.right_text);
+                std::mem::swap(&mut self.left_file_name, &mut self.right_file_name);
             }
 
             if ui.button("🗑 清空").clicked() {
                 self.left_text.clear();
                 self.right_text.clear();
+                self.left_file_name = None;
+                self.right_file_name = None;
                 self.diff_result = None;
+                self.error = None;
             }
 
             ui.separator();
@@ -99,6 +146,44 @@ impl DiffViewerUi {
                 self.view_mode = ViewMode::Split;
             }
         });
+    }
+
+    /// 加载文件到左侧
+    fn load_file_to_left(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .set_title("选择原始文本文件")
+            .pick_file()
+        {
+            match std::fs::read_to_string(&path) {
+                Ok(content) => {
+                    self.left_text = content;
+                    self.left_file_name = path.file_name().map(|n| n.to_string_lossy().to_string());
+                    self.error = None;
+                }
+                Err(e) => {
+                    self.error = Some(format!("读取文件失败: {}", e));
+                }
+            }
+        }
+    }
+
+    /// 加载文件到右侧
+    fn load_file_to_right(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .set_title("选择对比文本文件")
+            .pick_file()
+        {
+            match std::fs::read_to_string(&path) {
+                Ok(content) => {
+                    self.right_text = content;
+                    self.right_file_name = path.file_name().map(|n| n.to_string_lossy().to_string());
+                    self.error = None;
+                }
+                Err(e) => {
+                    self.error = Some(format!("读取文件失败: {}", e));
+                }
+            }
+        }
     }
 
     /// 渲染 Split 视图
