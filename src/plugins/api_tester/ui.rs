@@ -90,6 +90,8 @@ pub struct ApiTesterUi {
     editing_env_var_id: Option<i64>,
     /// 环境名称编辑表单
     env_form_name: String,
+    /// 是否显示新增环境弹窗
+    show_add_env_dialog: bool,
 
     // ========== 布局相关 ==========
     /// 左侧面板宽度
@@ -137,6 +139,7 @@ impl ApiTesterUi {
             env_var_form_value: String::new(),
             editing_env_var_id: None,
             env_form_name: String::new(),
+            show_add_env_dialog: false,
             left_panel_width: 250.0,
         }
     }
@@ -686,7 +689,6 @@ impl ApiTesterUi {
     fn render_environment_dialog(&mut self, ui: &mut Ui, conn: &rusqlite::Connection) {
         let mut env_to_edit: Option<Environment> = None;
         let mut env_to_delete: Option<i64> = None;
-        let mut show_add_env = false;
         let mut close_dialog = false;
 
         egui::Window::new("环境管理")
@@ -750,7 +752,9 @@ impl ApiTesterUi {
 
                 ui.horizontal(|ui| {
                     if ui.button("+ 新增环境").clicked() {
-                        show_add_env = true;
+                        self.show_add_env_dialog = true;
+                        self.env_form_name = "新环境".to_string();
+                        self.editing_environment_id = None;
                     }
 
                     if ui.button("关闭").clicked() {
@@ -759,11 +763,9 @@ impl ApiTesterUi {
                 });
             });
 
-        // 处理新增环境
-        if show_add_env {
-            self.env_form_name = "新环境".to_string();
-            self.editing_environment_id = None;
-            // 显示新增环境弹窗（使用 env_var_dialog 来复用）
+        // 处理新增环境弹窗
+        if self.show_add_env_dialog {
+            let mut close_add_dialog = false;
             egui::Window::new("新增环境")
                 .collapsible(false)
                 .resizable(false)
@@ -783,6 +785,7 @@ impl ApiTesterUi {
                                     Ok(_) => {
                                         self.load_environments(conn);
                                         self.env_form_name.clear();
+                                        close_add_dialog = true;
                                     }
                                     Err(e) => {
                                         self.error = Some(format!("创建环境失败: {}", e));
@@ -792,9 +795,13 @@ impl ApiTesterUi {
                         }
                         if ui.button("取消").clicked() {
                             self.env_form_name.clear();
+                            close_add_dialog = true;
                         }
                     });
                 });
+            if close_add_dialog {
+                self.show_add_env_dialog = false;
+            }
         }
 
         // 处理编辑环境名称
