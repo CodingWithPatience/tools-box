@@ -1,5 +1,6 @@
 use egui::{Color32, RichText, text::LayoutJob};
 
+use super::differ;
 use super::highlight::SyntaxHighlighter;
 use super::models::{DiffResult, DiffType, SplitLine, TextSegment, ViewMode};
 
@@ -255,9 +256,10 @@ impl DiffViewerUi {
                 .or(self.right_file_name.as_deref())
                 .and_then(|name| {
                     // 从文件扩展名获取
-                    std::path::Path::new(name)
+                    let ext = std::path::Path::new(name)
                         .extension()
-                        .and_then(|ext| self.highlighter.get_syntax_name_for_extension(&ext.to_string_lossy()))
+                        .map(|e| e.to_string_lossy().to_string())?;
+                    self.highlighter.get_syntax_name_for_extension(&ext)
                 })
         } else if self.selected_language == "Plain Text" {
             None
@@ -389,53 +391,50 @@ impl DiffViewerUi {
             let rect = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), row_height));
             ui.painter().rect_filled(rect, 0.0, left_bg);
 
-            if let Some(_content) = &line.left_content {
+            if let Some(content) = &line.left_content {
                 let line_num = line
                     .left_line_number
                     .map(|n| format!("{:>4} │ ", n))
                     .unwrap_or_else(|| "      │ ".to_string());
 
-                // 使用字符级差异渲染
+                // 使用字符级差异渲染（优先级最高）
                 if !line.left_segments.is_empty() {
                     let job = self.create_segment_layout(&line.left_segments, Some(&line_num), text_color, font_size);
                     ui.label(job);
-                } else {
+                } else if line.left_type == DiffType::Equal && syntax_name.is_some() {
                     // 相同行使用语法高亮
-                    if line.left_type == DiffType::Equal && syntax_name.is_some() {
-                        let mut job = LayoutJob::default();
-                        // 添加行号
+                    let mut job = LayoutJob::default();
+                    job.append(
+                        &line_num,
+                        0.0,
+                        egui::TextFormat {
+                            font_id: egui::FontId::monospace(font_size),
+                            color: dim_color,
+                            ..Default::default()
+                        },
+                    );
+                    let highlighted = self.highlighter.highlight_line(content, syntax_name.as_deref(), font_size, is_dark_mode);
+                    for (color, text) in highlighted {
                         job.append(
-                            &line_num,
+                            &text,
                             0.0,
                             egui::TextFormat {
                                 font_id: egui::FontId::monospace(font_size),
-                                color: dim_color,
+                                color,
                                 ..Default::default()
                             },
                         );
-                        // 语法高亮内容
-                        let highlighted = self.highlighter.highlight_line(_content, syntax_name.as_deref(), font_size, is_dark_mode);
-                        for (color, text) in highlighted {
-                            job.append(
-                                &text,
-                                0.0,
-                                egui::TextFormat {
-                                    font_id: egui::FontId::monospace(font_size),
-                                    color,
-                                    ..Default::default()
-                                },
-                            );
-                        }
-                        ui.label(job);
-                    } else {
-                        let text = format!("{}{}", line_num, _content);
-                        let rich_text = RichText::new(text).monospace();
-                        let rich_text = match line.left_type {
-                            DiffType::Removed => rich_text.color(Color32::from_rgb(180, 0, 0)),
-                            _ => rich_text.color(text_color),
-                        };
-                        ui.label(rich_text);
                     }
+                    ui.label(job);
+                } else {
+                    // 差异行使用差异颜色
+                    let text = format!("{}{}", line_num, content);
+                    let rich_text = RichText::new(text).monospace();
+                    let rich_text = match line.left_type {
+                        DiffType::Removed => rich_text.color(Color32::from_rgb(180, 0, 0)),
+                        _ => rich_text.color(text_color),
+                    };
+                    ui.label(rich_text);
                 }
             } else {
                 let rich_text = RichText::new("      │ ").monospace().color(dim_color);
@@ -456,53 +455,50 @@ impl DiffViewerUi {
             let rect = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), row_height));
             ui.painter().rect_filled(rect, 0.0, right_bg);
 
-            if let Some(_content) = &line.right_content {
+            if let Some(content) = &line.right_content {
                 let line_num = line
                     .right_line_number
                     .map(|n| format!("{:>4} │ ", n))
                     .unwrap_or_else(|| "      │ ".to_string());
 
-                // 使用字符级差异渲染
+                // 使用字符级差异渲染（优先级最高）
                 if !line.right_segments.is_empty() {
                     let job = self.create_segment_layout(&line.right_segments, Some(&line_num), text_color, font_size);
                     ui.label(job);
-                } else {
+                } else if line.right_type == DiffType::Equal && syntax_name.is_some() {
                     // 相同行使用语法高亮
-                    if line.right_type == DiffType::Equal && syntax_name.is_some() {
-                        let mut job = LayoutJob::default();
-                        // 添加行号
+                    let mut job = LayoutJob::default();
+                    job.append(
+                        &line_num,
+                        0.0,
+                        egui::TextFormat {
+                            font_id: egui::FontId::monospace(font_size),
+                            color: dim_color,
+                            ..Default::default()
+                        },
+                    );
+                    let highlighted = self.highlighter.highlight_line(content, syntax_name.as_deref(), font_size, is_dark_mode);
+                    for (color, text) in highlighted {
                         job.append(
-                            &line_num,
+                            &text,
                             0.0,
                             egui::TextFormat {
                                 font_id: egui::FontId::monospace(font_size),
-                                color: dim_color,
+                                color,
                                 ..Default::default()
                             },
                         );
-                        // 语法高亮内容
-                        let highlighted = self.highlighter.highlight_line(_content, syntax_name.as_deref(), font_size, is_dark_mode);
-                        for (color, text) in highlighted {
-                            job.append(
-                                &text,
-                                0.0,
-                                egui::TextFormat {
-                                    font_id: egui::FontId::monospace(font_size),
-                                    color,
-                                    ..Default::default()
-                                },
-                            );
-                        }
-                        ui.label(job);
-                    } else {
-                        let text = format!("{}{}", line_num, _content);
-                        let rich_text = RichText::new(text).monospace();
-                        let rich_text = match line.right_type {
-                            DiffType::Added => rich_text.color(Color32::from_rgb(0, 150, 0)),
-                            _ => rich_text.color(text_color),
-                        };
-                        ui.label(rich_text);
                     }
+                    ui.label(job);
+                } else {
+                    // 差异行使用差异颜色
+                    let text = format!("{}{}", line_num, content);
+                    let rich_text = RichText::new(text).monospace();
+                    let rich_text = match line.right_type {
+                        DiffType::Added => rich_text.color(Color32::from_rgb(0, 150, 0)),
+                        _ => rich_text.color(text_color),
+                    };
+                    ui.label(rich_text);
                 }
             } else {
                 let rich_text = RichText::new("      │ ").monospace().color(dim_color);
@@ -647,10 +643,10 @@ impl DiffViewerUi {
                             );
                             ui.painter().rect_filled(rect, 0.0, bg_color);
 
-                            // 相同行使用语法高亮
+                            // 相同行使用语法高亮，差异行使用差异颜色
                             if line.diff_type == DiffType::Equal && syntax_name.is_some() {
+                                // 相同行使用语法高亮
                                 let mut job = LayoutJob::default();
-                                // 添加行号和前缀
                                 let full_prefix = format!("{}{}", line_num, prefix);
                                 job.append(
                                     &full_prefix,
@@ -661,7 +657,6 @@ impl DiffViewerUi {
                                         ..Default::default()
                                     },
                                 );
-                                // 语法高亮内容
                                 let highlighted = self.highlighter.highlight_line(&line.content, syntax_name.as_deref(), font_size, is_dark_mode);
                                 for (color, text) in highlighted {
                                     job.append(
@@ -676,13 +671,14 @@ impl DiffViewerUi {
                                 }
                                 ui.label(job);
                             } else {
+                                // 差异行使用差异颜色
                                 let text = format!("{}{}{}", line_num, prefix, line.content);
                                 let rich_text = RichText::new(text).monospace();
 
                                 let rich_text = match line.diff_type {
                                     DiffType::Added => rich_text.color(Color32::from_rgb(0, 150, 0)),
                                     DiffType::Removed => rich_text.color(Color32::from_rgb(180, 0, 0)),
-                                    _ => rich_text.color(text_color), // 使用主题文字颜色
+                                    _ => rich_text.color(text_color),
                                 };
 
                                 ui.label(rich_text);
@@ -693,6 +689,3 @@ impl DiffViewerUi {
         }
     }
 }
-
-// 引入 differ 模块
-use super::differ;

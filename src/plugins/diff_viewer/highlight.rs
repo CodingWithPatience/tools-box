@@ -40,7 +40,7 @@ impl SyntaxHighlighter {
         is_dark_mode: bool,
     ) -> LayoutJob {
         let syntax = syntax_name
-            .and_then(|name| self.syntax_set.find_syntax_by_name(name))
+            .and_then(|name| self.find_syntax_by_name_fuzzy(name))
             .unwrap_or_else(|| self.syntax_set.find_syntax_plain_text());
 
         let theme_name = if is_dark_mode {
@@ -86,7 +86,7 @@ impl SyntaxHighlighter {
         is_dark_mode: bool,
     ) -> Vec<(Color32, String)> {
         let syntax = syntax_name
-            .and_then(|name| self.syntax_set.find_syntax_by_name(name))
+            .and_then(|name| self.find_syntax_by_name_fuzzy(name))
             .unwrap_or_else(|| self.syntax_set.find_syntax_plain_text());
 
         let theme_name = if is_dark_mode {
@@ -121,6 +121,21 @@ impl SyntaxHighlighter {
             .iter()
             .map(|s| s.name.clone())
             .collect()
+    }
+
+    /// 根据语言名称获取语法定义（模糊匹配）
+    pub fn find_syntax_by_name_fuzzy(&self, name: &str) -> Option<&syntect::parsing::SyntaxReference> {
+        // 先尝试精确匹配
+        if let Some(syntax) = self.syntax_set.find_syntax_by_name(name) {
+            return Some(syntax);
+        }
+
+        // 尝试不区分大小写匹配
+        let name_lower = name.to_lowercase();
+        self.syntax_set.syntaxes().iter().find(|s| {
+            s.name.to_lowercase() == name_lower
+            || s.file_extensions.iter().any(|ext| ext.to_lowercase() == name_lower)
+        })
     }
 
     /// 根据语言名称获取语法名称
