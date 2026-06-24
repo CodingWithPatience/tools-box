@@ -92,6 +92,8 @@ pub struct ApiTesterUi {
     env_form_name: String,
     /// 是否显示新增环境弹窗
     show_add_env_dialog: bool,
+    /// 是否显示重命名环境弹窗
+    show_rename_env_dialog: bool,
 
     // ========== 布局相关 ==========
     /// 左侧面板宽度
@@ -140,6 +142,7 @@ impl ApiTesterUi {
             editing_env_var_id: None,
             env_form_name: String::new(),
             show_add_env_dialog: false,
+            show_rename_env_dialog: false,
             left_panel_width: 250.0,
         }
     }
@@ -443,6 +446,12 @@ impl ApiTesterUi {
         if self.show_environment_dialog {
             self.render_environment_dialog(ui, conn);
         }
+        if self.show_add_env_dialog {
+            self.render_add_env_dialog(ui, conn);
+        }
+        if self.show_rename_env_dialog {
+            self.render_rename_env_dialog(ui, conn);
+        }
         if self.show_env_var_dialog {
             self.render_env_var_dialog(ui, conn);
         }
@@ -687,7 +696,6 @@ impl ApiTesterUi {
 
     /// 渲染环境管理弹窗
     fn render_environment_dialog(&mut self, ui: &mut Ui, conn: &rusqlite::Connection) {
-        let mut env_to_edit: Option<Environment> = None;
         let mut env_to_delete: Option<i64> = None;
         let mut close_dialog = false;
 
@@ -730,7 +738,9 @@ impl ApiTesterUi {
                                 }
                                 if !env.is_default {
                                     if ui.small_button("重命名").clicked() {
-                                        env_to_edit = Some(env.clone());
+                                        self.editing_environment_id = Some(env.id);
+                                        self.env_form_name = env.name.clone();
+                                        self.show_rename_env_dialog = true;
                                     }
                                     if ui
                                         .small_button(
@@ -763,86 +773,6 @@ impl ApiTesterUi {
                 });
             });
 
-        // 处理新增环境弹窗
-        if self.show_add_env_dialog {
-            let mut close_add_dialog = false;
-            egui::Window::new("新增环境")
-                .collapsible(false)
-                .resizable(false)
-                .show(ui.ctx(), |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("环境名称:");
-                        ui.text_edit_singleline(&mut self.env_form_name);
-                    });
-                    ui.add_space(10.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("创建").clicked() {
-                            if self.env_form_name.is_empty() {
-                                self.error = Some("环境名称不能为空".to_string());
-                            } else {
-                                let store = ApiStore::new(conn);
-                                match store.create_environment(&self.env_form_name) {
-                                    Ok(_) => {
-                                        self.load_environments(conn);
-                                        self.env_form_name.clear();
-                                        close_add_dialog = true;
-                                    }
-                                    Err(e) => {
-                                        self.error = Some(format!("创建环境失败: {}", e));
-                                    }
-                                }
-                            }
-                        }
-                        if ui.button("取消").clicked() {
-                            self.env_form_name.clear();
-                            close_add_dialog = true;
-                        }
-                    });
-                });
-            if close_add_dialog {
-                self.show_add_env_dialog = false;
-            }
-        }
-
-        // 处理编辑环境名称
-        if let Some(env) = env_to_edit {
-            self.editing_environment_id = Some(env.id);
-            self.env_form_name = env.name;
-            egui::Window::new("重命名环境")
-                .collapsible(false)
-                .resizable(false)
-                .show(ui.ctx(), |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("环境名称:");
-                        ui.text_edit_singleline(&mut self.env_form_name);
-                    });
-                    ui.add_space(10.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("保存").clicked() {
-                            if self.env_form_name.is_empty() {
-                                self.error = Some("环境名称不能为空".to_string());
-                            } else {
-                                let store = ApiStore::new(conn);
-                                if let Some(id) = self.editing_environment_id {
-                                    if let Err(e) = store.update_environment(id, &self.env_form_name)
-                                    {
-                                        self.error = Some(format!("更新环境名称失败: {}", e));
-                                    } else {
-                                        self.load_environments(conn);
-                                        self.env_form_name.clear();
-                                        self.editing_environment_id = None;
-                                    }
-                                }
-                            }
-                        }
-                        if ui.button("取消").clicked() {
-                            self.env_form_name.clear();
-                            self.editing_environment_id = None;
-                        }
-                    });
-                });
-        }
-
         // 处理删除环境
         if let Some(id) = env_to_delete {
             let store = ApiStore::new(conn);
@@ -855,6 +785,89 @@ impl ApiTesterUi {
 
         if close_dialog {
             self.show_environment_dialog = false;
+        }
+    }
+
+    /// 渲染新增环境弹窗
+    fn render_add_env_dialog(&mut self, ui: &mut Ui, conn: &rusqlite::Connection) {
+        let mut close_dialog = false;
+        egui::Window::new("新增环境")
+            .collapsible(false)
+            .resizable(false)
+            .show(ui.ctx(), |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("环境名称:");
+                    ui.text_edit_singleline(&mut self.env_form_name);
+                });
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("创建").clicked() {
+                        if self.env_form_name.is_empty() {
+                            self.error = Some("环境名称不能为空".to_string());
+                        } else {
+                            let store = ApiStore::new(conn);
+                            match store.create_environment(&self.env_form_name) {
+                                Ok(_) => {
+                                    self.load_environments(conn);
+                                    self.env_form_name.clear();
+                                    close_dialog = true;
+                                }
+                                Err(e) => {
+                                    self.error = Some(format!("创建环境失败: {}", e));
+                                }
+                            }
+                        }
+                    }
+                    if ui.button("取消").clicked() {
+                        self.env_form_name.clear();
+                        close_dialog = true;
+                    }
+                });
+            });
+        if close_dialog {
+            self.show_add_env_dialog = false;
+        }
+    }
+
+    /// 渲染重命名环境弹窗
+    fn render_rename_env_dialog(&mut self, ui: &mut Ui, conn: &rusqlite::Connection) {
+        let mut close_dialog = false;
+        egui::Window::new("重命名环境")
+            .collapsible(false)
+            .resizable(false)
+            .show(ui.ctx(), |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("环境名称:");
+                    ui.text_edit_singleline(&mut self.env_form_name);
+                });
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("保存").clicked() {
+                        if self.env_form_name.is_empty() {
+                            self.error = Some("环境名称不能为空".to_string());
+                        } else {
+                            let store = ApiStore::new(conn);
+                            if let Some(id) = self.editing_environment_id {
+                                if let Err(e) = store.update_environment(id, &self.env_form_name) {
+                                    self.error = Some(format!("更新环境名称失败: {}", e));
+                                } else {
+                                    self.load_environments(conn);
+                                    self.env_form_name.clear();
+                                    self.editing_environment_id = None;
+                                    close_dialog = true;
+                                }
+                            }
+                        }
+                    }
+                    if ui.button("取消").clicked() {
+                        self.env_form_name.clear();
+                        self.editing_environment_id = None;
+                        close_dialog = true;
+                    }
+                });
+            });
+        if close_dialog {
+            self.show_rename_env_dialog = false;
         }
     }
 
