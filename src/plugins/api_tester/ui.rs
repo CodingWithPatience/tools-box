@@ -90,7 +90,7 @@ impl ApiTesterUi {
     pub fn render(&mut self, ui: &mut Ui, conn: &rusqlite::Connection) {
         // 顶部标题栏
         ui.horizontal(|ui| {
-            ui.heading("API 调试工具");
+            ui.heading("🌐 API 调试工具");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // Mock 服务控制（仅 debug 模式）
                 #[cfg(debug_assertions)]

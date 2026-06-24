@@ -50,7 +50,7 @@ impl Plugin for ApiTesterPlugin {
     }
 
     fn icon(&self) -> &str {
-        "⚙"
+        "🌐"
     }
 
     fn description(&self) -> &str {
