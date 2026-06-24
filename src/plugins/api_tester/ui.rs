@@ -1617,13 +1617,13 @@ impl ApiTesterUi {
             if self.request.url.is_empty() {
                 "未命名请求".to_string()
             } else {
-                let url_display = if self.request.url.chars().count() > 30 {
-                    let truncated: String = self.request.url.chars().take(30).collect();
+                let url_display = if self.request.url.chars().count() > 40 {
+                    let truncated: String = self.request.url.chars().take(40).collect();
                     format!("{}...", truncated)
                 } else {
                     self.request.url.clone()
                 };
-                format!("{} {}", self.request.method, url_display)
+                url_display
             }
         } else {
             self.request.name.clone()
