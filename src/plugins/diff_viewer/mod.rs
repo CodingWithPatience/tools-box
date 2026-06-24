@@ -1,4 +1,5 @@
 mod differ;
+pub mod highlight;
 mod models;
 mod ui;
 

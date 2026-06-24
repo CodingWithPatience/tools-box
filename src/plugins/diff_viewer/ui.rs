@@ -1,6 +1,36 @@
 use egui::{Color32, RichText, text::LayoutJob};
 
+use super::highlight::SyntaxHighlighter;
 use super::models::{DiffResult, DiffType, SplitLine, TextSegment, ViewMode};
+
+/// 支持的编程语言列表
+const SUPPORTED_LANGUAGES: &[(&str, &str)] = &[
+    ("自动检测", ""),
+    ("Plain Text", "Plain Text"),
+    ("Bash", "Bash"),
+    ("C", "C"),
+    ("C++", "C++"),
+    ("C#", "C#"),
+    ("CSS", "CSS"),
+    ("Dockerfile", "Dockerfile"),
+    ("Go", "Go"),
+    ("HTML", "HTML"),
+    ("Java", "Java"),
+    ("JavaScript", "JavaScript"),
+    ("JSON", "JSON"),
+    ("Kotlin", "Kotlin"),
+    ("Lua", "Lua"),
+    ("Markdown", "Markdown"),
+    ("PHP", "PHP"),
+    ("Python", "Python"),
+    ("Ruby", "Ruby"),
+    ("Rust", "Rust"),
+    ("SQL", "SQL"),
+    ("Swift", "Swift"),
+    ("TypeScript", "TypeScript"),
+    ("XML", "XML"),
+    ("YAML", "YAML"),
+];
 
 /// Diff 查看器 UI
 pub struct DiffViewerUi {
@@ -18,6 +48,10 @@ pub struct DiffViewerUi {
     diff_result: Option<DiffResult>,
     /// 错误信息
     error: Option<String>,
+    /// 语法高亮器
+    highlighter: SyntaxHighlighter,
+    /// 选择的语言
+    selected_language: String,
 }
 
 impl DiffViewerUi {
@@ -30,6 +64,8 @@ impl DiffViewerUi {
             view_mode: ViewMode::Edit,
             diff_result: None,
             error: None,
+            highlighter: SyntaxHighlighter::new(),
+            selected_language: "自动检测".to_string(),
         }
     }
 
@@ -139,6 +175,23 @@ impl DiffViewerUi {
 
             ui.separator();
 
+            // 语言选择
+            ui.label("语言:");
+            egui::ComboBox::from_id_salt("language_select")
+                .selected_text(&self.selected_language)
+                .show_ui(ui, |ui| {
+                    for (name, _) in SUPPORTED_LANGUAGES {
+                        if ui
+                            .selectable_label(self.selected_language == *name, *name)
+                            .clicked()
+                        {
+                            self.selected_language = name.to_string();
+                        }
+                    }
+                });
+
+            ui.separator();
+
             // 开始对比按钮
             let compare_btn = ui.button("📊 开始对比");
             if compare_btn.clicked() {
@@ -178,12 +231,44 @@ impl DiffViewerUi {
                     self.right_text = content;
                     self.right_file_name = path.file_name().map(|n| n.to_string_lossy().to_string());
                     self.error = None;
+
+                    // 尝试自动检测语言
+                    if let Some(ext) = path.extension() {
+                        if let Some(name) = self.highlighter.get_syntax_name_for_extension(&ext.to_string_lossy()) {
+                            self.selected_language = name;
+                        }
+                    }
                 }
                 Err(e) => {
                     self.error = Some(format!("读取文件失败: {}", e));
                 }
             }
         }
+    }
+
+    /// 获取当前选择的语法名称
+    fn get_syntax_name(&self) -> Option<String> {
+        if self.selected_language == "自动检测" {
+            // 尝试从文件名检测
+            self.left_file_name
+                .as_deref()
+                .or(self.right_file_name.as_deref())
+                .and_then(|name| {
+                    // 从文件扩展名获取
+                    std::path::Path::new(name)
+                        .extension()
+                        .and_then(|ext| self.highlighter.get_syntax_name_for_extension(&ext.to_string_lossy()))
+                })
+        } else if self.selected_language == "Plain Text" {
+            None
+        } else {
+            Some(self.selected_language.clone())
+        }
+    }
+
+    /// 判断是否为深色模式
+    fn is_dark_mode(&self, ui: &egui::Ui) -> bool {
+        ui.visuals().dark_mode
     }
 
     /// 渲染 Split 视图
@@ -266,13 +351,17 @@ impl DiffViewerUi {
                         let code_style = egui::TextStyle::Monospace;
                         let row_height = ui.text_style_height(&code_style) + 4.0;
 
+                        // 获取语法高亮参数
+                        let syntax_name = self.get_syntax_name();
+                        let is_dark_mode = self.is_dark_mode(ui);
+
                         egui::Grid::new("diff_split_grid")
                             .striped(true)
                             .spacing([0.0, 0.0])
                             .min_col_width(ui.available_width() / 2.0)
                             .show(ui, |ui| {
                                 for line in &result.split_lines {
-                                    self.render_split_line(ui, line, row_height, font_size);
+                                    self.render_split_line(ui, line, row_height, font_size, &syntax_name, is_dark_mode);
                                     ui.end_row();
                                 }
                             });
@@ -282,7 +371,7 @@ impl DiffViewerUi {
     }
 
     /// 渲染 Split 视图的单行
-    fn render_split_line(&self, ui: &mut egui::Ui, line: &SplitLine, row_height: f32, font_size: f32) {
+    fn render_split_line(&self, ui: &mut egui::Ui, line: &SplitLine, row_height: f32, font_size: f32, syntax_name: &Option<String>, is_dark_mode: bool) {
         // 获取当前主题的文字颜色
         let text_color = ui.visuals().text_color();
         let dim_color = Color32::from_rgb(128, 128, 128);
@@ -311,13 +400,42 @@ impl DiffViewerUi {
                     let job = self.create_segment_layout(&line.left_segments, Some(&line_num), text_color, font_size);
                     ui.label(job);
                 } else {
-                    let text = format!("{}{}", line_num, _content);
-                    let rich_text = RichText::new(text).monospace();
-                    let rich_text = match line.left_type {
-                        DiffType::Removed => rich_text.color(Color32::from_rgb(180, 0, 0)),
-                        _ => rich_text.color(text_color),
-                    };
-                    ui.label(rich_text);
+                    // 相同行使用语法高亮
+                    if line.left_type == DiffType::Equal && syntax_name.is_some() {
+                        let mut job = LayoutJob::default();
+                        // 添加行号
+                        job.append(
+                            &line_num,
+                            0.0,
+                            egui::TextFormat {
+                                font_id: egui::FontId::monospace(font_size),
+                                color: dim_color,
+                                ..Default::default()
+                            },
+                        );
+                        // 语法高亮内容
+                        let highlighted = self.highlighter.highlight_line(_content, syntax_name.as_deref(), font_size, is_dark_mode);
+                        for (color, text) in highlighted {
+                            job.append(
+                                &text,
+                                0.0,
+                                egui::TextFormat {
+                                    font_id: egui::FontId::monospace(font_size),
+                                    color,
+                                    ..Default::default()
+                                },
+                            );
+                        }
+                        ui.label(job);
+                    } else {
+                        let text = format!("{}{}", line_num, _content);
+                        let rich_text = RichText::new(text).monospace();
+                        let rich_text = match line.left_type {
+                            DiffType::Removed => rich_text.color(Color32::from_rgb(180, 0, 0)),
+                            _ => rich_text.color(text_color),
+                        };
+                        ui.label(rich_text);
+                    }
                 }
             } else {
                 let rich_text = RichText::new("      │ ").monospace().color(dim_color);
@@ -325,7 +443,7 @@ impl DiffViewerUi {
             }
         });
 
-        // 右侧（移除了 ui.separator()）
+        // 右侧
         let right_bg = match line.right_type {
             DiffType::Added => Color32::from_rgb(220, 255, 220), // 绿色背景
             DiffType::Equal => Color32::TRANSPARENT,
@@ -349,13 +467,42 @@ impl DiffViewerUi {
                     let job = self.create_segment_layout(&line.right_segments, Some(&line_num), text_color, font_size);
                     ui.label(job);
                 } else {
-                    let text = format!("{}{}", line_num, _content);
-                    let rich_text = RichText::new(text).monospace();
-                    let rich_text = match line.right_type {
-                        DiffType::Added => rich_text.color(Color32::from_rgb(0, 150, 0)),
-                        _ => rich_text.color(text_color),
-                    };
-                    ui.label(rich_text);
+                    // 相同行使用语法高亮
+                    if line.right_type == DiffType::Equal && syntax_name.is_some() {
+                        let mut job = LayoutJob::default();
+                        // 添加行号
+                        job.append(
+                            &line_num,
+                            0.0,
+                            egui::TextFormat {
+                                font_id: egui::FontId::monospace(font_size),
+                                color: dim_color,
+                                ..Default::default()
+                            },
+                        );
+                        // 语法高亮内容
+                        let highlighted = self.highlighter.highlight_line(_content, syntax_name.as_deref(), font_size, is_dark_mode);
+                        for (color, text) in highlighted {
+                            job.append(
+                                &text,
+                                0.0,
+                                egui::TextFormat {
+                                    font_id: egui::FontId::monospace(font_size),
+                                    color,
+                                    ..Default::default()
+                                },
+                            );
+                        }
+                        ui.label(job);
+                    } else {
+                        let text = format!("{}{}", line_num, _content);
+                        let rich_text = RichText::new(text).monospace();
+                        let rich_text = match line.right_type {
+                            DiffType::Added => rich_text.color(Color32::from_rgb(0, 150, 0)),
+                            _ => rich_text.color(text_color),
+                        };
+                        ui.label(rich_text);
+                    }
                 }
             } else {
                 let rich_text = RichText::new("      │ ").monospace().color(dim_color);
@@ -454,11 +601,20 @@ impl DiffViewerUi {
 
             // 剩余空间用于内容区域
             ui.vertical(|ui| {
+                // 获取语法高亮参数
+                let syntax_name = self.get_syntax_name();
+                let is_dark_mode = self.is_dark_mode(ui);
+
                 // Unified 视图
                 egui::ScrollArea::both()
                     .auto_shrink([false, false])  // 不自动缩小，内容不足时不显示滚动条
                     .id_salt("diff_unified_view")
                     .show(ui, |ui| {
+                        // 获取当前字体大小
+                        let font_size = ui.style().text_styles.get(&egui::TextStyle::Monospace)
+                            .map(|font_id| font_id.size)
+                            .unwrap_or(14.0);
+
                         // 设置等宽字体
                         let code_style = egui::TextStyle::Monospace;
                         let row_height = ui.text_style_height(&code_style) + 4.0;
@@ -483,15 +639,6 @@ impl DiffViewerUi {
                                 DiffType::Equal => "  ",
                             };
 
-                            let text = format!("{}{}{}", line_num, prefix, line.content);
-                            let rich_text = RichText::new(text).monospace();
-
-                            let rich_text = match line.diff_type {
-                                DiffType::Added => rich_text.color(Color32::from_rgb(0, 150, 0)),
-                                DiffType::Removed => rich_text.color(Color32::from_rgb(180, 0, 0)),
-                                _ => rich_text.color(text_color), // 使用主题文字颜色
-                            };
-
                             // 绘制背景
                             let rect = ui.available_rect_before_wrap();
                             let rect = egui::Rect::from_min_size(
@@ -500,7 +647,46 @@ impl DiffViewerUi {
                             );
                             ui.painter().rect_filled(rect, 0.0, bg_color);
 
-                            ui.label(rich_text);
+                            // 相同行使用语法高亮
+                            if line.diff_type == DiffType::Equal && syntax_name.is_some() {
+                                let mut job = LayoutJob::default();
+                                // 添加行号和前缀
+                                let full_prefix = format!("{}{}", line_num, prefix);
+                                job.append(
+                                    &full_prefix,
+                                    0.0,
+                                    egui::TextFormat {
+                                        font_id: egui::FontId::monospace(font_size),
+                                        color: dim_color,
+                                        ..Default::default()
+                                    },
+                                );
+                                // 语法高亮内容
+                                let highlighted = self.highlighter.highlight_line(&line.content, syntax_name.as_deref(), font_size, is_dark_mode);
+                                for (color, text) in highlighted {
+                                    job.append(
+                                        &text,
+                                        0.0,
+                                        egui::TextFormat {
+                                            font_id: egui::FontId::monospace(font_size),
+                                            color,
+                                            ..Default::default()
+                                        },
+                                    );
+                                }
+                                ui.label(job);
+                            } else {
+                                let text = format!("{}{}{}", line_num, prefix, line.content);
+                                let rich_text = RichText::new(text).monospace();
+
+                                let rich_text = match line.diff_type {
+                                    DiffType::Added => rich_text.color(Color32::from_rgb(0, 150, 0)),
+                                    DiffType::Removed => rich_text.color(Color32::from_rgb(180, 0, 0)),
+                                    _ => rich_text.color(text_color), // 使用主题文字颜色
+                                };
+
+                                ui.label(rich_text);
+                            }
                         }
                     });
             });
