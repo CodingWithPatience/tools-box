@@ -55,7 +55,10 @@ impl SyntaxHighlighter {
 
         for line in LinesWithEndings::from(code) {
             let ranges = highlighter.highlight_line(line, &self.syntax_set)
-                .unwrap_or_else(|_| vec![(Style::default(), line)]);
+                .unwrap_or_else(|e| {
+                    log::warn!("语法高亮失败，使用默认样式回退: {}", e);
+                    vec![(Style::default(), line)]
+                });
 
             for (style, text) in ranges {
                 let fg_color = Color32::from_rgb(
@@ -100,7 +103,10 @@ impl SyntaxHighlighter {
         let mut result = Vec::new();
 
         let ranges = highlighter.highlight_line(line, &self.syntax_set)
-            .unwrap_or_else(|_| vec![(Style::default(), line)]);
+            .unwrap_or_else(|e| {
+                log::warn!("单行语法高亮失败，使用默认样式回退: {}", e);
+                vec![(Style::default(), line)]
+            });
 
         for (style, text) in ranges {
             let fg_color = Color32::from_rgb(

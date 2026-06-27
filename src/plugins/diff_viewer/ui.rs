@@ -1,3 +1,6 @@
+use std::cell::RefCell;
+use std::hash::{DefaultHasher, Hash, Hasher};
+
 use egui::{Color32, RichText, text::LayoutJob};
 
 use super::differ;
@@ -33,6 +36,9 @@ const SUPPORTED_LANGUAGES: &[(&str, &str)] = &[
     ("YAML", "YAML"),
 ];
 
+/// 高亮缓存条目：(内容哈希, 对应的 LayoutJob)
+type HighlightCache = RefCell<Option<(u64, LayoutJob)>>;
+
 /// Diff 查看器 UI
 pub struct DiffViewerUi {
     /// 左侧文本
@@ -53,6 +59,10 @@ pub struct DiffViewerUi {
     highlighter: SyntaxHighlighter,
     /// 选择的语言
     selected_language: String,
+    /// 左侧编辑区高亮缓存
+    left_highlight_cache: HighlightCache,
+    /// 右侧编辑区高亮缓存
+    right_highlight_cache: HighlightCache,
 }
 
 impl DiffViewerUi {
@@ -67,6 +77,8 @@ impl DiffViewerUi {
             error: None,
             highlighter: SyntaxHighlighter::new(),
             selected_language: "自动检测".to_string(),
+            left_highlight_cache: RefCell::new(None),
+            right_highlight_cache: RefCell::new(None),
         }
     }
 
@@ -87,6 +99,16 @@ impl DiffViewerUi {
         // 双栏输入区域
         let available_height = ui.available_height() - 120.0;
 
+        // 提前计算语法高亮参数，供 layouter 闭包使用
+        let syntax_name = self.get_syntax_name();
+        let is_dark_mode = ui.visuals().dark_mode;
+        let font_size = ui
+            .style()
+            .text_styles
+            .get(&egui::TextStyle::Monospace)
+            .map(|font_id| font_id.size)
+            .unwrap_or(14.0);
+
         // 使用 columns 实现双栏布局
         ui.columns(2, |columns| {
             // 左侧文本
@@ -106,13 +128,29 @@ impl DiffViewerUi {
                         }
                     });
                 });
+                // 此处 load_file_to_left 已执行完毕，可以安全借用 highlighter 和 cache
+                let highlighter = &self.highlighter;
+                let cache = &self.left_highlight_cache;
                 egui::ScrollArea::vertical()
                     .id_salt("diff_edit_left")
                     .max_height(available_height)
                     .show(ui, |ui| {
+                        let mut left_layouter =
+                            |ui: &egui::Ui, string: &str, wrap_width: f32| {
+                                Self::highlight_text_with_cache(
+                                    highlighter,
+                                    cache,
+                                    string,
+                                    &syntax_name,
+                                    is_dark_mode,
+                                    font_size,
+                                    wrap_width,
+                                    ui,
+                                )
+                            };
                         egui::TextEdit::multiline(&mut self.left_text)
                             .hint_text("在此输入原始文本...")
-                            .code_editor()
+                            .layouter(&mut left_layouter)
                             .desired_width(f32::INFINITY)
                             .min_size(egui::vec2(0.0, available_height))
                             .show(ui);
@@ -136,13 +174,29 @@ impl DiffViewerUi {
                         }
                     });
                 });
+                // 此处 load_file_to_right 已执行完毕，可以安全借用 highlighter 和 cache
+                let highlighter = &self.highlighter;
+                let cache = &self.right_highlight_cache;
                 egui::ScrollArea::vertical()
                     .id_salt("diff_edit_right")
                     .max_height(available_height)
                     .show(ui, |ui| {
+                        let mut right_layouter =
+                            |ui: &egui::Ui, string: &str, wrap_width: f32| {
+                                Self::highlight_text_with_cache(
+                                    highlighter,
+                                    cache,
+                                    string,
+                                    &syntax_name,
+                                    is_dark_mode,
+                                    font_size,
+                                    wrap_width,
+                                    ui,
+                                )
+                            };
                         egui::TextEdit::multiline(&mut self.right_text)
                             .hint_text("在此输入对比文本...")
-                            .code_editor()
+                            .layouter(&mut right_layouter)
                             .desired_width(f32::INFINITY)
                             .min_size(egui::vec2(0.0, available_height))
                             .show(ui);
@@ -163,6 +217,7 @@ impl DiffViewerUi {
             if ui.button("🔄 交换内容").clicked() {
                 std::mem::swap(&mut self.left_text, &mut self.right_text);
                 std::mem::swap(&mut self.left_file_name, &mut self.right_file_name);
+                self.clear_cache();
             }
 
             if ui.button("🗑 清空").clicked() {
@@ -172,6 +227,7 @@ impl DiffViewerUi {
                 self.right_file_name = None;
                 self.diff_result = None;
                 self.error = None;
+                self.clear_cache();
             }
 
             ui.separator();
@@ -187,6 +243,7 @@ impl DiffViewerUi {
                             .clicked()
                         {
                             self.selected_language = name.to_string();
+                            self.clear_cache();
                         }
                     }
                 });
@@ -271,6 +328,55 @@ impl DiffViewerUi {
     /// 判断是否为深色模式
     fn is_dark_mode(&self, ui: &egui::Ui) -> bool {
         ui.visuals().dark_mode
+    }
+
+    /// 计算高亮缓存的哈希值（基于文本内容 + 语法名称 + 主题 + 字号）
+    fn compute_highlight_hash(
+        text: &str,
+        syntax_name: &Option<String>,
+        is_dark_mode: bool,
+        font_size: f32,
+    ) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        text.hash(&mut hasher);
+        syntax_name.hash(&mut hasher);
+        is_dark_mode.hash(&mut hasher);
+        font_size.to_bits().hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// 带缓存的语法高亮：仅当文本或高亮参数变化时才重新计算
+    fn highlight_text_with_cache(
+        highlighter: &SyntaxHighlighter,
+        cache: &HighlightCache,
+        text: &str,
+        syntax_name: &Option<String>,
+        is_dark_mode: bool,
+        font_size: f32,
+        wrap_width: f32,
+        ui: &egui::Ui,
+    ) -> std::sync::Arc<egui::Galley> {
+        let hash = Self::compute_highlight_hash(text, syntax_name, is_dark_mode, font_size);
+        let mut cache_ref = cache.borrow_mut();
+        if let Some((cached_hash, cached_job)) = cache_ref.as_ref() {
+            if *cached_hash == hash {
+                let mut job = cached_job.clone();
+                job.wrap.max_width = wrap_width;
+                return ui.fonts(|f| f.layout_job(job));
+            }
+        }
+        let mut job =
+            highlighter.highlight_to_layout_job(text, syntax_name.as_deref(), font_size, is_dark_mode);
+        job.wrap.max_width = wrap_width;
+        let galley = ui.fonts(|f| f.layout_job(job.clone()));
+        *cache_ref = Some((hash, job));
+        galley
+    }
+
+    /// 清空高亮缓存（文本内容或语言切换时调用）
+    fn clear_cache(&self) {
+        self.left_highlight_cache.borrow_mut().take();
+        self.right_highlight_cache.borrow_mut().take();
     }
 
     /// 渲染 Split 视图
