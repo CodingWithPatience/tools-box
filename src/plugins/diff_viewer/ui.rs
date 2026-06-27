@@ -109,6 +109,12 @@ impl DiffViewerUi {
             .map(|font_id| font_id.size)
             .unwrap_or(14.0);
 
+        // 预计算行号宽度，确保左右两侧一致
+        let left_lines = self.left_text.lines().count().max(1);
+        let right_lines = self.right_text.lines().count().max(1);
+        let max_lines = left_lines.max(right_lines);
+        let line_num_digits = format!("{}", max_lines).len().max(3);
+
         // 使用 columns 实现双栏布局
         ui.columns(2, |columns| {
             // 左侧文本
@@ -131,29 +137,45 @@ impl DiffViewerUi {
                 // 此处 load_file_to_left 已执行完毕，可以安全借用 highlighter 和 cache
                 let highlighter = &self.highlighter;
                 let cache = &self.left_highlight_cache;
-                egui::ScrollArea::vertical()
+                let line_count = self.left_text.lines().count();
+                // 行号面板与编辑区共享同一个 ScrollArea，实现垂直同步滚动
+                egui::ScrollArea::both()
                     .id_salt("diff_edit_left")
                     .max_height(available_height)
                     .show(ui, |ui| {
-                        let mut left_layouter =
-                            |ui: &egui::Ui, string: &str, wrap_width: f32| {
-                                Self::highlight_text_with_cache(
-                                    highlighter,
-                                    cache,
-                                    string,
-                                    &syntax_name,
-                                    is_dark_mode,
-                                    font_size,
-                                    wrap_width,
-                                    ui,
-                                )
-                            };
-                        egui::TextEdit::multiline(&mut self.left_text)
-                            .hint_text("在此输入原始文本...")
-                            .layouter(&mut left_layouter)
-                            .desired_width(f32::INFINITY)
-                            .min_size(egui::vec2(0.0, available_height))
-                            .show(ui);
+                        // 行号与编辑区水平排列
+                        ui.horizontal(|ui| {
+                            // 行号面板
+                            let line_num_text: String = (1..=line_count)
+                                .map(|i| format!("{:>width$} │ \n", i, width = line_num_digits))
+                                .collect();
+                            ui.label(
+                                RichText::new(line_num_text.trim_end())
+                                    .monospace()
+                                    .color(Color32::from_rgb(128, 128, 128))
+                                    .size(font_size),
+                            );
+                            // 编辑区
+                            let mut left_layouter =
+                                |ui: &egui::Ui, string: &str, _wrap_width: f32| {
+                                    Self::highlight_text_with_cache(
+                                        highlighter,
+                                        cache,
+                                        string,
+                                        &syntax_name,
+                                        is_dark_mode,
+                                        font_size,
+                                        f32::INFINITY, // 禁用自动换行
+                                        ui,
+                                    )
+                                };
+                            egui::TextEdit::multiline(&mut self.left_text)
+                                .hint_text("在此输入原始文本...")
+                                .layouter(&mut left_layouter)
+                                .desired_width(f32::INFINITY)
+                                .min_size(egui::vec2(0.0, available_height))
+                                .show(ui);
+                        });
                     });
             });
 
@@ -177,29 +199,45 @@ impl DiffViewerUi {
                 // 此处 load_file_to_right 已执行完毕，可以安全借用 highlighter 和 cache
                 let highlighter = &self.highlighter;
                 let cache = &self.right_highlight_cache;
-                egui::ScrollArea::vertical()
+                let line_count = self.right_text.lines().count();
+                // 行号面板与编辑区共享同一个 ScrollArea，实现垂直同步滚动
+                egui::ScrollArea::both()
                     .id_salt("diff_edit_right")
                     .max_height(available_height)
                     .show(ui, |ui| {
-                        let mut right_layouter =
-                            |ui: &egui::Ui, string: &str, wrap_width: f32| {
-                                Self::highlight_text_with_cache(
-                                    highlighter,
-                                    cache,
-                                    string,
-                                    &syntax_name,
-                                    is_dark_mode,
-                                    font_size,
-                                    wrap_width,
-                                    ui,
-                                )
-                            };
-                        egui::TextEdit::multiline(&mut self.right_text)
-                            .hint_text("在此输入对比文本...")
-                            .layouter(&mut right_layouter)
-                            .desired_width(f32::INFINITY)
-                            .min_size(egui::vec2(0.0, available_height))
-                            .show(ui);
+                        // 行号与编辑区水平排列
+                        ui.horizontal(|ui| {
+                            // 行号面板
+                            let line_num_text: String = (1..=line_count)
+                                .map(|i| format!("{:>width$} │ \n", i, width = line_num_digits))
+                                .collect();
+                            ui.label(
+                                RichText::new(line_num_text.trim_end())
+                                    .monospace()
+                                    .color(Color32::from_rgb(128, 128, 128))
+                                    .size(font_size),
+                            );
+                            // 编辑区
+                            let mut right_layouter =
+                                |ui: &egui::Ui, string: &str, _wrap_width: f32| {
+                                    Self::highlight_text_with_cache(
+                                        highlighter,
+                                        cache,
+                                        string,
+                                        &syntax_name,
+                                        is_dark_mode,
+                                        font_size,
+                                        f32::INFINITY, // 禁用自动换行
+                                        ui,
+                                    )
+                                };
+                            egui::TextEdit::multiline(&mut self.right_text)
+                                .hint_text("在此输入对比文本...")
+                                .layouter(&mut right_layouter)
+                                .desired_width(f32::INFINITY)
+                                .min_size(egui::vec2(0.0, available_height))
+                                .show(ui);
+                        });
                     });
             });
         });
