@@ -115,6 +115,11 @@ impl DiffViewerUi {
         let max_lines = left_lines.max(right_lines);
         let line_num_digits = format!("{}", max_lines).len().max(3);
 
+        // 行号列宽（字符数）：数字位数 + 分隔符 " │ "
+        let gutter_char_count = line_num_digits + 3;
+        let gutter_width = gutter_char_count as f32 * font_size * 0.6;
+        let line_height = font_size * 1.2;
+
         // 使用 columns 实现双栏布局
         ui.columns(2, |columns| {
             // 左侧文本
@@ -138,24 +143,16 @@ impl DiffViewerUi {
                 let highlighter = &self.highlighter;
                 let cache = &self.left_highlight_cache;
                 let line_count = self.left_text.lines().count();
-                // 行号面板与编辑区共享同一个 ScrollArea，实现垂直同步滚动
-                egui::ScrollArea::both()
-                    .id_salt("diff_edit_left")
-                    .max_height(available_height)
-                    .show(ui, |ui| {
-                        // 行号与编辑区水平排列
-                        ui.horizontal(|ui| {
-                            // 行号面板
-                            let line_num_text: String = (1..=line_count)
-                                .map(|i| format!("{:>width$} │ \n", i, width = line_num_digits))
-                                .collect();
-                            ui.label(
-                                RichText::new(line_num_text.trim_end())
-                                    .monospace()
-                                    .color(Color32::from_rgb(128, 128, 128))
-                                    .size(font_size),
-                            );
-                            // 编辑区
+                // 行号在 ScrollArea 外部，不随水平滚动移动
+                ui.horizontal(|ui| {
+                    let gutter_origin = ui.cursor().left_top();
+                    // 行号区域占位（高度与 ScrollArea 一致）
+                    ui.allocate_space(egui::vec2(gutter_width, available_height));
+                    // 编辑区 ScrollArea
+                    egui::ScrollArea::both()
+                        .id_salt("diff_edit_left")
+                        .max_height(available_height)
+                        .show(ui, |ui| {
                             let mut left_layouter =
                                 |ui: &egui::Ui, string: &str, _wrap_width: f32| {
                                     Self::highlight_text_with_cache(
@@ -165,7 +162,7 @@ impl DiffViewerUi {
                                         &syntax_name,
                                         is_dark_mode,
                                         font_size,
-                                        f32::INFINITY, // 禁用自动换行
+                                        f32::INFINITY,
                                         ui,
                                     )
                                 };
@@ -176,7 +173,23 @@ impl DiffViewerUi {
                                 .min_size(egui::vec2(0.0, available_height))
                                 .show(ui);
                         });
-                    });
+                    // 读取 ScrollArea 垂直偏移并绘制行号
+                    let scroll_id = ui.make_persistent_id(egui::Id::new("diff_edit_left"));
+                    let offset_y = egui::scroll_area::State::load(ui.ctx(), scroll_id)
+                        .map(|s| s.offset.y)
+                        .unwrap_or(0.0);
+                    Self::render_gutter(
+                        ui,
+                        gutter_origin,
+                        gutter_width,
+                        available_height,
+                        line_count,
+                        line_num_digits,
+                        line_height,
+                        offset_y,
+                        font_size,
+                    );
+                });
             });
 
             // 右侧文本
@@ -200,24 +213,16 @@ impl DiffViewerUi {
                 let highlighter = &self.highlighter;
                 let cache = &self.right_highlight_cache;
                 let line_count = self.right_text.lines().count();
-                // 行号面板与编辑区共享同一个 ScrollArea，实现垂直同步滚动
-                egui::ScrollArea::both()
-                    .id_salt("diff_edit_right")
-                    .max_height(available_height)
-                    .show(ui, |ui| {
-                        // 行号与编辑区水平排列
-                        ui.horizontal(|ui| {
-                            // 行号面板
-                            let line_num_text: String = (1..=line_count)
-                                .map(|i| format!("{:>width$} │ \n", i, width = line_num_digits))
-                                .collect();
-                            ui.label(
-                                RichText::new(line_num_text.trim_end())
-                                    .monospace()
-                                    .color(Color32::from_rgb(128, 128, 128))
-                                    .size(font_size),
-                            );
-                            // 编辑区
+                // 行号在 ScrollArea 外部，不随水平滚动移动
+                ui.horizontal(|ui| {
+                    let gutter_origin = ui.cursor().left_top();
+                    // 行号区域占位（高度与 ScrollArea 一致）
+                    ui.allocate_space(egui::vec2(gutter_width, available_height));
+                    // 编辑区 ScrollArea
+                    egui::ScrollArea::both()
+                        .id_salt("diff_edit_right")
+                        .max_height(available_height)
+                        .show(ui, |ui| {
                             let mut right_layouter =
                                 |ui: &egui::Ui, string: &str, _wrap_width: f32| {
                                     Self::highlight_text_with_cache(
@@ -227,7 +232,7 @@ impl DiffViewerUi {
                                         &syntax_name,
                                         is_dark_mode,
                                         font_size,
-                                        f32::INFINITY, // 禁用自动换行
+                                        f32::INFINITY,
                                         ui,
                                     )
                                 };
@@ -238,7 +243,23 @@ impl DiffViewerUi {
                                 .min_size(egui::vec2(0.0, available_height))
                                 .show(ui);
                         });
-                    });
+                    // 读取 ScrollArea 垂直偏移并绘制行号
+                    let scroll_id = ui.make_persistent_id(egui::Id::new("diff_edit_right"));
+                    let offset_y = egui::scroll_area::State::load(ui.ctx(), scroll_id)
+                        .map(|s| s.offset.y)
+                        .unwrap_or(0.0);
+                    Self::render_gutter(
+                        ui,
+                        gutter_origin,
+                        gutter_width,
+                        available_height,
+                        line_count,
+                        line_num_digits,
+                        line_height,
+                        offset_y,
+                        font_size,
+                    );
+                });
             });
         });
 
@@ -415,6 +436,44 @@ impl DiffViewerUi {
     fn clear_cache(&self) {
         self.left_highlight_cache.borrow_mut().take();
         self.right_highlight_cache.borrow_mut().take();
+    }
+
+    /// 渲染固定行号面板（不随水平滚动移动，垂直与 ScrollArea 同步）
+    #[allow(clippy::too_many_arguments)]
+    fn render_gutter(
+        ui: &egui::Ui,
+        origin: egui::Pos2,
+        width: f32,
+        height: f32,
+        line_count: usize,
+        num_digits: usize,
+        line_height: f32,
+        scroll_offset_y: f32,
+        font_size: f32,
+    ) {
+        let gutter_rect = egui::Rect::from_min_size(origin, egui::vec2(width, height));
+        let painter = ui.painter().with_clip_rect(gutter_rect);
+        let text_color = Color32::from_rgb(128, 128, 128);
+        let font_id = egui::FontId::monospace(font_size);
+        // 计算当前可见行范围
+        let first_visible = (scroll_offset_y / line_height).floor() as usize;
+        let visible_count = (height / line_height).ceil() as usize + 1;
+        let last_visible = (first_visible + visible_count).min(line_count);
+        let frac_offset = scroll_offset_y - first_visible as f32 * line_height;
+        for i in first_visible..last_visible {
+            let y = origin.y + (i - first_visible) as f32 * line_height - frac_offset;
+            if y + line_height < origin.y || y > origin.y + height {
+                continue;
+            }
+            let text = format!("{:>width$} │ ", i + 1, width = num_digits);
+            painter.text(
+                egui::pos2(origin.x + width, y),
+                egui::Align2::RIGHT_TOP,
+                &text,
+                font_id.clone(),
+                text_color,
+            );
+        }
     }
 
     /// 渲染 Split 视图
