@@ -118,7 +118,9 @@ impl DiffViewerUi {
         // 行号列宽（字符数）：数字位数 + 分隔符 " │ "
         let gutter_char_count = line_num_digits + 3;
         let gutter_width = gutter_char_count as f32 * font_size * 0.6;
-        let line_height = font_size * 1.2;
+        // 使用 egui 的字体行高计算方式，与 TextEdit 保持一致
+        let font_id = egui::FontId::monospace(font_size);
+        let line_height = ui.fonts(|f| f.row_height(&font_id));
 
         // 使用 columns 实现双栏布局
         ui.columns(2, |columns| {
