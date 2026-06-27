@@ -118,9 +118,16 @@ impl DiffViewerUi {
         // 行号列宽（字符数）：数字位数 + 分隔符 " │ "
         let gutter_char_count = line_num_digits + 3;
         let gutter_width = gutter_char_count as f32 * font_size * 0.6;
-        // 使用 egui 的字体行高计算方式，与 TextEdit 保持一致
-        let font_id = egui::FontId::monospace(font_size);
-        let line_height = ui.fonts(|f| f.row_height(&font_id));
+        // 使用等宽字体计算行高，与 TextEdit layouter 使用的字体一致
+        let mono_font_id = egui::FontId::monospace(font_size);
+        let raw_line_height = ui.fonts(|f| f.row_height(&mono_font_id));
+        // 使用 round_to_pixel 舍入行高，与 TextEdit 内部的 Galley 行高计算一致
+        // 假设 egui 0.31 内部使用 round_to_pixel 舍入行高
+        let pixels_per_point = ui.pixels_per_point();
+        let line_height = (raw_line_height * pixels_per_point).round() / pixels_per_point;
+        // TextEdit 边距：左右各 4.0，上下各 2.0，与 TextEdit 默认 Margin::symmetric(4, 2) 一致
+        const TEXTEDIT_MARGIN: egui::Margin = egui::Margin::symmetric(4, 2);
+        let text_edit_margin_top = TEXTEDIT_MARGIN.top as f32;
 
         // 使用 columns 实现双栏布局
         ui.columns(2, |columns| {
@@ -173,6 +180,7 @@ impl DiffViewerUi {
                                 .layouter(&mut left_layouter)
                                 .desired_width(f32::INFINITY)
                                 .min_size(egui::vec2(0.0, available_height))
+                                .margin(TEXTEDIT_MARGIN)
                                 .show(ui);
                         });
                     // 读取 ScrollArea 垂直偏移并绘制行号
@@ -190,6 +198,7 @@ impl DiffViewerUi {
                         line_height,
                         offset_y,
                         font_size,
+                        text_edit_margin_top,
                     );
                 });
             });
@@ -243,6 +252,7 @@ impl DiffViewerUi {
                                 .layouter(&mut right_layouter)
                                 .desired_width(f32::INFINITY)
                                 .min_size(egui::vec2(0.0, available_height))
+                                .margin(TEXTEDIT_MARGIN)
                                 .show(ui);
                         });
                     // 读取 ScrollArea 垂直偏移并绘制行号
@@ -260,6 +270,7 @@ impl DiffViewerUi {
                         line_height,
                         offset_y,
                         font_size,
+                        text_edit_margin_top,
                     );
                 });
             });
@@ -452,18 +463,20 @@ impl DiffViewerUi {
         line_height: f32,
         scroll_offset_y: f32,
         font_size: f32,
+        margin_top: f32,
     ) {
         let gutter_rect = egui::Rect::from_min_size(origin, egui::vec2(width, height));
         let painter = ui.painter().with_clip_rect(gutter_rect);
         let text_color = Color32::from_rgb(128, 128, 128);
         let font_id = egui::FontId::monospace(font_size);
-        // 计算当前可见行范围
-        let first_visible = (scroll_offset_y / line_height).floor() as usize;
-        let visible_count = (height / line_height).ceil() as usize + 1;
+        // 计算当前可见行范围，考虑顶部边距
+        let first_visible = ((scroll_offset_y - margin_top) / line_height).floor().max(0.0) as usize;
+        let visible_count = ((height - margin_top) / line_height).ceil().max(0.0) as usize + 1;
         let last_visible = (first_visible + visible_count).min(line_count);
         let frac_offset = scroll_offset_y - first_visible as f32 * line_height;
         for i in first_visible..last_visible {
-            let y = origin.y + (i - first_visible) as f32 * line_height - frac_offset;
+            // 添加顶部边距偏移
+            let y = origin.y + margin_top + (i - first_visible) as f32 * line_height - frac_offset;
             if y + line_height < origin.y || y > origin.y + height {
                 continue;
             }
