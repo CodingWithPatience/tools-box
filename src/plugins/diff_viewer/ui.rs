@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 use egui::{Color32, RichText, text::LayoutJob};
@@ -49,6 +49,9 @@ pub struct DiffViewerUi {
     selected_language: String,
     left_highlight_cache: HighlightCache,
     right_highlight_cache: HighlightCache,
+    last_split_left_y: Cell<f32>,
+    last_split_right_y: Cell<f32>,
+    pending_split_sync_y: Cell<Option<f32>>,
 }
 
 impl DiffViewerUi {
@@ -65,6 +68,9 @@ impl DiffViewerUi {
             selected_language: "自动检测".to_string(),
             left_highlight_cache: RefCell::new(None),
             right_highlight_cache: RefCell::new(None),
+            last_split_left_y: Cell::new(0.0),
+            last_split_right_y: Cell::new(0.0),
+            pending_split_sync_y: Cell::new(None),
         }
     }
 
@@ -256,6 +262,9 @@ impl DiffViewerUi {
             if ui.button("📊 开始对比").clicked() {
                 self.diff_result = Some(differ::compute_diff(&self.left_text, &self.right_text));
                 self.view_mode = ViewMode::Split;
+                self.last_split_left_y.set(0.0);
+                self.last_split_right_y.set(0.0);
+                self.pending_split_sync_y.set(None);
             }
         });
     }
@@ -327,6 +336,13 @@ impl DiffViewerUi {
             let available_size = ui.available_size_before_wrap();
             let col_width = (available_size.x / 2.0).max(100.0);
 
+            // 读取待同步目标
+            let sync_target = self.pending_split_sync_y.get().unwrap_or(0.0);
+
+            // 以闭包形式记录输出状态（避免 borrow 冲突）
+            let left_y_ref: Cell<f32> = Cell::new(0.0);
+            let right_y_ref: Cell<f32> = Cell::new(0.0);
+
             ui.horizontal(|ui| {
                 // ===== 左面板 =====
                 ui.allocate_ui_with_layout(
@@ -334,37 +350,41 @@ impl DiffViewerUi {
                     egui::Layout::top_down(egui::Align::LEFT),
                     |ui| {
                         ui.label(RichText::new("原始文本").strong().color(dim_color));
-                        egui::ScrollArea::both()
+                        let mut scroll = egui::ScrollArea::both()
                             .id_salt("split_left")
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                for line in &result.split_lines {
-                                    ui.horizontal(|ui| {
-                                        let num_text = match line.left_line_number {
-                                            Some(n) => format!("{:>w$}", n, w = num_digits),
-                                            None => " ".repeat(num_digits),
-                                        };
-                                        ui.add_sized(
-                                            [gutter_w, row_height],
-                                            egui::Label::new(
-                                                RichText::new(format!("{} │ ", num_text))
-                                                    .monospace()
-                                                    .color(dim_color),
-                                            ),
-                                        );
-                                        ui.allocate_ui_with_layout(
-                                            egui::vec2(col_width - gutter_w, row_height),
-                                            egui::Layout::left_to_right(egui::Align::Min),
-                                            |ui| {
-                                                self.render_cell(
-                                                    ui, line, true, row_height, font_size,
-                                                    &syntax_name, is_dark_mode, text_color,
-                                                );
-                                            },
-                                        );
-                                    });
-                                }
-                            });
+                            .auto_shrink([false, false]);
+                        if sync_target > 0.5 {
+                            scroll = scroll.vertical_scroll_offset(sync_target);
+                        }
+                        let output = scroll.show(ui, |ui| {
+                            for line in &result.split_lines {
+                                ui.horizontal(|ui| {
+                                    let num_text = match line.left_line_number {
+                                        Some(n) => format!("{:>w$}", n, w = num_digits),
+                                        None => " ".repeat(num_digits),
+                                    };
+                                    ui.add_sized(
+                                        [gutter_w, row_height],
+                                        egui::Label::new(
+                                            RichText::new(format!("{} │ ", num_text))
+                                                .monospace()
+                                                .color(dim_color),
+                                        ),
+                                    );
+                                    ui.allocate_ui_with_layout(
+                                        egui::vec2(col_width - gutter_w, row_height),
+                                        egui::Layout::left_to_right(egui::Align::Min),
+                                        |ui| {
+                                            self.render_cell(
+                                                ui, line, true, row_height, font_size,
+                                                &syntax_name, is_dark_mode, text_color,
+                                            );
+                                        },
+                                    );
+                                });
+                            }
+                        });
+                        left_y_ref.set(output.state.offset.y);
                     },
                 );
 
@@ -376,40 +396,64 @@ impl DiffViewerUi {
                     egui::Layout::top_down(egui::Align::LEFT),
                     |ui| {
                         ui.label(RichText::new("对比文本").strong().color(dim_color));
-                        egui::ScrollArea::both()
+                        let mut scroll = egui::ScrollArea::both()
                             .id_salt("split_right")
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                for line in &result.split_lines {
-                                    ui.horizontal(|ui| {
-                                        let num_text = match line.right_line_number {
-                                            Some(n) => format!("{:>w$}", n, w = num_digits),
-                                            None => " ".repeat(num_digits),
-                                        };
-                                        ui.add_sized(
-                                            [gutter_w, row_height],
-                                            egui::Label::new(
-                                                RichText::new(format!("{} │ ", num_text))
-                                                    .monospace()
-                                                    .color(dim_color),
-                                            ),
-                                        );
-                                        ui.allocate_ui_with_layout(
-                                            egui::vec2(col_width - gutter_w, row_height),
-                                            egui::Layout::left_to_right(egui::Align::Min),
-                                            |ui| {
-                                                self.render_cell(
-                                                    ui, line, false, row_height, font_size,
-                                                    &syntax_name, is_dark_mode, text_color,
-                                                );
-                                            },
-                                        );
-                                    });
-                                }
-                            });
+                            .auto_shrink([false, false]);
+                        if sync_target > 0.5 {
+                            scroll = scroll.vertical_scroll_offset(sync_target);
+                        }
+                        let output = scroll.show(ui, |ui| {
+                            for line in &result.split_lines {
+                                ui.horizontal(|ui| {
+                                    let num_text = match line.right_line_number {
+                                        Some(n) => format!("{:>w$}", n, w = num_digits),
+                                        None => " ".repeat(num_digits),
+                                    };
+                                    ui.add_sized(
+                                        [gutter_w, row_height],
+                                        egui::Label::new(
+                                            RichText::new(format!("{} │ ", num_text))
+                                                .monospace()
+                                                .color(dim_color),
+                                        ),
+                                    );
+                                    ui.allocate_ui_with_layout(
+                                        egui::vec2(col_width - gutter_w, row_height),
+                                        egui::Layout::left_to_right(egui::Align::Min),
+                                        |ui| {
+                                            self.render_cell(
+                                                ui, line, false, row_height, font_size,
+                                                &syntax_name, is_dark_mode, text_color,
+                                            );
+                                        },
+                                    );
+                                });
+                            }
+                        });
+                        right_y_ref.set(output.state.offset.y);
                     },
                 );
             });
+
+            // 检测滚动变化并设置同步目标
+            let left_y = left_y_ref.get();
+            let right_y = right_y_ref.get();
+            let last_left = self.last_split_left_y.get();
+            let last_right = self.last_split_right_y.get();
+
+            let left_changed = (left_y - last_left).abs() > 0.5;
+            let right_changed = (right_y - last_right).abs() > 0.5;
+
+            if left_changed && !right_changed {
+                self.pending_split_sync_y.set(Some(left_y));
+            } else if right_changed && !left_changed {
+                self.pending_split_sync_y.set(Some(right_y));
+            } else {
+                self.pending_split_sync_y.set(None);
+            }
+
+            self.last_split_left_y.set(left_y);
+            self.last_split_right_y.set(right_y);
         });
     }
 
