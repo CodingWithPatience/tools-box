@@ -49,9 +49,14 @@ pub struct DiffViewerUi {
     selected_language: String,
     left_highlight_cache: HighlightCache,
     right_highlight_cache: HighlightCache,
-    last_split_left_y: Cell<f32>,
-    last_split_right_y: Cell<f32>,
-    pending_split_sync_y: Cell<Option<f32>>,
+    /// 上一帧左面板的滚动偏移量
+    last_left_offset: Cell<f32>,
+    /// 上一帧右面板的滚动偏移量
+    last_right_offset: Cell<f32>,
+    /// 待同步到左面板的偏移量（右面板被用户滚动时设置）
+    pending_sync_left: Cell<Option<f32>>,
+    /// 待同步到右面板的偏移量（左面板被用户滚动时设置）
+    pending_sync_right: Cell<Option<f32>>,
 }
 
 impl DiffViewerUi {
@@ -68,9 +73,10 @@ impl DiffViewerUi {
             selected_language: "自动检测".to_string(),
             left_highlight_cache: RefCell::new(None),
             right_highlight_cache: RefCell::new(None),
-            last_split_left_y: Cell::new(0.0),
-            last_split_right_y: Cell::new(0.0),
-            pending_split_sync_y: Cell::new(None),
+            last_left_offset: Cell::new(0.0),
+            last_right_offset: Cell::new(0.0),
+            pending_sync_left: Cell::new(None),
+            pending_sync_right: Cell::new(None),
         }
     }
 
@@ -262,9 +268,10 @@ impl DiffViewerUi {
             if ui.button("📊 开始对比").clicked() {
                 self.diff_result = Some(differ::compute_diff(&self.left_text, &self.right_text));
                 self.view_mode = ViewMode::Split;
-                self.last_split_left_y.set(0.0);
-                self.last_split_right_y.set(0.0);
-                self.pending_split_sync_y.set(None);
+                self.last_left_offset.set(0.0);
+                self.last_right_offset.set(0.0);
+                self.pending_sync_left.set(None);
+                self.pending_sync_right.set(None);
             }
         });
     }
@@ -315,7 +322,6 @@ impl DiffViewerUi {
         let dim_color = Color32::from_rgb(128, 128, 128);
 
         ui.vertical(|ui| {
-
             let row_height = ui.text_style_height(&egui::TextStyle::Monospace) + 4.0;
             let font_size = ui
                 .style()
@@ -336,15 +342,18 @@ impl DiffViewerUi {
             let available_size = ui.available_size_before_wrap();
             let col_width = (available_size.x / 2.0).max(100.0);
 
-            // 读取待同步目标
-            let sync_target = self.pending_split_sync_y.get().unwrap_or(0.0);
+            // 读取上一帧的待同步偏移量
+            let sync_left = self.pending_sync_left.get();
+            let sync_right = self.pending_sync_right.get();
 
-            // 以闭包形式记录输出状态（避免 borrow 冲突）
-            let left_y_ref: Cell<f32> = Cell::new(0.0);
-            let right_y_ref: Cell<f32> = Cell::new(0.0);
+            // 用于记录当前帧的面板偏移量
+            let left_current_offset: Cell<f32> = Cell::new(0.0);
+            let right_current_offset: Cell<f32> = Cell::new(0.0);
+            // 标记是否因同步而应用了偏移（用于 ignoreChange 模式）
+            let left_sync_applied: Cell<bool> = Cell::new(false);
 
             ui.horizontal(|ui| {
-                // ===== 左面板 =====
+                // ===== 左面板（先渲染，获取滚动位置） =====
                 ui.allocate_ui_with_layout(
                     egui::vec2(col_width, available_size.y),
                     egui::Layout::top_down(egui::Align::LEFT),
@@ -353,8 +362,10 @@ impl DiffViewerUi {
                         let mut scroll = egui::ScrollArea::both()
                             .id_salt("split_left")
                             .auto_shrink([false, false]);
-                        if sync_target > 0.5 {
-                            scroll = scroll.vertical_scroll_offset(sync_target);
+                        // 应用上一帧右面板的同步偏移量
+                        if let Some(offset_y) = sync_left {
+                            scroll = scroll.vertical_scroll_offset(offset_y);
+                            left_sync_applied.set(true);
                         }
                         let output = scroll.show(ui, |ui| {
                             for line in &result.split_lines {
@@ -384,13 +395,13 @@ impl DiffViewerUi {
                                 });
                             }
                         });
-                        left_y_ref.set(output.state.offset.y);
+                        left_current_offset.set(output.state.offset.y);
                     },
                 );
 
                 ui.separator();
 
-                // ===== 右面板 =====
+                // ===== 右面板（同帧同步左面板的滚动位置） =====
                 ui.allocate_ui_with_layout(
                     egui::vec2(col_width, available_size.y),
                     egui::Layout::top_down(egui::Align::LEFT),
@@ -399,8 +410,21 @@ impl DiffViewerUi {
                         let mut scroll = egui::ScrollArea::both()
                             .id_salt("split_right")
                             .auto_shrink([false, false]);
-                        if sync_target > 0.5 {
-                            scroll = scroll.vertical_scroll_offset(sync_target);
+                        // 同帧同步策略（参考 VSCode 的 ignoreChange 模式）：
+                        // 1. 左面板被用户滚动 → 同帧同步右面板
+                        // 2. 右面板被用户滚动 → 下一帧同步左面板（通过 pending_sync_left）
+                        let left_y = left_current_offset.get();
+                        let sync_to_right = if !left_sync_applied.get()
+                            && (left_y - self.last_left_offset.get()).abs() > 0.5
+                        {
+                            // 左面板被用户滚动（非同步导致），同帧同步右面板
+                            Some(left_y)
+                        } else {
+                            // 否则使用上一帧的同步值（来自右面板用户滚动）
+                            sync_right
+                        };
+                        if let Some(offset_y) = sync_to_right {
+                            scroll = scroll.vertical_scroll_offset(offset_y);
                         }
                         let output = scroll.show(ui, |ui| {
                             for line in &result.split_lines {
@@ -430,30 +454,38 @@ impl DiffViewerUi {
                                 });
                             }
                         });
-                        right_y_ref.set(output.state.offset.y);
+                        right_current_offset.set(output.state.offset.y);
+                        // 判断右面板是否被用户滚动（排除同步导致的偏移变化）
+                        let right_changed = sync_to_right.is_none()
+                            && (output.state.offset.y - self.last_right_offset.get()).abs() > 0.5;
+                        // 设置下一帧的同步
+                        if right_changed {
+                            // 用户滚动右面板 → 下一帧同步左面板
+                            self.pending_sync_left.set(Some(output.state.offset.y));
+                            self.pending_sync_right.set(None);
+                        } else {
+                            // 清除待同步
+                            self.pending_sync_left.set(None);
+                            self.pending_sync_right.set(None);
+                        }
                     },
                 );
             });
-
-            // 检测滚动变化并设置同步目标
-            let left_y = left_y_ref.get();
-            let right_y = right_y_ref.get();
-            let last_left = self.last_split_left_y.get();
-            let last_right = self.last_split_right_y.get();
-
-            let left_changed = (left_y - last_left).abs() > 0.5;
-            let right_changed = (right_y - last_right).abs() > 0.5;
-
-            if left_changed && !right_changed {
-                self.pending_split_sync_y.set(Some(left_y));
-            } else if right_changed && !left_changed {
-                self.pending_split_sync_y.set(Some(right_y));
-            } else {
-                self.pending_split_sync_y.set(None);
+            // 边界补正：当滚动到顶部/底部时，强制另一边面板也对齐
+            let left_offset = left_current_offset.get();
+            let right_offset = right_current_offset.get();
+            let left_at_top = left_offset < 1.0;
+            let right_at_top = right_offset < 1.0;
+            if left_at_top && !right_at_top {
+                // 左面板在顶部，右面板不在顶部 → 强制右面板到顶部
+                self.pending_sync_right.set(Some(0.0));
+            } else if right_at_top && !left_at_top {
+                // 右面板在顶部，左面板不在顶部 → 强制左面板到顶部
+                self.pending_sync_left.set(Some(0.0));
             }
-
-            self.last_split_left_y.set(left_y);
-            self.last_split_right_y.set(right_y);
+            // 更新上一帧的偏移量
+            self.last_left_offset.set(left_offset);
+            self.last_right_offset.set(right_offset);
         });
     }
 
