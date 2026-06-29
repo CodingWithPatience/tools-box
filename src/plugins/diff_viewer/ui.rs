@@ -349,6 +349,9 @@ impl DiffViewerUi {
             // 用于记录当前帧的面板偏移量
             let left_current_offset: Cell<f32> = Cell::new(0.0);
             let right_current_offset: Cell<f32> = Cell::new(0.0);
+            // 记录面板是否可滚动（内容高度超过视口高度）
+            let left_scrollable: Cell<bool> = Cell::new(false);
+            let right_scrollable: Cell<bool> = Cell::new(false);
             // 标记是否因同步而应用了偏移（用于 ignoreChange 模式）
             let left_sync_applied: Cell<bool> = Cell::new(false);
 
@@ -396,6 +399,8 @@ impl DiffViewerUi {
                             }
                         });
                         left_current_offset.set(output.state.offset.y);
+                        // 记录左面板是否可滚动（内容高度超过视口高度）
+                        left_scrollable.set(output.content_size.y > output.inner_rect.height());
                     },
                 );
 
@@ -455,6 +460,8 @@ impl DiffViewerUi {
                             }
                         });
                         right_current_offset.set(output.state.offset.y);
+                        // 记录右面板是否可滚动（内容高度超过视口高度）
+                        right_scrollable.set(output.content_size.y > output.inner_rect.height());
                         // 判断右面板是否被用户滚动（排除同步导致的偏移变化）
                         let right_changed = sync_to_right.is_none()
                             && (output.state.offset.y - self.last_right_offset.get()).abs() > 0.5;
@@ -471,16 +478,17 @@ impl DiffViewerUi {
                     },
                 );
             });
-            // 边界补正：当滚动到顶部/底部时，强制另一边面板也对齐
+            // 边界补正：当滚动到顶部时，强制另一边面板也对齐
+            // 仅当两侧面板都可滚动时才触发补正，避免短内容面板误判
             let left_offset = left_current_offset.get();
             let right_offset = right_current_offset.get();
             let left_at_top = left_offset < 1.0;
             let right_at_top = right_offset < 1.0;
-            if left_at_top && !right_at_top {
-                // 左面板在顶部，右面板不在顶部 → 强制右面板到顶部
+            if left_at_top && !right_at_top && right_scrollable.get() {
+                // 左面板在顶部，右面板不在顶部且可滚动 → 强制右面板到顶部
                 self.pending_sync_right.set(Some(0.0));
-            } else if right_at_top && !left_at_top {
-                // 右面板在顶部，左面板不在顶部 → 强制左面板到顶部
+            } else if right_at_top && !left_at_top && left_scrollable.get() {
+                // 右面板在顶部，左面板不在顶部且可滚动 → 强制左面板到顶部
                 self.pending_sync_left.set(Some(0.0));
             }
             // 更新上一帧的偏移量
