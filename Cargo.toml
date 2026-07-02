@@ -32,7 +32,7 @@ arboard = "3"
 aes-gcm = "0.10"
 rand = "0.8"
 sha2 = "0.10"
-pbkdf2 = { version = "0.12", default-features = false }
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 hmac = "0.12"
 
 # Serialization

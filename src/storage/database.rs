@@ -99,6 +99,33 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_hosts_entries_env ON hosts_entries(environment_id);",
         )?;
 
+        // SSH 客户端 - 会话配置表
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS ssh_sessions (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                name        TEXT NOT NULL,
+                host        TEXT NOT NULL,
+                port        INTEGER NOT NULL DEFAULT 22,
+                username    TEXT NOT NULL,
+                auth_type   TEXT NOT NULL DEFAULT 'password',
+                auth_data   TEXT,
+                sort_order  INTEGER DEFAULT 0,
+                created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+            );",
+        )?;
+
+        // SSH 客户端 - 连接历史表
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS ssh_history (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id      INTEGER NOT NULL,
+                connected_at    DATETIME DEFAULT CURRENT_TIMESTAMP,
+                disconnected_at DATETIME,
+                FOREIGN KEY (session_id) REFERENCES ssh_sessions(id) ON DELETE CASCADE
+            );",
+        )?;
+
         log::info!("数据库表初始化完成");
         Ok(())
     }
