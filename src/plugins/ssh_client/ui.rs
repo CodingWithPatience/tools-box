@@ -146,53 +146,30 @@ impl SshClientUi {
                 self.render_status_bar(ui);
             });
 
-        // 弹窗：新增/编辑会话
-        let ctx = ui.ctx().clone();
-        self.render_modals(&ctx, store);
-    }
-
-    /// 渲染弹窗（新增/编辑会话）
-    fn render_modals(&mut self, ctx: &egui::Context, store: &SshStore) {
+        // 弹窗：新增/编辑会话（参考 api_tester 的 Window 用法）
         let is_editing = self.editing_id.is_some();
         let title = if is_editing { "编辑会话" } else { "新增会话" };
 
-        // 编辑弹窗
         if self.show_edit_modal {
-            let mut open = self.show_edit_modal;
             egui::Window::new(title)
-                .open(&mut open)
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .min_width(380.0)
-                .show(ctx, |ui| {
+                .show(ui.ctx(), |ui| {
                     self.render_session_form_content(ui, store);
                 });
-            // open 是值拷贝，表单内修改的是 self.show_edit_modal
-            if !open || !self.show_edit_modal {
-                self.show_edit_modal = false;
-                self.editing_id = None;
-                self.form_error = None;
-            }
         }
 
-        // 新增弹窗
         if self.show_new_modal {
-            let mut open = self.show_new_modal;
             egui::Window::new("新增会话")
-                .open(&mut open)
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .min_width(380.0)
-                .show(ctx, |ui| {
+                .show(ui.ctx(), |ui| {
                     self.render_session_form_content(ui, store);
                 });
-            if !open || !self.show_new_modal {
-                self.show_new_modal = false;
-                self.editing_id = None;
-                self.form_error = None;
-            }
         }
     }
 
