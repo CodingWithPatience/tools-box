@@ -163,7 +163,7 @@ impl SshClientUi {
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-                .min_width(380.0)
+                .fixed_size(egui::vec2(440.0, f32::INFINITY))
                 .show(ui.ctx(), |ui| {
                     self.render_session_form_content(ui, store);
                 });
@@ -174,7 +174,7 @@ impl SshClientUi {
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-                .min_width(380.0)
+                .fixed_size(egui::vec2(440.0, f32::INFINITY))
                 .show(ui.ctx(), |ui| {
                     self.render_session_form_content(ui, store);
                 });
