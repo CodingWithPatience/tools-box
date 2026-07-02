@@ -46,21 +46,21 @@ impl<'a> SshStore<'a> {
                 match row.context("读取会话记录失败") {
                     Ok(r) => r,
                     Err(e) => {
-                        log::warn!("跳过一条损坏的 SSH 会话记录: {}", e);
+                        log::warn!("跳过一条损坏的 SSH 连接记录: {}", e);
                         continue;
                     }
                 };
             let port = match u16::try_from(port_i64) {
                 Ok(p) => p,
                 Err(_) => {
-                    log::warn!("SSH 会话 '{}' (id={}) 端口值 {} 无效，跳过", name, id, port_i64);
+                    log::warn!("SSH 连接 '{}' (id={}) 端口值 {} 无效，跳过", name, id, port_i64);
                     continue;
                 }
             };
             let auth_method = match Self::parse_auth(&auth_type, &auth_data) {
                 Ok(m) => m,
                 Err(e) => {
-                    log::warn!("SSH 会话 '{}' (id={}) {} 解析失败，跳过: {}", name, id, auth_type, e);
+                    log::warn!("SSH 连接 '{}' (id={}) {} 解析失败，跳过: {}", name, id, auth_type, e);
                     continue;
                 }
             };
@@ -123,7 +123,7 @@ impl<'a> SshStore<'a> {
                     max_order + 1,
                 ],
             )
-            .context("新增会话失败")?;
+            .context("保存连接失败")?;
 
         Ok(self.conn.last_insert_rowid())
     }
@@ -149,12 +149,12 @@ impl<'a> SshStore<'a> {
                     id,
                 ],
             )
-            .context("更新会话失败")?;
+            .context("更新连接失败")?;
 
         if affected == 0 {
-            anyhow::bail!("未找到 id 为 {} 的会话", id);
+            anyhow::bail!("未找到 id 为 {} 的连接", id);
         }
-        log::info!("SSH 会话 '{}' (id={}) 已更新", session.name, id);
+        log::info!("SSH 连接 '{}' (id={}) 已更新", session.name, id);
         Ok(())
     }
 
@@ -163,12 +163,12 @@ impl<'a> SshStore<'a> {
         let affected = self
             .conn
             .execute("DELETE FROM ssh_sessions WHERE id = ?1", params![id])
-            .context("删除会话失败")?;
+            .context("删除连接失败")?;
 
         if affected == 0 {
-            anyhow::bail!("未找到 id 为 {} 的会话", id);
+            anyhow::bail!("未找到 id 为 {} 的连接", id);
         }
-        log::info!("SSH 会话 (id={}) 已删除", id);
+        log::info!("SSH 连接 (id={}) 已删除", id);
         Ok(())
     }
 
@@ -178,8 +178,8 @@ impl<'a> SshStore<'a> {
         let count: i64 = self
             .conn
             .query_row("SELECT COUNT(*) FROM ssh_sessions", [], |row| row.get(0))
-            .context("查询会话数量失败")?;
-        usize::try_from(count).context("会话数量溢出")
+            .context("查询连接数量失败")?;
+        usize::try_from(count).context("连接数量溢出")
     }
 
     // ===================================================================

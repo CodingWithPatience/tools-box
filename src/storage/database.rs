@@ -136,7 +136,7 @@ impl Database {
             self.conn
                 .pragma_update(None, "user_version", 1)
                 .context("更新数据库版本号失败")?;
-            log::info!("SSH 会话表已迁移到 v1（清除旧数据，添加唯一约束）");
+            log::info!("SSH 连接配置表已迁移到 v1（清除旧数据，添加唯一约束）");
         }
 
         // SSH 客户端 - 连接历史表

@@ -65,7 +65,7 @@ impl SshClientUi {
                 }
             }
             Err(e) => {
-                let err_msg = format!("加载会话列表失败: {}", e);
+                let err_msg = format!("加载连接列表失败: {}", e);
                 self.status_msg = err_msg.clone();
                 if self.last_load_error != err_msg {
                     log::error!("{}", err_msg);
@@ -154,9 +154,9 @@ impl SshClientUi {
                 self.render_status_bar(ui);
             });
 
-        // 弹窗：新增/编辑会话（参考 api_tester 的 Window 用法）
+        // 弹窗：新增/编辑连接（参考 api_tester 的 Window 用法）
         let is_editing = self.editing_id.is_some();
-        let title = if is_editing { "编辑会话" } else { "新增会话" };
+        let title = if is_editing { "编辑连接" } else { "新增连接" };
 
         if self.show_edit_modal {
             egui::Window::new(title)
@@ -170,7 +170,7 @@ impl SshClientUi {
         }
 
         if self.show_new_modal {
-            egui::Window::new("新增会话")
+            egui::Window::new("新增连接")
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
@@ -293,7 +293,7 @@ impl SshClientUi {
             let btn_label = if is_editing {
                 "💾 保存修改"
             } else {
-                "✅ 创建会话"
+                "✅ 保存连接"
             };
 
             if ui.button(btn_label).clicked() {
@@ -350,7 +350,7 @@ impl SshClientUi {
 
     /// 渲染左侧会话列表
     fn render_session_list(&mut self, ui: &mut egui::Ui, _store: &SshStore) {
-        ui.strong("会话列表:");
+        ui.strong("连接列表:");
         ui.add_space(4.0);
 
         let height = ui.available_height() - 10.0;
@@ -359,7 +359,7 @@ impl SshClientUi {
             .max_height(height)
             .show(ui, |ui| {
                 if self.sessions.is_empty() {
-                    ui.weak("暂无保存的会话，点击「+ 新增会话」创建");
+                    ui.weak("暂无保存的连接，点击「+ 新增会话」创建");
                     return;
                 }
 
@@ -403,12 +403,12 @@ impl SshClientUi {
                 self.render_session_detail(ui, idx, store);
             } else {
                 ui.centered_and_justified(|ui| {
-                    ui.weak("选择一个会话查看详情");
+                    ui.weak("选择一个连接查看详情");
                 });
             }
         } else {
             ui.centered_and_justified(|ui| {
-                ui.weak("选择一个会话查看详情");
+                ui.weak("选择一个连接查看详情");
             });
         }
     }
@@ -434,7 +434,7 @@ impl SshClientUi {
             _ => None,
         };
 
-        ui.strong("会话详情");
+        ui.strong("连接详情");
         ui.add_space(8.0);
 
         ui.label(format!("名称: {}", session_name));
@@ -450,7 +450,7 @@ impl SshClientUi {
 
         // 操作按钮
         ui.horizontal(|ui| {
-            if ui.button("🔌 连接").clicked() {
+            if ui.button("🖥 创建会话").clicked() {
                 self.status_msg = format!("正在连接 {}...", session_name);
                 self.connection_state = SessionState::Connecting;
                 // 后续阶段实现实际连接
@@ -470,13 +470,13 @@ impl SshClientUi {
             {
                 match store.delete_session(session_id) {
                     Ok(()) => {
-                        self.status_msg = format!("已删除会话: {}", session_name);
+                        self.status_msg = format!("已删除连接: {}", session_name);
                         self.selected_index = None;
                         self.refresh_sessions(store);
                     }
                     Err(e) => {
                         self.status_msg = format!("删除失败: {}", e);
-                        log::error!("删除 SSH 会话失败: {}", e);
+                        log::error!("删除 SSH 连接失败: {}", e);
                     }
                 }
             }
@@ -530,13 +530,13 @@ impl SshClientUi {
         if let Some(id) = self.editing_id {
             store
                 .update_session(id, &new_session)
-                .map_err(|e| format!("更新会话失败: {}", e))?;
-            log::info!("SSH 会话 '{}' 已更新", new_session.name);
+                .map_err(|e| format!("更新连接失败: {}", e))?;
+            log::info!("SSH 连接 '{}' 已更新", new_session.name);
         } else {
             store
                 .insert_session(&new_session)
-                .map_err(|e| format!("新增会话失败: {}", e))?;
-            log::info!("SSH 会话 '{}' 已创建", new_session.name);
+                .map_err(|e| format!("保存连接失败: {}", e))?;
+            log::info!("SSH 连接 '{}' 已创建", new_session.name);
         }
 
         Ok(())
