@@ -31,6 +31,22 @@ impl SyntaxHighlighter {
             .or_else(|| self.syntax_set.find_syntax_by_first_line(filename))
     }
 
+    /// 根据亮/暗模式获取主题，若指定主题不存在则回退到第一个可用主题
+    fn resolve_theme(&self, is_dark_mode: bool) -> Option<&syntect::highlighting::Theme> {
+        let theme_name = if is_dark_mode {
+            "base16-ocean.dark"
+        } else {
+            "base16-ocean.light"
+        };
+        self.theme_set.themes.get(theme_name).or_else(|| {
+            log::warn!(
+                "主题 '{}' 未找到，回退到首个可用主题",
+                theme_name
+            );
+            self.theme_set.themes.values().next()
+        })
+    }
+
     /// 高亮代码并返回 LayoutJob
     pub fn highlight_to_layout_job(
         &self,
@@ -39,16 +55,27 @@ impl SyntaxHighlighter {
         font_size: f32,
         is_dark_mode: bool,
     ) -> LayoutJob {
+        if code.is_empty() {
+            return LayoutJob::default();
+        }
+
         let syntax = syntax_name
             .and_then(|name| self.find_syntax_by_name_fuzzy(name))
             .unwrap_or_else(|| self.syntax_set.find_syntax_plain_text());
 
-        let theme_name = if is_dark_mode {
-            "base16-ocean.dark"
-        } else {
-            "base16-ocean.light"
+        let Some(theme) = self.resolve_theme(is_dark_mode) else {
+            log::error!("无可用语法高亮主题，回退为纯文本");
+            let mut job = LayoutJob::default();
+            job.append(
+                code,
+                0.0,
+                TextFormat {
+                    font_id: FontId::monospace(font_size),
+                    ..Default::default()
+                },
+            );
+            return job;
         };
-        let theme = &self.theme_set.themes[theme_name];
 
         let mut highlighter = HighlightLines::new(syntax, theme);
         let mut job = LayoutJob::default();
@@ -92,12 +119,11 @@ impl SyntaxHighlighter {
             .and_then(|name| self.find_syntax_by_name_fuzzy(name))
             .unwrap_or_else(|| self.syntax_set.find_syntax_plain_text());
 
-        let theme_name = if is_dark_mode {
-            "base16-ocean.dark"
-        } else {
-            "base16-ocean.light"
+        let Some(theme) = self.resolve_theme(is_dark_mode) else {
+            log::error!("无可用语法高亮主题，回退为纯文本");
+            let fg = Color32::from_rgb(0xd0, 0xd0, 0xd0);
+            return vec![(fg, line.to_string())];
         };
-        let theme = &self.theme_set.themes[theme_name];
 
         let mut highlighter = HighlightLines::new(syntax, theme);
         let mut result = Vec::new();
@@ -131,12 +157,10 @@ impl SyntaxHighlighter {
 
     /// 根据语言名称获取语法定义（模糊匹配）
     pub fn find_syntax_by_name_fuzzy(&self, name: &str) -> Option<&syntect::parsing::SyntaxReference> {
-        // 先尝试精确匹配
         if let Some(syntax) = self.syntax_set.find_syntax_by_name(name) {
             return Some(syntax);
         }
 
-        // 尝试不区分大小写匹配
         let name_lower = name.to_lowercase();
         self.syntax_set.syntaxes().iter().find(|s| {
             s.name.to_lowercase() == name_lower

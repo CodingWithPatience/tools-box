@@ -4,7 +4,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use egui::{Color32, RichText, text::LayoutJob};
 
 use super::differ;
-use super::highlight::SyntaxHighlighter;
+use crate::utils::highlight::SyntaxHighlighter;
 use super::models::{DiffResult, DiffType, SplitLine, TextSegment, ViewMode};
 
 const SUPPORTED_LANGUAGES: &[(&str, &str)] = &[

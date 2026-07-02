@@ -4,6 +4,7 @@ mod app;
 mod plugin;
 mod plugins;
 mod storage;
+mod utils;
 
 use app::App;
 use storage::Database;
