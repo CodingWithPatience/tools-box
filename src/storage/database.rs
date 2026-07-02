@@ -115,6 +115,30 @@ impl Database {
             );",
         )?;
 
+        // 数据库迁移：清除旧版本的 SSH 会话数据，添加唯一约束
+        let db_version: i32 = self
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap_or(0);
+        if db_version < 1 {
+            // 清除 v0 版本的旧数据（auth_data 格式不兼容）
+            self.conn
+                .execute("DELETE FROM ssh_sessions", [])
+                .context("清除旧 SSH 会话数据失败")?;
+            // 添加唯一约束：同主机同用户名只能有一个配置
+            self.conn
+                .execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_ssh_sessions_unique
+                     ON ssh_sessions(host, username)",
+                    [],
+                )
+                .context("创建唯一索引失败")?;
+            self.conn
+                .pragma_update(None, "user_version", 1)
+                .context("更新数据库版本号失败")?;
+            log::info!("SSH 会话表已迁移到 v1（清除旧数据，添加唯一约束）");
+        }
+
         // SSH 客户端 - 连接历史表
         self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS ssh_history (

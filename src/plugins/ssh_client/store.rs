@@ -79,8 +79,25 @@ impl<'a> SshStore<'a> {
         Ok(sessions)
     }
 
-    /// 新增会话
+    /// 新增会话配置（host+username 唯一）
     pub fn insert_session(&self, session: &NewSession) -> Result<i64> {
+        // 检查是否已存在同主机同用户的配置
+        let exists: bool = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM ssh_sessions WHERE host = ?1 AND username = ?2",
+                params![session.host, session.username],
+                |row| row.get(0),
+            )
+            .context("查询重复配置失败")?;
+        if exists {
+            anyhow::bail!(
+                "连接配置已存在: {}@{}，请通过编辑按钮更新现有配置",
+                session.username,
+                session.host
+            );
+        }
+
         let auth_type = session.auth_method.type_str().to_string();
         let auth_data = Self::serialize_auth(&session.auth_method)?;
         let max_order: i32 = self
