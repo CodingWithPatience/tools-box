@@ -26,6 +26,8 @@ pub struct SshClientUi {
     status_msg: String,
     /// 左侧会话列表面板宽度
     left_panel_width: f32,
+    /// 上次加载错误消息（用于去重日志）
+    last_load_error: String,
 }
 
 impl SshClientUi {
@@ -41,6 +43,7 @@ impl SshClientUi {
             connection_state: SessionState::Disconnected,
             status_msg: "就绪".to_string(),
             left_panel_width: 180.0,
+            last_load_error: String::new(),
         }
     }
 
@@ -49,6 +52,7 @@ impl SshClientUi {
         match store.list_sessions() {
             Ok(list) => {
                 self.sessions = list;
+                self.last_load_error.clear();
                 // 之前有选中会话则维护选中状态
                 if let Some(idx) = self.selected_index {
                     if idx >= self.sessions.len() {
@@ -61,8 +65,12 @@ impl SshClientUi {
                 }
             }
             Err(e) => {
-                self.status_msg = format!("加载会话列表失败: {}", e);
-                log::error!("加载 SSH 会话列表失败: {}", e);
+                let err_msg = format!("加载会话列表失败: {}", e);
+                self.status_msg = err_msg.clone();
+                if self.last_load_error != err_msg {
+                    log::error!("{}", err_msg);
+                    self.last_load_error = err_msg;
+                }
             }
         }
     }

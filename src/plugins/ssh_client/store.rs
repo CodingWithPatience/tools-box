@@ -43,10 +43,27 @@ impl<'a> SshStore<'a> {
         let mut sessions = Vec::new();
         for row in rows {
             let (id, name, host, port_i64, username, auth_type, auth_data, sort_order, created_at, updated_at) =
-                row.context("读取会话记录失败")?;
-            let port = u16::try_from(port_i64)
-                .with_context(|| format!("端口值 {} 超出有效范围 (0-65535)", port_i64))?;
-            let auth_method = Self::parse_auth(&auth_type, &auth_data)?;
+                match row.context("读取会话记录失败") {
+                    Ok(r) => r,
+                    Err(e) => {
+                        log::warn!("跳过一条损坏的 SSH 会话记录: {}", e);
+                        continue;
+                    }
+                };
+            let port = match u16::try_from(port_i64) {
+                Ok(p) => p,
+                Err(_) => {
+                    log::warn!("SSH 会话 '{}' (id={}) 端口值 {} 无效，跳过", name, id, port_i64);
+                    continue;
+                }
+            };
+            let auth_method = match Self::parse_auth(&auth_type, &auth_data) {
+                Ok(m) => m,
+                Err(e) => {
+                    log::warn!("SSH 会话 '{}' (id={}) {} 解析失败，跳过: {}", name, id, auth_type, e);
+                    continue;
+                }
+            };
             sessions.push(SshSession {
                 id,
                 name,
