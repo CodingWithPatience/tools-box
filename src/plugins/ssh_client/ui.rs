@@ -327,7 +327,7 @@ impl SshClientUi {
     /// 渲染顶部操作工具栏
     fn render_toolbar(&mut self, ui: &mut egui::Ui, store: &SshStore) {
         ui.horizontal(|ui| {
-            if ui.button("+ 新增会话").clicked() {
+            if ui.button("+ 新增连接").clicked() {
                 self.form = SessionForm::new();
                 self.form_error = None;
                 self.editing_id = None;
@@ -359,7 +359,7 @@ impl SshClientUi {
             .max_height(height)
             .show(ui, |ui| {
                 if self.sessions.is_empty() {
-                    ui.weak("暂无保存的连接，点击「+ 新增会话」创建");
+                    ui.weak("暂无保存的连接，点击「+ 新增连接」创建");
                     return;
                 }
 

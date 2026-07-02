@@ -79,7 +79,7 @@ impl<'a> SshStore<'a> {
         Ok(sessions)
     }
 
-    /// 新增会话配置（host+username 唯一）
+    /// 新增连接配置（host+username 唯一）
     pub fn insert_session(&self, session: &NewSession) -> Result<i64> {
         // 检查是否已存在同主机同用户的配置
         let exists: bool = self

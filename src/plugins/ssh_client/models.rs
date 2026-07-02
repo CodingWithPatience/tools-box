@@ -152,7 +152,7 @@ impl SessionForm {
     }
 }
 
-/// 新增会话数据结构
+/// 新增连接数据结构
 #[derive(Debug, Clone)]
 pub struct NewSession {
     pub name: String,
