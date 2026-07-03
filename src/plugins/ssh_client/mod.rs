@@ -1,6 +1,8 @@
+mod client;
 mod crypto;
 pub mod models;
 mod store;
+mod terminal;
 mod ui;
 
 use crate::plugin::Plugin;

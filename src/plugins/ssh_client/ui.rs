@@ -1,33 +1,37 @@
+use std::sync::mpsc;
+
 use egui::{Color32, RichText};
 
+use super::client::SshClient;
 use super::crypto;
-use super::models::{AuthMethod, AuthType, NewSession, SessionForm, SessionState};
+use super::models::{AuthMethod, AuthType, NewSession, SessionForm, SessionState, SshInput, SshOutput};
 use super::store::SshStore;
+use super::terminal::TerminalEmulator;
 
 /// SSH 客户端 UI 状态
 pub struct SshClientUi {
-    /// 会话列表
+    // ===== 会话管理 =====
     sessions: Vec<super::models::SshSession>,
-    /// 当前选中的会话索引
     selected_index: Option<usize>,
-    /// 会话编辑表单
     form: SessionForm,
-    /// 是否显示新增弹窗
     show_new_modal: bool,
-    /// 是否显示编辑弹窗
     show_edit_modal: bool,
-    /// 正在编辑的会话 ID（None 表示新增）
     editing_id: Option<i64>,
-    /// 表单校验错误
     form_error: Option<String>,
-    /// 连接状态
     connection_state: SessionState,
-    /// 状态消息
     status_msg: String,
-    /// 左侧会话列表面板宽度
     left_panel_width: f32,
-    /// 上次加载错误消息（用于去重日志）
     last_load_error: String,
+
+    // ===== 终端相关 =====
+    /// 终端仿真器
+    terminal: Option<TerminalEmulator>,
+    /// 发送消息到 SSH I/O 线程（有界通道）
+    input_tx: Option<mpsc::SyncSender<SshInput>>,
+    /// 从 SSH I/O 线程接收消息
+    output_rx: Option<mpsc::Receiver<SshOutput>>,
+    /// 当前连接的会话索引
+    connected_session_idx: Option<usize>,
 }
 
 impl SshClientUi {
@@ -44,7 +48,16 @@ impl SshClientUi {
             status_msg: "就绪".to_string(),
             left_panel_width: 180.0,
             last_load_error: String::new(),
+            terminal: None,
+            input_tx: None,
+            output_rx: None,
+            connected_session_idx: None,
         }
+    }
+
+    /// 是否正在终端视图中
+    fn is_terminal_view(&self) -> bool {
+        self.terminal.is_some() && self.connected_session_idx.is_some()
     }
 
     /// 刷新会话列表
@@ -53,7 +66,6 @@ impl SshClientUi {
             Ok(list) => {
                 self.sessions = list;
                 self.last_load_error.clear();
-                // 之前有选中会话则维护选中状态
                 if let Some(idx) = self.selected_index {
                     if idx >= self.sessions.len() {
                         self.selected_index = if self.sessions.is_empty() {
@@ -75,17 +87,343 @@ impl SshClientUi {
         }
     }
 
+    /// 断开当前 SSH 连接
+    fn disconnect(&mut self) {
+        if let Some(tx) = &self.input_tx {
+            let _ = tx.send(SshInput::Disconnect);
+        }
+        self.cleanup_connection();
+    }
+
+    /// 清理连接状态
+    fn cleanup_connection(&mut self) {
+        self.terminal = None;
+        self.input_tx = None;
+        self.output_rx = None;
+        self.connected_session_idx = None;
+        self.connection_state = SessionState::Disconnected;
+        self.status_msg = "已断开连接".to_string();
+    }
+
+    // ===================================================================
+    // 主渲染入口
+    // ===================================================================
+
     /// 渲染完整的 SSH 客户端 UI
     pub fn render(&mut self, ui: &mut egui::Ui, store: &SshStore) {
-        // 每次渲染前刷新列表
         if self.sessions.is_empty() {
             self.refresh_sessions(store);
         }
 
+        // 轮询 SSH 输出（在终端视图中每帧处理）
+        self.poll_ssh_output();
+
+        if self.is_terminal_view() {
+            self.render_terminal_view(ui);
+        } else {
+            self.render_management_view(ui, store);
+        }
+    }
+
+    // ===================================================================
+    // SSH 输出轮询
+    // ===================================================================
+
+    /// 每帧非阻塞读取 SSH 输出，喂入终端解析器
+    fn poll_ssh_output(&mut self) {
+        let rx = match &self.output_rx {
+            Some(rx) => rx,
+            None => return,
+        };
+
+        loop {
+            match rx.try_recv() {
+                Ok(SshOutput::TerminalData(data)) => {
+                    if let Some(term) = &mut self.terminal {
+                        term.process(&data);
+                    }
+                }
+                Ok(SshOutput::Connected) => {
+                    self.connection_state = SessionState::Connected;
+                    self.status_msg = "已连接".to_string();
+                    log::info!("SSH 连接就绪");
+                }
+                Ok(SshOutput::Disconnected(reason)) => {
+                    self.status_msg = format!("连接断开: {}", reason);
+                    log::info!("SSH 连接断开: {}", reason);
+                    self.connection_state = SessionState::Error(reason.clone());
+                    self.cleanup_connection();
+                    return;
+                }
+                Ok(SshOutput::Error(err)) => {
+                    self.status_msg = format!("连接错误: {}", err);
+                    self.connection_state = SessionState::Error(err.clone());
+                    log::error!("SSH 错误: {}", err);
+                    self.cleanup_connection();
+                    return;
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.status_msg = "SSH 连接已断开".to_string();
+                    self.cleanup_connection();
+                    return;
+                }
+            }
+        }
+    }
+
+    // ===================================================================
+    // 终端视图
+    // ===================================================================
+
+    fn render_terminal_view(&mut self, ui: &mut egui::Ui) {
+        // 强制每帧重绘，确保光标闪烁和终端内容及时更新
+        ui.ctx().request_repaint();
+
+        // 提前处理键盘输入，防止被其他 widget 消费
+        let tx_clone = self.input_tx.clone();
+        if let Some(tx) = &tx_clone {
+            Self::process_terminal_input(tx, ui.ctx());
+        }
+
+        // 顶部连接信息栏（提前提取数据避免借用冲突）
+        let session_info = self
+            .connected_session_idx
+            .and_then(|idx| self.sessions.get(idx))
+            .map(|s| (s.name.clone(), s.username.clone(), s.host.clone(), s.port));
+
+        ui.horizontal(|ui| {
+            if let Some((ref name, ref username, ref host, port)) = session_info {
+                ui.heading(format!(
+                    "🖥 {} ({}@{}:{})",
+                    name, username, host, port
+                ));
+            }
+            let state_color = match self.connection_state {
+                SessionState::Connected => Color32::from_rgb(50, 200, 50),
+                SessionState::Connecting => Color32::from_rgb(200, 200, 50),
+                _ => Color32::from_rgb(220, 50, 50),
+            };
+            let state_text = match self.connection_state {
+                SessionState::Connected => "🟢 已连接",
+                SessionState::Connecting => "🟡 连接中...",
+                _ => "🔴 异常",
+            };
+            ui.colored_label(state_color, state_text);
+
+            if ui.button("🔌 断开").clicked() {
+                self.disconnect();
+                return;
+            }
+        });
+        ui.separator();
+
+        // 获取终端尺寸信息
+        let font_size = self
+            .terminal
+            .as_ref()
+            .map(|t| t.font_size())
+            .unwrap_or(14.0);
+        let is_dark_mode = ui.visuals().dark_mode;
+
+        // 计算终端渲染区域
+        let header_height = 40.0;
+        let status_height = 28.0;
+        let available_height = ui.available_height() - status_height - header_height;
+
+        // 使用精确的字体度量
+        let mono_font = egui::FontId::monospace(font_size);
+        let char_width = ui.fonts(|f| {
+            let glyph = f.glyph_width(&mono_font, 'M');
+            if glyph > 0.0 { glyph } else { font_size * 0.6 }
+        });
+        let line_height = ui.fonts(|f| f.row_height(&mono_font));
+
+        let new_cols = ((ui.available_width() - 20.0) / char_width)
+            .max(1.0)
+            .min(f32::from(u16::MAX)) as u16;
+        let new_rows = (available_height / line_height)
+            .max(1.0)
+            .min(f32::from(u16::MAX)) as u16;
+
+        // 调整终端大小
+        if let Some(term) = &mut self.terminal {
+            let (cur_cols, cur_rows) = term.size();
+            if new_cols != cur_cols || new_rows != cur_rows {
+                term.resize(new_cols, new_rows);
+                if let Some(tx) = &self.input_tx {
+                    let _ = tx.send(SshInput::Resize(new_cols, new_rows));
+                }
+            }
+        }
+
+        // 渲染终端内容
+        egui::ScrollArea::both()
+            .id_salt("ssh_terminal_scroll")
+            .show(ui, |ui| {
+                // 设置终端背景色
+                let bg_color = if is_dark_mode {
+                    Color32::from_rgb(0x1e, 0x1e, 0x1e)
+                } else {
+                    Color32::from_rgb(0xff, 0xff, 0xff)
+                };
+                ui.painter()
+                    .rect_filled(ui.max_rect(), 0.0, bg_color);
+
+                if let Some(term) = &mut self.terminal {
+                    let job = term.render_to_layout_job(is_dark_mode);
+                    // 设置终端内容最小尺寸，确保填满可用区域
+                    let content_w = f32::from(new_cols) * char_width + 20.0;
+                    let content_h = f32::from(new_rows) * line_height;
+                    ui.set_min_width(content_w);
+                    ui.set_min_height(content_h);
+
+                    // 使用 ui.label 渲染文本
+                    let response = ui.label(job);
+                    // 从 response.rect 获取文本区域的精确位置
+                    let text_rect = response.rect;
+
+                    // 绘制闪烁光标
+                    let (c_col, c_row) = term.cursor_position();
+                    let time = ui.ctx().input(|i| i.time);
+                    let blink_on = (time * 2.0) as u64 % 2 == 0;
+                    if blink_on {
+                        // 使用 text_rect 的左上角作为基准，加上字符偏移
+                        let cursor_x = text_rect.left() + f32::from(c_col) * char_width.round();
+                        let cursor_y = text_rect.top() + f32::from(c_row) * line_height.round();
+                        let cursor_color = if is_dark_mode {
+                            Color32::from_rgb(0xd0, 0xd0, 0xd0)
+                        } else {
+                            Color32::from_rgb(0x30, 0x30, 0x30)
+                        };
+                        ui.painter().rect_filled(
+                            egui::Rect::from_min_size(
+                                egui::pos2(cursor_x, cursor_y),
+                                egui::vec2(char_width, line_height),
+                            ),
+                            0.0,
+                            cursor_color,
+                        );
+                    }
+                } else if self.connection_state == SessionState::Connecting {
+                    ui.centered_and_justified(|ui| {
+                        ui.label("正在连接...");
+                    });
+                }
+            });
+
+        // 底部状态栏
+        let cursor_pos = self
+            .terminal
+            .as_ref()
+            .map(|t| t.cursor_position())
+            .unwrap_or((0, 0));
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label(format!(
+                "列: {} 行: {} | 字号: {:.0} | {}",
+                cursor_pos.0,
+                cursor_pos.1,
+                font_size,
+                self.status_msg
+            ));
+        });
+
+    }
+
+    /// 处理终端键盘输入，将键盘事件转换为 SSH 字节流并发送到 I/O 线程
+    ///
+    /// 本方法在 egui widget 渲染之前调用，确保事件不被其他组件消费。
+    /// 终端视图独占键盘输入，因此消费所有事件后清空队列。
+    /// 完全依赖服务器回显，不进行本地回显，避免双重回显问题。
+    fn process_terminal_input(tx: &mpsc::SyncSender<SshInput>, ctx: &egui::Context) {
+        ctx.input(|i| {
+            for event in &i.events {
+                match event {
+                    egui::Event::Key {
+                        key,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } => {
+                        if *key == egui::Key::C && modifiers.ctrl {
+                            let _ = tx.send(SshInput::KeyInput(vec![0x03]));
+                            continue;
+                        }
+                        if *key == egui::Key::D && modifiers.ctrl {
+                            let _ = tx.send(SshInput::KeyInput(vec![0x04]));
+                            continue;
+                        }
+                        if *key == egui::Key::Z && modifiers.ctrl {
+                            let _ = tx.send(SshInput::KeyInput(vec![0x1a]));
+                            continue;
+                        }
+                        if *key == egui::Key::L && modifiers.ctrl {
+                            let _ = tx.send(SshInput::KeyInput(vec![0x0c]));
+                            continue;
+                        }
+                        if *key == egui::Key::Enter {
+                            let _ = tx.send(SshInput::KeyInput(vec![0x0d]));
+                            continue;
+                        }
+                        if *key == egui::Key::Backspace {
+                            let _ = tx.send(SshInput::KeyInput(vec![0x7f]));
+                            continue;
+                        }
+                        if *key == egui::Key::Tab {
+                            let _ = tx.send(SshInput::KeyInput(vec![0x09]));
+                            continue;
+                        }
+                        if *key == egui::Key::Escape {
+                            let _ = tx.send(SshInput::KeyInput(vec![0x1b]));
+                            continue;
+                        }
+                        // 方向键
+                        if *key == egui::Key::ArrowUp {
+                            let _ = tx.send(SshInput::KeyInput(b"\x1b[A".to_vec()));
+                            continue;
+                        }
+                        if *key == egui::Key::ArrowDown {
+                            let _ = tx.send(SshInput::KeyInput(b"\x1b[B".to_vec()));
+                            continue;
+                        }
+                        if *key == egui::Key::ArrowRight {
+                            let _ = tx.send(SshInput::KeyInput(b"\x1b[C".to_vec()));
+                            continue;
+                        }
+                        if *key == egui::Key::ArrowLeft {
+                            let _ = tx.send(SshInput::KeyInput(b"\x1b[D".to_vec()));
+                            continue;
+                        }
+                    }
+                    egui::Event::Text(text) => {
+                        // 过滤掉控制字符事件
+                        if text.is_empty()
+                            || text == "\r"
+                            || text == "\x08"
+                            || text == "\t"
+                        {
+                            continue;
+                        }
+                        let _ = tx.send(SshInput::KeyInput(text.as_bytes().to_vec()));
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        // 消费键盘事件，防止影响其他 UI 组件
+        ctx.input_mut(|i| i.events.clear());
+    }
+
+    // ===================================================================
+    // 管理视图（原有代码）
+    // ===================================================================
+
+    fn render_management_view(&mut self, ui: &mut egui::Ui, store: &SshStore) {
         ui.heading("🖥 SSH 客户端");
         ui.separator();
 
-        // 操作按钮
         self.render_toolbar(ui, store);
 
         ui.add_space(4.0);
@@ -96,7 +434,6 @@ impl SshClientUi {
         let max_left_width = (available_width * 0.5).min(400.0);
 
         ui.horizontal_top(|ui| {
-            // 左侧面板（固定宽度）
             let left_width = self.left_panel_width.clamp(min_left_width, max_left_width);
             ui.vertical(|ui| {
                 ui.set_min_width(left_width);
@@ -104,7 +441,7 @@ impl SshClientUi {
                 self.render_session_list(ui, store);
             });
 
-            // 可拖拽的分隔线（参考 note_taker 实现）
+            // 可拖拽分隔线
             let separator_rect = ui.available_rect_before_wrap();
             let separator_x = separator_rect.left();
             let separator_response = ui.allocate_rect(
@@ -139,13 +476,12 @@ impl SshClientUi {
 
             ui.add_space(4.0);
 
-            // 右侧详情面板
             ui.vertical(|ui| {
                 self.render_detail_panel(ui, store);
             });
         });
 
-        // 状态栏（底部固定，避免遮盖主内容）
+        // 状态栏
         let stats_height = ui.text_style_height(&egui::TextStyle::Small) + 16.0;
         egui::TopBottomPanel::bottom("ssh_status")
             .exact_height(stats_height)
@@ -154,9 +490,8 @@ impl SshClientUi {
                 self.render_status_bar(ui);
             });
 
-        // 弹窗：新增/编辑连接（参考 api_tester 的 Window 用法）
-        let is_editing = self.editing_id.is_some();
-        let title = if is_editing { "编辑连接" } else { "新增连接" };
+        // 弹窗
+        let title = if self.editing_id.is_some() { "编辑连接" } else { "新增连接" };
 
         if self.show_edit_modal {
             egui::Window::new(title)
@@ -185,32 +520,25 @@ impl SshClientUi {
     fn render_session_form_content(&mut self, ui: &mut egui::Ui, store: &SshStore) {
         let label_width = 80.0;
 
-        // 会话名称
         ui.horizontal(|ui| {
             ui.add_sized([label_width, 20.0], egui::Label::new("名称:"));
             ui.text_edit_singleline(&mut self.form.name);
         });
         ui.add_space(4.0);
 
-        // 主机地址
         ui.horizontal(|ui| {
             ui.add_sized([label_width, 20.0], egui::Label::new("主机:"));
             ui.text_edit_singleline(&mut self.form.host);
         });
         ui.add_space(4.0);
 
-        // 端口
         ui.horizontal(|ui| {
             ui.add_sized([label_width, 20.0], egui::Label::new("端口:"));
-            ui.add_sized(
-                [100.0, 20.0],
-                egui::TextEdit::singleline(&mut self.form.port),
-            );
+            ui.add_sized([100.0, 20.0], egui::TextEdit::singleline(&mut self.form.port));
             ui.weak("默认: 22");
         });
         ui.add_space(4.0);
 
-        // 用户名
         ui.horizontal(|ui| {
             ui.add_sized([label_width, 20.0], egui::Label::new("用户:"));
             ui.text_edit_singleline(&mut self.form.username);
@@ -220,23 +548,13 @@ impl SshClientUi {
         ui.separator();
         ui.add_space(4.0);
 
-        // 认证方式选择
         ui.horizontal(|ui| {
             ui.label("认证方式:");
-            ui.selectable_value(
-                &mut self.form.auth_type,
-                AuthType::Password,
-                AuthType::Password.as_str(),
-            );
-            ui.selectable_value(
-                &mut self.form.auth_type,
-                AuthType::KeyFile,
-                AuthType::KeyFile.as_str(),
-            );
+            ui.selectable_value(&mut self.form.auth_type, AuthType::Password, AuthType::Password.as_str());
+            ui.selectable_value(&mut self.form.auth_type, AuthType::KeyFile, AuthType::KeyFile.as_str());
         });
         ui.add_space(8.0);
 
-        // 根据认证方式显示不同字段
         match self.form.auth_type {
             AuthType::Password => {
                 ui.horizontal(|ui| {
@@ -259,8 +577,7 @@ impl SshClientUi {
                             .set_title("选择 SSH 私钥文件")
                             .pick_file()
                         {
-                            self.form.private_key_path =
-                                path.to_string_lossy().to_string();
+                            self.form.private_key_path = path.to_string_lossy().to_string();
                         }
                     }
                 });
@@ -278,30 +595,20 @@ impl SshClientUi {
 
         ui.add_space(8.0);
 
-        // 校验错误提示
         if let Some(error) = &self.form_error {
-            ui.label(
-                RichText::new(format!("⚠ {}", error))
-                    .color(Color32::from_rgb(220, 50, 50)),
-            );
+            ui.label(RichText::new(format!("⚠ {}", error)).color(Color32::from_rgb(220, 50, 50)));
             ui.add_space(4.0);
         }
 
-        // 提交按钮
         let is_editing = self.editing_id.is_some();
         ui.horizontal(|ui| {
-            let btn_label = if is_editing {
-                "💾 保存修改"
-            } else {
-                "✅ 保存连接"
-            };
+            let btn_label = if is_editing { "💾 保存修改" } else { "✅ 保存连接" };
 
             if ui.button(btn_label).clicked() {
                 if let Err(e) = self.form.validate() {
                     self.form_error = Some(e);
                     return;
                 }
-
                 match self.submit_form(store) {
                     Ok(()) => {
                         self.show_new_modal = false;
@@ -324,7 +631,6 @@ impl SshClientUi {
         });
     }
 
-    /// 渲染顶部操作工具栏
     fn render_toolbar(&mut self, ui: &mut egui::Ui, store: &SshStore) {
         ui.horizontal(|ui| {
             if ui.button("+ 新增连接").clicked() {
@@ -339,16 +645,13 @@ impl SshClientUi {
                 self.status_msg = "列表已刷新".to_string();
             }
 
-            // 快速连接栏
             ui.separator();
             ui.label("快速连接:");
             ui.label("ssh");
-            // 简化的快速连接：只是占位提示，后续阶段实现
             ui.weak("(开发中，请通过会话列表连接)");
         });
     }
 
-    /// 渲染左侧会话列表
     fn render_session_list(&mut self, ui: &mut egui::Ui, _store: &SshStore) {
         ui.strong("连接列表:");
         ui.add_space(4.0);
@@ -373,12 +676,7 @@ impl SshClientUi {
                         SessionState::Error(_) => "🔴",
                         SessionState::Disconnected => "⚪",
                     };
-                    let label = format!(
-                        "{} {} ({})",
-                        icon,
-                        session.name,
-                        format_session_addr(session)
-                    );
+                    let label = format!("{} {} ({})", icon, session.name, format_session_addr(session));
 
                     let response = ui.add_sized(
                         [ui.available_width(), 30.0],
@@ -396,7 +694,6 @@ impl SshClientUi {
             });
     }
 
-    /// 渲染右侧详情面板
     fn render_detail_panel(&mut self, ui: &mut egui::Ui, store: &SshStore) {
         if let Some(idx) = self.selected_index {
             if self.sessions.get(idx).is_some() {
@@ -413,12 +710,10 @@ impl SshClientUi {
         }
     }
 
-    /// 渲染会话详情
     fn render_session_detail(&mut self, ui: &mut egui::Ui, idx: usize, store: &SshStore) {
         let Some(session) = self.sessions.get(idx) else {
             return;
         };
-        // 先提取需要的数据（避免后续借用 self 冲突）
         let session_id = session.id;
         let session_name = session.name.clone();
         let session_host = session.host.clone();
@@ -448,12 +743,58 @@ impl SshClientUi {
 
         ui.add_space(12.0);
 
-        // 操作按钮
         ui.horizontal(|ui| {
             if ui.button("🖥 创建会话").clicked() {
+                // 发起 SSH 连接
+                let s = &self.sessions[idx];
+                let host = s.host.clone();
+                let port = s.port;
+                let username = s.username.clone();
+                let auth = s.auth_method.clone();
+
                 self.status_msg = format!("正在连接 {}...", session_name);
                 self.connection_state = SessionState::Connecting;
-                // 后续阶段实现实际连接
+
+                // 根据字体大小和可用宽度估算初始终端尺寸
+                let mono_font = egui::FontId::monospace(
+                    ui.style().text_styles.get(&egui::TextStyle::Monospace).map(|f| f.size).unwrap_or(14.0),
+                );
+                let est_char_w = ui.fonts(|f| f.glyph_width(&mono_font, 'M'));
+                let est_line_h = ui.fonts(|f| f.row_height(&mono_font));
+                let est_cols = if est_char_w > 0.0 {
+                    ((ui.available_width() * 0.7 / est_char_w).max(80.0).min(f32::from(u16::MAX))) as u16
+                } else {
+                    120
+                };
+                let est_rows = if est_line_h > 0.0 {
+                    ((ui.available_height() * 0.5 / est_line_h).max(24.0).min(f32::from(u16::MAX))) as u16
+                } else {
+                    30
+                };
+
+                match SshClient::connect(&host, port, &username, &auth, est_cols, est_rows) {
+                    Ok((tx, rx)) => {
+                        self.input_tx = Some(tx);
+                        self.output_rx = Some(rx);
+                        self.connected_session_idx = Some(idx);
+                        self.terminal = Some(TerminalEmulator::new(
+                            est_cols,
+                            est_rows,
+                            ui.style()
+                                .text_styles
+                                .get(&egui::TextStyle::Monospace)
+                                .map(|f| f.size)
+                                .unwrap_or(14.0),
+                        ));
+                        log::info!("SSH 连接已发起: {}@{}", username, host);
+                    }
+                    Err(e) => {
+                        self.connection_state =
+                            SessionState::Error(format!("连接失败: {}", e));
+                        self.status_msg = format!("连接失败: {}", e);
+                        log::error!("SSH 连接失败: {}", e);
+                    }
+                }
             }
 
             if ui.button("✏️ 编辑").clicked() {
@@ -483,7 +824,6 @@ impl SshClientUi {
         });
     }
 
-    /// 提交表单（加密密码后保存）
     fn submit_form(&self, store: &SshStore) -> Result<(), String> {
         let port: u16 = self
             .form
@@ -497,19 +837,14 @@ impl SshClientUi {
                 let (encrypted_password, iv, salt) =
                     crypto::encrypt_password(&self.form.password)
                         .map_err(|e| format!("密码加密失败: {}", e))?;
-                AuthMethod::Password {
-                    encrypted_password,
-                    iv,
-                    salt,
-                }
+                AuthMethod::Password { encrypted_password, iv, salt }
             }
             AuthType::KeyFile => {
                 let encrypted_passphrase = if self.form.passphrase.is_empty() {
                     None
                 } else {
-                    let (ct, iv, salt) =
-                        crypto::encrypt_password(&self.form.passphrase)
-                            .map_err(|e| format!("密码短语加密失败: {}", e))?;
+                    let (ct, iv, salt) = crypto::encrypt_password(&self.form.passphrase)
+                        .map_err(|e| format!("密码短语加密失败: {}", e))?;
                     Some((ct, iv, salt))
                 };
                 AuthMethod::KeyFile {
@@ -528,21 +863,16 @@ impl SshClientUi {
         };
 
         if let Some(id) = self.editing_id {
-            store
-                .update_session(id, &new_session)
-                .map_err(|e| format!("更新连接失败: {}", e))?;
+            store.update_session(id, &new_session).map_err(|e| format!("更新连接失败: {}", e))?;
             log::info!("SSH 连接 '{}' 已更新", new_session.name);
         } else {
-            store
-                .insert_session(&new_session)
-                .map_err(|e| format!("保存连接失败: {}", e))?;
+            store.insert_session(&new_session).map_err(|e| format!("保存连接失败: {}", e))?;
             log::info!("SSH 连接 '{}' 已创建", new_session.name);
         }
 
         Ok(())
     }
 
-    /// 渲染底部状态栏
     fn render_status_bar(&self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             let state_color = match &self.connection_state {
@@ -564,7 +894,6 @@ impl SshClientUi {
     }
 }
 
-/// 格式化会话地址显示
 fn format_session_addr(session: &super::models::SshSession) -> String {
     if session.port == 22 {
         format!("{}@{}", session.username, session.host)

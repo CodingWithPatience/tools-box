@@ -25,7 +25,31 @@ impl AuthMethod {
     }
 }
 
-/// SSH 会话配置（数据库模型）
+/// 线程间通信：SSH I/O 线程 → 主线程的消息
+#[derive(Debug)]
+pub enum SshOutput {
+    /// 终端输出数据（ANSI 字节流）
+    TerminalData(Vec<u8>),
+    /// 连接已建立
+    Connected,
+    /// 连接断开（携带原因）
+    Disconnected(String),
+    /// 发生错误
+    Error(String),
+}
+
+/// 线程间通信：主线程 → SSH I/O 线程的消息
+#[derive(Debug)]
+pub enum SshInput {
+    /// 用户键盘输入
+    KeyInput(Vec<u8>),
+    /// 终端窗口大小变更 (cols, rows)
+    Resize(u16, u16),
+    /// 断开连接
+    Disconnect,
+}
+
+/// SSH 连接配置（数据库模型）
 #[derive(Debug, Clone)]
 pub struct SshSession {
     pub id: i64,
