@@ -1,12 +1,26 @@
+use std::path::Path;
 use std::sync::mpsc;
 
 use egui::{Color32, RichText};
 
 use super::client::SshClient;
 use super::crypto;
-use super::models::{AuthMethod, AuthType, NewSession, SessionForm, SessionState, SshInput, SshOutput};
+use super::models::{
+    AuthMethod, AuthType, FileEntry, NewSession, SessionForm, SessionState, SftpRequest,
+    SftpResponse, SshInput, SshOutput, TransferTask,
+};
+use super::sftp::{self, SftpClient};
 use super::store::SshStore;
 use super::terminal::TerminalEmulator;
+
+/// 会话视图中的 Tab 页
+#[derive(Debug, Clone, PartialEq)]
+enum SessionViewTab {
+    /// 交互终端
+    Terminal,
+    /// SFTP 文件传输
+    Sftp,
+}
 
 /// SSH 客户端 UI 状态
 pub struct SshClientUi {
@@ -24,20 +38,46 @@ pub struct SshClientUi {
     last_load_error: String,
 
     // ===== 终端相关 =====
-    /// 终端仿真器
     terminal: Option<TerminalEmulator>,
-    /// 发送消息到 SSH I/O 线程（有界通道）
     input_tx: Option<mpsc::SyncSender<SshInput>>,
-    /// 从 SSH I/O 线程接收消息
     output_rx: Option<mpsc::Receiver<SshOutput>>,
-    /// 当前连接的会话索引
     connected_session_idx: Option<usize>,
-    /// IME（输入法）是否激活，用于避免 Event::Text 和 Event::Ime::Commit 重复触发
     ime_active: bool,
+
+    // ===== SFTP 相关 =====
+    /// 当前活动的 Tab 页
+    active_tab: SessionViewTab,
+    /// SFTP 请求发送端
+    sftp_tx: Option<mpsc::SyncSender<SftpRequest>>,
+    /// SFTP 响应接收端
+    sftp_rx: Option<mpsc::Receiver<SftpResponse>>,
+    /// 本地当前目录
+    local_current_dir: String,
+    /// 本地目录文件列表
+    local_files: Vec<FileEntry>,
+    /// 远程当前目录
+    remote_current_dir: String,
+    /// 远程目录文件列表
+    remote_files: Vec<FileEntry>,
+    /// 本地选中的文件索引
+    local_selected: Option<usize>,
+    /// 远程选中的文件索引
+    remote_selected: Option<usize>,
+    /// 当前传输任务列表
+    transfer_tasks: Vec<TransferTask>,
+    /// SFTP 连接状态
+    sftp_connected: bool,
+    /// SFTP 操作状态消息
+    sftp_status_msg: String,
+    /// 远程目录输入框
+    remote_dir_input: String,
+    /// 本地目录输入框
+    local_dir_input: String,
 }
 
 impl SshClientUi {
     pub fn new() -> Self {
+        let home = sftp::home_dir();
         Self {
             sessions: Vec::new(),
             selected_index: None,
@@ -48,19 +88,34 @@ impl SshClientUi {
             form_error: None,
             connection_state: SessionState::Disconnected,
             status_msg: "就绪".to_string(),
-            left_panel_width: 180.0,
+            left_panel_width: 250.0,
             last_load_error: String::new(),
             terminal: None,
             input_tx: None,
             output_rx: None,
             connected_session_idx: None,
             ime_active: false,
+            active_tab: SessionViewTab::Terminal,
+            sftp_tx: None,
+            sftp_rx: None,
+            local_current_dir: home.clone(),
+            local_files: Vec::new(),
+            remote_current_dir: String::new(),
+            remote_files: Vec::new(),
+            local_selected: None,
+            remote_selected: None,
+            transfer_tasks: Vec::new(),
+            sftp_connected: false,
+            sftp_status_msg: String::new(),
+            remote_dir_input: String::new(),
+            local_dir_input: home,
         }
     }
 
-    /// 是否正在终端视图中
+    /// 是否在会话视图中（终端或 SFTP 任一连接即显示会话视图）
     fn is_terminal_view(&self) -> bool {
-        self.terminal.is_some() && self.connected_session_idx.is_some()
+        self.connected_session_idx.is_some()
+            && (self.terminal.is_some() || self.sftp_connected || self.sftp_tx.is_some())
     }
 
     /// 刷新会话列表
@@ -90,12 +145,42 @@ impl SshClientUi {
         }
     }
 
-    /// 断开当前 SSH 连接
+    /// 断开当前 SSH 连接（同时断开终端和 SFTP）
     fn disconnect(&mut self) {
+        // 断开 SFTP
+        if let Some(tx) = &self.sftp_tx {
+            let _ = tx.send(SftpRequest::Disconnect);
+        }
+        self.sftp_tx = None;
+        self.sftp_rx = None;
+        self.sftp_connected = false;
+        self.remote_files.clear();
+        self.remote_current_dir.clear();
+        self.transfer_tasks.clear();
+
+        // 断开终端
         if let Some(tx) = &self.input_tx {
             let _ = tx.send(SshInput::Disconnect);
         }
         self.cleanup_connection();
+    }
+
+    /// 仅断开终端连接，保持 SFTP 不变
+    fn disconnect_terminal_only(&mut self) {
+        if let Some(tx) = &self.input_tx {
+            let _ = tx.send(SshInput::Disconnect);
+        }
+        self.terminal = None;
+        self.input_tx = None;
+        self.output_rx = None;
+        self.connection_state = SessionState::Disconnected;
+        self.status_msg = "终端已断开".to_string();
+        // 如果 SFTP 仍连接，切换到 SFTP tab；否则清除会话索引
+        if self.sftp_connected || self.sftp_tx.is_some() {
+            self.active_tab = SessionViewTab::Sftp;
+        } else {
+            self.connected_session_idx = None;
+        }
     }
 
     /// 清理连接状态
@@ -106,23 +191,94 @@ impl SshClientUi {
         self.connected_session_idx = None;
         self.connection_state = SessionState::Disconnected;
         self.status_msg = "已断开连接".to_string();
+        self.active_tab = SessionViewTab::Terminal;
+    }
+
+    /// 刷新本地文件列表
+    fn refresh_local_files(&mut self) {
+        match sftp::list_local_dir(&self.local_current_dir) {
+            Ok(files) => {
+                self.local_files = files;
+                self.local_selected = None;
+                self.local_dir_input = self.local_current_dir.clone();
+            }
+            Err(e) => {
+                self.sftp_status_msg = format!("无法读取本地目录: {}", e);
+                log::warn!("读取本地目录失败: {}", e);
+            }
+        }
+    }
+
+    /// 请求刷新远程文件列表
+    fn refresh_remote_files(&mut self) {
+        if let Some(tx) = &self.sftp_tx {
+            let _ = tx.send(SftpRequest::ListDirectory(self.remote_current_dir.clone()));
+        }
+    }
+
+    /// 初始化 SFTP 连接
+    fn init_sftp_connection(&mut self) {
+        if self.sftp_tx.is_some() {
+            return; // 已连接
+        }
+        let Some(idx) = self.connected_session_idx else {
+            return;
+        };
+        let Some(session) = self.sessions.get(idx) else {
+            return;
+        };
+
+        let host = session.host.clone();
+        let port = session.port;
+        let username = session.username.clone();
+        let auth = session.auth_method.clone();
+
+        match SftpClient::connect(&host, port, &username, &auth) {
+            Ok((tx, rx)) => {
+                self.sftp_tx = Some(tx);
+                self.sftp_rx = Some(rx);
+                log::info!("SFTP 连接已发起");
+            }
+            Err(e) => {
+                self.sftp_status_msg = format!("SFTP 连接失败: {}", e);
+                log::error!("SFTP 连接失败: {}", e);
+            }
+        }
     }
 
     // ===================================================================
     // 主渲染入口
     // ===================================================================
 
-    /// 渲染完整的 SSH 客户端 UI
     pub fn render(&mut self, ui: &mut egui::Ui, store: &SshStore) {
         if self.sessions.is_empty() {
             self.refresh_sessions(store);
         }
 
-        // 轮询 SSH 输出（在终端视图中每帧处理）
         self.poll_ssh_output();
+        self.poll_sftp_output();
 
         if self.is_terminal_view() {
-            self.render_terminal_view(ui);
+            // 在渲染前处理终端键盘输入，避免与 disconnect 按钮的借用冲突
+            if self.active_tab == SessionViewTab::Terminal {
+                if let Some(tx) = self.input_tx.clone() {
+                    self.process_terminal_input(&tx, ui.ctx());
+                }
+                // 处理 Ctrl+滚轮调整终端字体大小
+                let (ctrl_held, scroll_y) = ui.ctx().input(|i| {
+                    (i.modifiers.ctrl, i.raw_scroll_delta.y)
+                });
+                // 使用 signum 确保各平台步进一致，避免触控板/滚轮差异
+                if ctrl_held && scroll_y != 0.0 {
+                    if let Some(term) = &mut self.terminal {
+                        let delta = scroll_y.signum();
+                        let current_size = term.font_size();
+                        let new_size = (current_size + delta).clamp(8.0, 36.0);
+                        term.set_font_size(new_size);
+                    }
+                }
+            }
+            self.render_session_view(ui);
         } else {
             self.render_management_view(ui, store);
         }
@@ -132,7 +288,6 @@ impl SshClientUi {
     // SSH 输出轮询
     // ===================================================================
 
-    /// 每帧非阻塞读取 SSH 输出，喂入终端解析器
     fn poll_ssh_output(&mut self) {
         let rx = match &self.output_rx {
             Some(rx) => rx,
@@ -176,20 +331,82 @@ impl SshClientUi {
     }
 
     // ===================================================================
-    // 终端视图
+    // SFTP 输出轮询
     // ===================================================================
 
-    fn render_terminal_view(&mut self, ui: &mut egui::Ui) {
-        // 强制每帧重绘，确保光标闪烁和终端内容及时更新
-        ui.ctx().request_repaint();
-
-        // 提前处理键盘输入，防止被其他 widget 消费
-        let tx_clone = self.input_tx.clone();
-        if let Some(tx) = &tx_clone {
-            self.process_terminal_input(tx, ui.ctx());
+    fn poll_sftp_output(&mut self) {
+        // 先收集所有待处理的消息，再逐个处理，避免借用冲突
+        let mut messages = Vec::new();
+        if let Some(rx) = &self.sftp_rx {
+            loop {
+                match rx.try_recv() {
+                    Ok(msg) => messages.push(msg),
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        self.sftp_connected = false;
+                        self.sftp_tx = None;
+                        self.sftp_rx = None;
+                        self.sftp_status_msg = "SFTP 通道已关闭".to_string();
+                        return;
+                    }
+                }
+            }
         }
 
-        // 顶部连接信息栏（提前提取数据避免借用冲突）
+        for msg in messages {
+            match msg {
+                SftpResponse::DirectoryList(path, entries) => {
+                    self.remote_current_dir = path.clone();
+                    self.remote_dir_input = path;
+                    self.remote_files = entries;
+                    self.remote_selected = None;
+                }
+                SftpResponse::TransferProgress(task) => {
+                    let existing = self.transfer_tasks.iter_mut().find(|t| {
+                        t.source == task.source && t.destination == task.destination
+                    });
+                    if let Some(existing) = existing {
+                        *existing = task;
+                    } else {
+                        self.transfer_tasks.push(task);
+                    }
+                }
+                SftpResponse::OperationDone(msg) => {
+                    self.sftp_status_msg = msg;
+                }
+                SftpResponse::Error(err) => {
+                    self.sftp_status_msg = err;
+                    log::warn!("SFTP 错误: {}", self.sftp_status_msg);
+                }
+                SftpResponse::Connected => {
+                    self.sftp_connected = true;
+                    self.sftp_status_msg = "SFTP 已连接".to_string();
+                    log::info!("SFTP 连接就绪");
+                    // 请求列出远程家目录
+                    if let Some(tx) = &self.sftp_tx {
+                        let _ = tx.send(SftpRequest::ListDirectory(".".to_string()));
+                    }
+                }
+                SftpResponse::Disconnected => {
+                    self.sftp_connected = false;
+                    self.sftp_tx = None;
+                    self.sftp_rx = None;
+                    self.remote_files.clear();
+                    self.sftp_status_msg = "SFTP 已断开".to_string();
+                    log::info!("SFTP 连接已断开");
+                }
+            }
+        }
+    }
+
+    // ===================================================================
+    // 会话视图（终端 + SFTP）
+    // ===================================================================
+
+    fn render_session_view(&mut self, ui: &mut egui::Ui) {
+        ui.ctx().request_repaint();
+
+        // 顶部连接信息栏 + Tab 切换
         let session_info = self
             .connected_session_idx
             .and_then(|idx| self.sessions.get(idx))
@@ -197,31 +414,99 @@ impl SshClientUi {
 
         ui.horizontal(|ui| {
             if let Some((ref name, ref username, ref host, port)) = session_info {
-                ui.heading(format!(
-                    "🖥 {} ({}@{}:{})",
-                    name, username, host, port
-                ));
+                ui.heading(format!("🖥 {} ({}@{}:{})", name, username, host, port));
             }
-            let state_color = match self.connection_state {
+
+            // 终端连接状态
+            let term_color = match self.connection_state {
                 SessionState::Connected => Color32::from_rgb(50, 200, 50),
                 SessionState::Connecting => Color32::from_rgb(200, 200, 50),
                 _ => Color32::from_rgb(220, 50, 50),
             };
-            let state_text = match self.connection_state {
-                SessionState::Connected => "🟢 已连接",
-                SessionState::Connecting => "🟡 连接中...",
-                _ => "🔴 异常",
+            let term_text = match self.connection_state {
+                SessionState::Connected => "🟢 终端",
+                SessionState::Connecting => "🟡 终端...",
+                _ => "🔴 终端",
             };
-            ui.colored_label(state_color, state_text);
+            ui.colored_label(term_color, term_text);
 
-            if ui.button("🔌 断开").clicked() {
-                self.disconnect();
-                return;
+            // SFTP 连接状态
+            if self.sftp_connected {
+                ui.colored_label(Color32::from_rgb(50, 200, 50), "🟢 SFTP");
+            } else if self.sftp_tx.is_some() {
+                ui.colored_label(Color32::from_rgb(200, 200, 50), "🟡 SFTP...");
+            }
+
+            // 断开终端（仅断开终端，不影响 SFTP）
+            if ui.button("🔌 断开终端").clicked() {
+                self.disconnect_terminal_only();
+            }
+
+            // 断开 SFTP（仅在 SFTP 已连接时显示）
+            if self.sftp_connected || self.sftp_tx.is_some() {
+                if ui.button("📁 断开SFTP").clicked() {
+                    if let Some(tx) = &self.sftp_tx {
+                        let _ = tx.send(SftpRequest::Disconnect);
+                    }
+                    self.sftp_tx = None;
+                    self.sftp_rx = None;
+                    self.sftp_connected = false;
+                    self.remote_files.clear();
+                    self.sftp_status_msg = "SFTP 已断开".to_string();
+                }
+            }
+        });
+
+        // 终端已断开但 SFTP 仍连接时，自动切换到 SFTP tab
+        if self.terminal.is_none()
+            && self.active_tab == SessionViewTab::Terminal
+            && (self.sftp_connected || self.sftp_tx.is_some())
+        {
+            self.active_tab = SessionViewTab::Sftp;
+        }
+
+        // Tab 栏
+        ui.horizontal(|ui| {
+            if self.terminal.is_some() {
+                ui.selectable_value(
+                    &mut self.active_tab,
+                    SessionViewTab::Terminal,
+                    "🖥 终端",
+                );
+            } else {
+                ui.add_enabled(false, egui::Label::new("🖥 终端(已断开)"));
+            }
+            if ui
+                .selectable_value(&mut self.active_tab, SessionViewTab::Sftp, "📁 SFTP")
+                .clicked()
+            {
+                self.init_sftp_connection();
+                if self.local_files.is_empty() {
+                    self.refresh_local_files();
+                }
             }
         });
         ui.separator();
 
-        // 获取终端尺寸信息
+        // 根据当前 Tab 渲染内容
+        match self.active_tab {
+            SessionViewTab::Terminal => self.render_terminal_content(ui),
+            SessionViewTab::Sftp => self.render_sftp_panel(ui),
+        }
+    }
+
+    // ===================================================================
+    // 终端内容渲染
+    // ===================================================================
+
+    fn render_terminal_content(&mut self, ui: &mut egui::Ui) {
+        if self.terminal.is_none() {
+            ui.centered_and_justified(|ui| {
+                ui.label("终端未连接");
+            });
+            return;
+        }
+
         let font_size = self
             .terminal
             .as_ref()
@@ -229,12 +514,10 @@ impl SshClientUi {
             .unwrap_or(14.0);
         let is_dark_mode = ui.visuals().dark_mode;
 
-        // 计算终端渲染区域
         let header_height = 40.0;
         let status_height = 28.0;
         let available_height = ui.available_height() - status_height - header_height;
 
-        // 使用精确的字体度量
         let mono_font = egui::FontId::monospace(font_size);
         let char_width = ui.fonts(|f| {
             let glyph = f.glyph_width(&mono_font, 'M');
@@ -264,26 +547,21 @@ impl SshClientUi {
         egui::ScrollArea::both()
             .id_salt("ssh_terminal_scroll")
             .show(ui, |ui| {
-                // 设置终端背景色
                 let bg_color = if is_dark_mode {
                     Color32::from_rgb(0x1e, 0x1e, 0x1e)
                 } else {
                     Color32::from_rgb(0xff, 0xff, 0xff)
                 };
-                ui.painter()
-                    .rect_filled(ui.max_rect(), 0.0, bg_color);
+                ui.painter().rect_filled(ui.max_rect(), 0.0, bg_color);
 
                 if let Some(term) = &mut self.terminal {
                     let job = term.render_to_layout_job(is_dark_mode);
-                    // 设置终端内容最小尺寸，确保填满可用区域
                     let content_w = f32::from(new_cols) * char_width + 20.0;
                     let content_h = f32::from(new_rows) * line_height;
                     ui.set_min_width(content_w);
                     ui.set_min_height(content_h);
 
-                    // 使用 ui.label 渲染文本
                     let response = ui.label(job);
-                    // 从 response.rect 获取文本区域的精确位置
                     let text_rect = response.rect;
 
                     // 绘制闪烁光标
@@ -291,7 +569,6 @@ impl SshClientUi {
                     let cursor_w = term.cursor_char_width();
                     let time = ui.ctx().input(|i| i.time);
                     let blink_on = (time * 2.0) as u64 % 2 == 0;
-                    // 计算光标位置（用于绘制和 IME 定位）
                     let cursor_x = text_rect.left() + f32::from(c_col) * char_width.round();
                     let cursor_y = text_rect.top() + f32::from(c_row) * line_height.round();
                     let cursor_width = char_width * f32::from(cursor_w);
@@ -311,7 +588,7 @@ impl SshClientUi {
                         );
                     }
 
-                    // 设置 IME 输出位置，使输入法候选窗口跟随光标
+                    // 设置 IME 输出位置
                     let cursor_rect = egui::Rect::from_min_size(
                         egui::pos2(cursor_x, cursor_y),
                         egui::vec2(cursor_width, line_height),
@@ -343,22 +620,306 @@ impl SshClientUi {
         ui.horizontal(|ui| {
             ui.label(format!(
                 "列: {} 行: {} | 字号: {:.0} | {}",
-                cursor_pos.0,
-                cursor_pos.1,
-                font_size,
-                self.status_msg
+                cursor_pos.0, cursor_pos.1, font_size, self.status_msg
             ));
         });
-
     }
 
-    /// 处理终端键盘输入，将键盘事件转换为 SSH 字节流并发送到 I/O 线程
-    ///
-    /// 本方法在 egui widget 渲染之前调用，确保事件不被其他组件消费。
-    /// 终端视图独占键盘输入，因此消费所有事件后清空队列。
-    /// 完全依赖服务器回显，不进行本地回显，避免双重回显问题。
+    // ===================================================================
+    // SFTP 面板渲染
+    // ===================================================================
+
+    fn render_sftp_panel(&mut self, ui: &mut egui::Ui) {
+        if !self.sftp_connected {
+            if self.sftp_tx.is_some() {
+                ui.centered_and_justified(|ui| {
+                    ui.label("正在连接 SFTP...");
+                });
+            } else {
+                ui.centered_and_justified(|ui| {
+                    ui.label("SFTP 未连接");
+                    if ui.button("连接 SFTP").clicked() {
+                        self.init_sftp_connection();
+                    }
+                });
+            }
+            return;
+        }
+
+        // 清理已完成的传输任务
+        self.transfer_tasks.retain(|t| !t.done);
+
+        let total_h = ui.available_height();
+
+        // 上下分区：上方文件面板区占 3/4，下方传输进度区占 1/4（上限 120px）
+        let transfer_h = (total_h * 0.25).min(120.0);
+        let file_area_h = total_h - transfer_h;
+
+        // ---- 上方：文件面板区域 ----
+        let total_w = ui.available_width();
+
+        // 按钮列宽
+        let btn_col_w = 70.0_f32;
+        // 每侧面板宽度 = (总宽 - 按钮列宽) / 2
+        let side_w = (total_w - btn_col_w) / 2.0;
+
+        // 文件面板区的净高度（去掉分隔线等）
+        let panel_inner_h = file_area_h - 4.0;
+
+        ui.horizontal(|ui| {
+            // 减小元素间距，使按钮列与两侧面板紧凑排列
+            ui.spacing_mut().item_spacing.x = 2.0;
+
+            // ===== 左侧：本地文件面板 =====
+            ui.vertical(|ui| {
+                ui.set_min_width(side_w);
+                ui.set_max_width(side_w);
+                ui.set_min_height(panel_inner_h);
+
+                ui.strong("📁 本地文件");
+                ui.add_space(2.0);
+
+                // 路径导航栏
+                ui.horizontal(|ui| {
+                    let resp = ui.text_edit_singleline(&mut self.local_dir_input);
+                    if resp.lost_focus()
+                        && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                    {
+                        let p = self.local_dir_input.trim().to_string();
+                        if Path::new(&p).is_dir() {
+                            self.local_current_dir = p;
+                            self.refresh_local_files();
+                        }
+                    }
+                    if ui.button("📂").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .set_title("选择本地目录")
+                            .set_directory(&self.local_current_dir)
+                            .pick_folder()
+                        {
+                            self.local_current_dir =
+                                path.to_string_lossy().to_string();
+                            self.refresh_local_files();
+                        }
+                    }
+                    if ui.button("⬆").clicked() {
+                        if let Some(parent) =
+                            Path::new(&self.local_current_dir).parent()
+                        {
+                            self.local_current_dir =
+                                parent.to_string_lossy().to_string();
+                            self.refresh_local_files();
+                        }
+                    }
+                    if ui.button("🏠").clicked() {
+                        self.local_current_dir = sftp::home_dir();
+                        self.refresh_local_files();
+                    }
+                });
+
+                // 表头
+                render_file_header(ui);
+
+                // 文件列表为空时加载
+                if self.local_files.is_empty() {
+                    self.refresh_local_files();
+                }
+
+                // 列表高度 = 面板高度 - 标题/路径栏/表头约 70px
+                let list_h = (panel_inner_h - 70.0).max(60.0);
+
+                egui::ScrollArea::vertical()
+                    .max_height(list_h)
+                    .id_salt("local_files_scroll")
+                    .show(ui, |ui| {
+                        let action = render_file_rows(
+                            ui,
+                            &self.local_files,
+                            self.local_selected,
+                        );
+                        if let Some(idx) = action.select {
+                            self.local_selected = Some(idx);
+                        }
+                        if let Some(idx) = action.open {
+                            self.local_current_dir =
+                                self.local_files[idx].path.clone();
+                            self.refresh_local_files();
+                        }
+                    });
+            });
+
+            // ===== 中间：上传/下载按钮列（左对齐消除右侧间隙） =====
+            ui.with_layout(
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                ui.set_min_width(btn_col_w);
+                ui.set_max_width(btn_col_w);
+                ui.set_min_height(panel_inner_h);
+                // 垂直留白使按钮居中
+                let btn_area_h = panel_inner_h - 70.0;
+                ui.add_space(btn_area_h / 2.0 - 30.0);
+
+                let can_upload = matches!(
+                    self.local_selected
+                        .and_then(|i| self.local_files.get(i)),
+                    Some(f) if !f.is_dir
+                );
+                if ui
+                    .add_enabled(can_upload, egui::Button::new("上传 →"))
+                    .clicked()
+                {
+                    if let Some(idx) = self.local_selected {
+                        if let Some(entry) = self.local_files.get(idx) {
+                            let local_path = entry.path.clone();
+                            let remote_path = format!(
+                                "{}/{}",
+                                self.remote_current_dir
+                                    .trim_end_matches('/'),
+                                entry.name
+                            );
+                            if let Some(tx) = &self.sftp_tx {
+                                let _ = tx.send(SftpRequest::Upload(
+                                    local_path,
+                                    remote_path,
+                                ));
+                            }
+                        }
+                    }
+                }
+
+                ui.add_space(12.0);
+
+                let can_download = matches!(
+                    self.remote_selected
+                        .and_then(|i| self.remote_files.get(i)),
+                    Some(f) if !f.is_dir
+                );
+                if ui
+                    .add_enabled(can_download, egui::Button::new("← 下载"))
+                    .clicked()
+                {
+                    if let Some(idx) = self.remote_selected {
+                        if let Some(entry) = self.remote_files.get(idx) {
+                            let remote_path = entry.path.clone();
+                            let local_path = format!(
+                                "{}/{}",
+                                self.local_current_dir
+                                    .trim_end_matches('/'),
+                                entry.name
+                            );
+                            if let Some(tx) = &self.sftp_tx {
+                                let _ = tx.send(SftpRequest::Download(
+                                    remote_path,
+                                    local_path,
+                                ));
+                            }
+                        }
+                    }
+                }
+            });
+
+            // ===== 右侧：远程文件面板 =====
+            ui.vertical(|ui| {
+                ui.set_min_width(side_w);
+                ui.set_max_width(side_w);
+                ui.set_min_height(panel_inner_h);
+
+                ui.strong("📁 远程文件");
+                ui.add_space(2.0);
+
+                // 路径导航栏
+                ui.horizontal(|ui| {
+                    let resp = ui.text_edit_singleline(&mut self.remote_dir_input);
+                    if resp.lost_focus()
+                        && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                    {
+                        self.remote_current_dir =
+                            self.remote_dir_input.trim().to_string();
+                        self.refresh_remote_files();
+                    }
+                    if ui.button("⬆").clicked() {
+                        if let Some(parent) =
+                            Path::new(&self.remote_current_dir).parent()
+                        {
+                            self.remote_current_dir =
+                                parent.to_string_lossy().to_string();
+                            self.refresh_remote_files();
+                        }
+                    }
+                    if ui.button("🔄").clicked() {
+                        self.refresh_remote_files();
+                    }
+                });
+
+                // 表头
+                render_file_header(ui);
+
+                // 列表高度 = 面板高度 - 标题/路径栏/表头约 70px
+                let list_h = (panel_inner_h - 70.0).max(60.0);
+
+                egui::ScrollArea::vertical()
+                    .max_height(list_h)
+                    .id_salt("remote_files_scroll")
+                    .show(ui, |ui| {
+                        let action = render_file_rows(
+                            ui,
+                            &self.remote_files,
+                            self.remote_selected,
+                        );
+                        if let Some(idx) = action.select {
+                            self.remote_selected = Some(idx);
+                        }
+                        if let Some(idx) = action.open {
+                            self.remote_current_dir =
+                                self.remote_files[idx].path.clone();
+                            self.refresh_remote_files();
+                        }
+                    });
+            });
+        });
+
+        // ---- 下方：传输进度区（始终显示） ----
+        ui.separator();
+        ui.strong("传输进度:");
+        if self.transfer_tasks.is_empty() {
+            ui.weak("暂无传输任务");
+        } else {
+            egui::ScrollArea::vertical()
+                .max_height(transfer_h - 40.0)
+                .id_salt("transfer_progress_scroll")
+                .show(ui, |ui| {
+                    for task in &self.transfer_tasks {
+                        ui.horizontal(|ui| {
+                            let icon = match task.direction {
+                                super::models::TransferDirection::Upload => {
+                                    "⬆"
+                                }
+                                super::models::TransferDirection::Download => {
+                                    "⬇"
+                                }
+                            };
+                            ui.label(format!("{} {}", icon, task.filename));
+                            let bar = egui::ProgressBar::new(task.progress())
+                                .show_percentage();
+                            ui.add_sized([160.0, 16.0], bar);
+                            ui.label(task.progress_text());
+                        });
+                    }
+                });
+        }
+
+        // 底部状态栏
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label(&self.sftp_status_msg);
+        });
+    }
+
+    // ===================================================================
+    // 终端键盘输入处理
+    // ===================================================================
+
     fn process_terminal_input(&mut self, tx: &mpsc::SyncSender<SshInput>, ctx: &egui::Context) {
-        // 使用 input_mut 读取并消费事件，防止事件传播到其他 UI 组件
         ctx.input_mut(|i| {
             for event in i.events.clone() {
                 match event {
@@ -368,8 +929,6 @@ impl SshClientUi {
                         modifiers,
                         ..
                     } => {
-                        // IME 激活时跳过大部分键盘事件，将控制权交给 IME 系统
-                        // 仅保留 Ctrl 组合快捷键（如 Ctrl+C）以便用户中断命令
                         if self.ime_active && !modifiers.ctrl {
                             continue;
                         }
@@ -413,7 +972,6 @@ impl SshClientUi {
                             i.consume_key(modifiers, key);
                             continue;
                         }
-                        // 方向键
                         if key == egui::Key::ArrowUp {
                             let _ = tx.send(SshInput::KeyInput(b"\x1b[A".to_vec()));
                             i.consume_key(modifiers, key);
@@ -436,21 +994,14 @@ impl SshClientUi {
                         }
                     }
                     egui::Event::Text(text) => {
-                        // IME 激活时跳过，由 ImeEvent::Commit 处理，避免重复输入
                         if self.ime_active {
                             continue;
                         }
-                        // 过滤掉控制字符事件
-                        if text.is_empty()
-                            || text == "\r"
-                            || text == "\x08"
-                            || text == "\t"
-                        {
+                        if text.is_empty() || text == "\r" || text == "\x08" || text == "\t" {
                             continue;
                         }
                         let _ = tx.send(SshInput::KeyInput(text.as_bytes().to_vec()));
                     }
-                    // 处理 IME（输入法）事件，支持中文等非 ASCII 字符输入
                     egui::Event::Ime(ime_event) => {
                         match ime_event {
                             egui::ImeEvent::Enabled => {
@@ -460,23 +1011,19 @@ impl SshClientUi {
                                 self.ime_active = false;
                             }
                             egui::ImeEvent::Commit(text) => {
-                                // IME 组合完成，提交最终文本
                                 if !text.is_empty() {
                                     let _ = tx.send(SshInput::KeyInput(text.as_bytes().to_vec()));
                                 }
                             }
-                            // Preedit 事件（组合中）不需要处理，等待 Commit
                             egui::ImeEvent::Preedit(_) => {}
                         }
                     }
                     _ => {}
                 }
             }
-            // 清空所有事件，防止传播到其他 UI 组件
             i.events.clear();
         });
 
-        // 设置焦点锁定过滤器，阻止 Tab/Enter 等按键传播到其他组件
         let terminal_id = egui::Id::new("ssh_terminal_input");
         ctx.memory_mut(|mem| {
             mem.request_focus(terminal_id);
@@ -493,7 +1040,7 @@ impl SshClientUi {
     }
 
     // ===================================================================
-    // 管理视图（原有代码）
+    // 管理视图
     // ===================================================================
 
     fn render_management_view(&mut self, ui: &mut egui::Ui, store: &SshStore) {
@@ -504,7 +1051,6 @@ impl SshClientUi {
 
         ui.add_space(4.0);
 
-        // 主布局：左侧会话列表（可拖拽宽度）+ 右侧详情
         let available_width = ui.available_width();
         let min_left_width = 120.0;
         let max_left_width = (available_width * 0.5).min(400.0);
@@ -517,7 +1063,6 @@ impl SshClientUi {
                 self.render_session_list(ui, store);
             });
 
-            // 可拖拽分隔线
             let separator_rect = ui.available_rect_before_wrap();
             let separator_x = separator_rect.left();
             let separator_response = ui.allocate_rect(
@@ -543,8 +1088,8 @@ impl SshClientUi {
 
             if separator_response.dragged() {
                 let delta = separator_response.drag_delta().x;
-                self.left_panel_width = (self.left_panel_width + delta)
-                    .clamp(min_left_width, max_left_width);
+                self.left_panel_width =
+                    (self.left_panel_width + delta).clamp(min_left_width, max_left_width);
             }
             if separator_response.hovered() || separator_response.dragged() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeColumn);
@@ -557,7 +1102,6 @@ impl SshClientUi {
             });
         });
 
-        // 状态栏
         let stats_height = ui.text_style_height(&egui::TextStyle::Small) + 16.0;
         egui::TopBottomPanel::bottom("ssh_status")
             .exact_height(stats_height)
@@ -566,8 +1110,11 @@ impl SshClientUi {
                 self.render_status_bar(ui);
             });
 
-        // 弹窗
-        let title = if self.editing_id.is_some() { "编辑连接" } else { "新增连接" };
+        let title = if self.editing_id.is_some() {
+            "编辑连接"
+        } else {
+            "新增连接"
+        };
 
         if self.show_edit_modal {
             egui::Window::new(title)
@@ -592,7 +1139,6 @@ impl SshClientUi {
         }
     }
 
-    /// 渲染表单内容（弹窗内部）
     fn render_session_form_content(&mut self, ui: &mut egui::Ui, store: &SshStore) {
         let label_width = 80.0;
 
@@ -626,8 +1172,16 @@ impl SshClientUi {
 
         ui.horizontal(|ui| {
             ui.label("认证方式:");
-            ui.selectable_value(&mut self.form.auth_type, AuthType::Password, AuthType::Password.as_str());
-            ui.selectable_value(&mut self.form.auth_type, AuthType::KeyFile, AuthType::KeyFile.as_str());
+            ui.selectable_value(
+                &mut self.form.auth_type,
+                AuthType::Password,
+                AuthType::Password.as_str(),
+            );
+            ui.selectable_value(
+                &mut self.form.auth_type,
+                AuthType::KeyFile,
+                AuthType::KeyFile.as_str(),
+            );
         });
         ui.add_space(8.0);
 
@@ -678,7 +1232,11 @@ impl SshClientUi {
 
         let is_editing = self.editing_id.is_some();
         ui.horizontal(|ui| {
-            let btn_label = if is_editing { "💾 保存修改" } else { "✅ 保存连接" };
+            let btn_label = if is_editing {
+                "💾 保存修改"
+            } else {
+                "✅ 保存连接"
+            };
 
             if ui.button(btn_label).clicked() {
                 if let Err(e) = self.form.validate() {
@@ -720,11 +1278,6 @@ impl SshClientUi {
                 self.refresh_sessions(store);
                 self.status_msg = "列表已刷新".to_string();
             }
-
-            ui.separator();
-            ui.label("快速连接:");
-            ui.label("ssh");
-            ui.weak("(开发中，请通过会话列表连接)");
         });
     }
 
@@ -752,14 +1305,14 @@ impl SshClientUi {
                         SessionState::Error(_) => "🔴",
                         SessionState::Disconnected => "⚪",
                     };
-                    let label = format!("{} {} ({})", icon, session.name, format_session_addr(session));
-
-                    let response = ui.add_sized(
-                        [ui.available_width(), 30.0],
-                        egui::SelectableLabel::new(is_selected, label),
+                    let label = format!(
+                        "{} {} ({})",
+                        icon,
+                        session.name,
+                        format_session_addr(session)
                     );
 
-                    if response.clicked() {
+                    if ui.selectable_label(is_selected, label).clicked() {
                         to_select = Some(idx);
                     }
                 }
@@ -801,7 +1354,9 @@ impl SshClientUi {
         }
         .to_string();
         let key_path = match &session.auth_method {
-            AuthMethod::KeyFile { private_key_path, .. } => Some(private_key_path.clone()),
+            AuthMethod::KeyFile {
+                private_key_path, ..
+            } => Some(private_key_path.clone()),
             _ => None,
         };
 
@@ -821,7 +1376,6 @@ impl SshClientUi {
 
         ui.horizontal(|ui| {
             if ui.button("🖥 创建会话").clicked() {
-                // 发起 SSH 连接
                 let s = &self.sessions[idx];
                 let host = s.host.clone();
                 let port = s.port;
@@ -831,19 +1385,26 @@ impl SshClientUi {
                 self.status_msg = format!("正在连接 {}...", session_name);
                 self.connection_state = SessionState::Connecting;
 
-                // 根据字体大小和可用宽度估算初始终端尺寸
                 let mono_font = egui::FontId::monospace(
-                    ui.style().text_styles.get(&egui::TextStyle::Monospace).map(|f| f.size).unwrap_or(14.0),
+                    ui.style()
+                        .text_styles
+                        .get(&egui::TextStyle::Monospace)
+                        .map(|f| f.size)
+                        .unwrap_or(14.0),
                 );
                 let est_char_w = ui.fonts(|f| f.glyph_width(&mono_font, 'M'));
                 let est_line_h = ui.fonts(|f| f.row_height(&mono_font));
                 let est_cols = if est_char_w > 0.0 {
-                    ((ui.available_width() * 0.7 / est_char_w).max(80.0).min(f32::from(u16::MAX))) as u16
+                    ((ui.available_width() * 0.7 / est_char_w)
+                        .max(80.0)
+                        .min(f32::from(u16::MAX))) as u16
                 } else {
                     120
                 };
                 let est_rows = if est_line_h > 0.0 {
-                    ((ui.available_height() * 0.5 / est_line_h).max(24.0).min(f32::from(u16::MAX))) as u16
+                    ((ui.available_height() * 0.5 / est_line_h)
+                        .max(24.0)
+                        .min(f32::from(u16::MAX))) as u16
                 } else {
                     30
                 };
@@ -862,6 +1423,7 @@ impl SshClientUi {
                                 .map(|f| f.size)
                                 .unwrap_or(14.0),
                         ));
+                        self.active_tab = SessionViewTab::Terminal;
                         log::info!("SSH 连接已发起: {}@{}", username, host);
                     }
                     Err(e) => {
@@ -913,7 +1475,11 @@ impl SshClientUi {
                 let (encrypted_password, iv, salt) =
                     crypto::encrypt_password(&self.form.password)
                         .map_err(|e| format!("密码加密失败: {}", e))?;
-                AuthMethod::Password { encrypted_password, iv, salt }
+                AuthMethod::Password {
+                    encrypted_password,
+                    iv,
+                    salt,
+                }
             }
             AuthType::KeyFile => {
                 let encrypted_passphrase = if self.form.passphrase.is_empty() {
@@ -939,10 +1505,14 @@ impl SshClientUi {
         };
 
         if let Some(id) = self.editing_id {
-            store.update_session(id, &new_session).map_err(|e| format!("更新连接失败: {}", e))?;
+            store
+                .update_session(id, &new_session)
+                .map_err(|e| format!("更新连接失败: {}", e))?;
             log::info!("SSH 连接 '{}' 已更新", new_session.name);
         } else {
-            store.insert_session(&new_session).map_err(|e| format!("保存连接失败: {}", e))?;
+            store
+                .insert_session(&new_session)
+                .map_err(|e| format!("保存连接失败: {}", e))?;
             log::info!("SSH 连接 '{}' 已创建", new_session.name);
         }
 
@@ -976,4 +1546,63 @@ fn format_session_addr(session: &super::models::SshSession) -> String {
     } else {
         format!("{}@{}:{}", session.username, session.host, session.port)
     }
+}
+
+/// 文件列表交互结果
+struct FileListAction {
+    select: Option<usize>,
+    open: Option<usize>,
+}
+
+/// 渲染文件表头（三列等宽）
+fn render_file_header(ui: &mut egui::Ui) {
+    ui.columns(3, |cols| {
+        cols[0].label(RichText::new("名称").strong());
+        cols[1].label(RichText::new("大小").strong());
+        cols[2].label(RichText::new("修改时间").strong());
+    });
+    ui.separator();
+}
+
+/// 渲染文件列表行（本地和远程共用）
+///
+/// 使用 `ui.columns(3)` 三列等宽，保证表头与数据列对齐。
+/// 返回用户的点击/双击操作，由调用方处理状态变更。
+fn render_file_rows(
+    ui: &mut egui::Ui,
+    files: &[super::models::FileEntry],
+    selected: Option<usize>,
+) -> FileListAction {
+    let mut action = FileListAction {
+        select: None,
+        open: None,
+    };
+
+    for (idx, entry) in files.iter().enumerate() {
+        let is_selected = selected == Some(idx);
+        let icon = if entry.is_dir { "📁" } else { "📄" };
+
+        ui.columns(3, |cols| {
+            // 名称列：图标 + 文件名，使用 Label::truncate() 自动按列宽裁切
+            let resp = cols[0].horizontal(|ui| {
+                ui.label(icon);
+                let text = if is_selected {
+                    egui::RichText::new(&entry.name).strong()
+                } else {
+                    egui::RichText::new(&entry.name)
+                };
+                ui.add(egui::Label::new(text).truncate())
+            });
+            if resp.inner.clicked() {
+                action.select = Some(idx);
+            }
+            if resp.inner.double_clicked() && entry.is_dir {
+                action.open = Some(idx);
+            }
+            cols[1].label(entry.size_display());
+            cols[2].label(entry.modified_display());
+        });
+    }
+
+    action
 }

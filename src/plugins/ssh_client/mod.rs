@@ -1,6 +1,7 @@
 mod client;
 mod crypto;
 pub mod models;
+mod sftp;
 mod store;
 mod terminal;
 mod ui;

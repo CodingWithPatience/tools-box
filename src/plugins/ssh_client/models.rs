@@ -185,3 +185,296 @@ pub struct NewSession {
     pub username: String,
     pub auth_method: AuthMethod,
 }
+
+// ===================================================================
+// SFTP 相关数据结构
+// ===================================================================
+
+/// 文件条目（用于本地和远程文件列表）
+#[derive(Debug, Clone)]
+pub struct FileEntry {
+    /// 文件名
+    pub name: String,
+    /// 完整路径
+    pub path: String,
+    /// 是否为目录
+    pub is_dir: bool,
+    /// 文件大小（字节，目录为 0）
+    pub size: u64,
+    /// 修改时间戳（秒）
+    pub modified: Option<i64>,
+    /// 文件权限（Unix 模式，仅远程文件有意义）
+    pub permissions: Option<u32>,
+}
+
+impl FileEntry {
+    /// 获取文件大小的可读格式
+    pub fn size_display(&self) -> String {
+        if self.is_dir {
+            return "<DIR>".to_string();
+        }
+        if self.size < 1024 {
+            format!("{} B", self.size)
+        } else if self.size < 1024 * 1024 {
+            format!("{:.1} KB", self.size as f64 / 1024.0)
+        } else if self.size < 1024 * 1024 * 1024 {
+            format!("{:.1} MB", self.size as f64 / (1024.0 * 1024.0))
+        } else {
+            format!("{:.1} GB", self.size as f64 / (1024.0 * 1024.0 * 1024.0))
+        }
+    }
+
+    /// 获取修改时间的可读格式
+    pub fn modified_display(&self) -> String {
+        self.modified
+            .map(|ts| {
+                let dt = chrono::DateTime::from_timestamp(ts, 0);
+                match dt {
+                    Some(d) => d.format("%Y-%m-%d %H:%M").to_string(),
+                    None => "-".to_string(),
+                }
+            })
+            .unwrap_or_else(|| "-".to_string())
+    }
+}
+
+/// SFTP 文件传输方向
+#[derive(Debug, Clone, PartialEq)]
+pub enum TransferDirection {
+    /// 上传（本地 → 远程）
+    Upload,
+    /// 下载（远程 → 本地）
+    Download,
+}
+
+/// 文件传输任务
+#[derive(Debug, Clone)]
+pub struct TransferTask {
+    /// 源路径
+    pub source: String,
+    /// 目标路径
+    pub destination: String,
+    /// 传输方向
+    pub direction: TransferDirection,
+    /// 文件总大小（字节）
+    pub total_size: u64,
+    /// 已传输大小（字节）
+    pub transferred: u64,
+    /// 文件名（用于显示）
+    pub filename: String,
+    /// 是否完成
+    pub done: bool,
+    /// 错误信息（如有）
+    pub error: Option<String>,
+}
+
+impl TransferTask {
+    /// 获取传输进度百分比 (0.0 ~ 1.0)
+    pub fn progress(&self) -> f32 {
+        if self.total_size == 0 {
+            return 1.0;
+        }
+        let ratio = self.transferred as f64 / self.total_size as f64;
+        ratio.min(1.0) as f32
+    }
+
+    /// 获取进度显示文本
+    pub fn progress_text(&self) -> String {
+        if self.done {
+            match &self.error {
+                Some(err) => format!("❌ 失败: {}", err),
+                None => "✅ 完成".to_string(),
+            }
+        } else {
+            format!(
+                "{} / {} ({:.0}%)",
+                Self::format_size(self.transferred),
+                Self::format_size(self.total_size),
+                self.progress() * 100.0
+            )
+        }
+    }
+
+    fn format_size(bytes: u64) -> String {
+        if bytes < 1024 {
+            format!("{} B", bytes)
+        } else if bytes < 1024 * 1024 {
+            format!("{:.1} KB", bytes as f64 / 1024.0)
+        } else if bytes < 1024 * 1024 * 1024 {
+            format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+        } else {
+            format!("{:.1} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+        }
+    }
+}
+
+/// SFTP 操作请求（UI → SFTP 线程）
+#[derive(Debug)]
+pub enum SftpRequest {
+    /// 列出远程目录
+    ListDirectory(String),
+    /// 上传文件 (本地路径, 远程路径)
+    Upload(String, String),
+    /// 下载文件 (远程路径, 本地路径)
+    Download(String, String),
+    /// 创建远程目录
+    MkDir(String),
+    /// 删除远程文件
+    Delete(String),
+    /// 断开 SFTP 连接
+    Disconnect,
+}
+
+/// SFTP 操作响应（SFTP 线程 → UI）
+#[derive(Debug)]
+pub enum SftpResponse {
+    /// 目录列表结果
+    DirectoryList(String, Vec<FileEntry>),
+    /// 传输进度更新
+    TransferProgress(TransferTask),
+    /// 操作完成
+    OperationDone(String),
+    /// 操作错误
+    Error(String),
+    /// SFTP 连接已就绪
+    Connected,
+    /// SFTP 连接已断开
+    Disconnected,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_file_entry_size_display() {
+        let dir = FileEntry {
+            name: "test".to_string(),
+            path: "/test".to_string(),
+            is_dir: true,
+            size: 0,
+            modified: None,
+            permissions: None,
+        };
+        assert_eq!(dir.size_display(), "<DIR>");
+
+        let small = FileEntry {
+            name: "a.txt".to_string(),
+            path: "/a.txt".to_string(),
+            is_dir: false,
+            size: 500,
+            modified: None,
+            permissions: None,
+        };
+        assert_eq!(small.size_display(), "500 B");
+
+        let kb = FileEntry {
+            name: "b.txt".to_string(),
+            path: "/b.txt".to_string(),
+            is_dir: false,
+            size: 2048,
+            modified: None,
+            permissions: None,
+        };
+        assert_eq!(kb.size_display(), "2.0 KB");
+
+        let mb = FileEntry {
+            name: "c.bin".to_string(),
+            path: "/c.bin".to_string(),
+            is_dir: false,
+            size: 5 * 1024 * 1024,
+            modified: None,
+            permissions: None,
+        };
+        assert_eq!(mb.size_display(), "5.0 MB");
+
+        let gb = FileEntry {
+            name: "d.bin".to_string(),
+            path: "/d.bin".to_string(),
+            is_dir: false,
+            size: 2 * 1024 * 1024 * 1024,
+            modified: None,
+            permissions: None,
+        };
+        assert_eq!(gb.size_display(), "2.0 GB");
+    }
+
+    #[test]
+    fn test_transfer_task_progress() {
+        let task = TransferTask {
+            source: "/a".to_string(),
+            destination: "/b".to_string(),
+            direction: TransferDirection::Upload,
+            total_size: 1000,
+            transferred: 500,
+            filename: "test.bin".to_string(),
+            done: false,
+            error: None,
+        };
+        assert!((task.progress() - 0.5).abs() < 0.01);
+
+        let empty = TransferTask {
+            source: "/a".to_string(),
+            destination: "/b".to_string(),
+            direction: TransferDirection::Download,
+            total_size: 0,
+            transferred: 0,
+            filename: "empty".to_string(),
+            done: false,
+            error: None,
+        };
+        assert!((empty.progress() - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_transfer_task_progress_text() {
+        let in_progress = TransferTask {
+            source: "/a".to_string(),
+            destination: "/b".to_string(),
+            direction: TransferDirection::Upload,
+            total_size: 1024,
+            transferred: 512,
+            filename: "test.bin".to_string(),
+            done: false,
+            error: None,
+        };
+        assert!(in_progress.progress_text().contains("50%"));
+
+        let done = TransferTask {
+            source: "/a".to_string(),
+            destination: "/b".to_string(),
+            direction: TransferDirection::Upload,
+            total_size: 1024,
+            transferred: 1024,
+            filename: "test.bin".to_string(),
+            done: true,
+            error: None,
+        };
+        assert_eq!(done.progress_text(), "✅ 完成");
+
+        let failed = TransferTask {
+            source: "/a".to_string(),
+            destination: "/b".to_string(),
+            direction: TransferDirection::Download,
+            total_size: 1024,
+            transferred: 0,
+            filename: "test.bin".to_string(),
+            done: true,
+            error: Some("网络错误".to_string()),
+        };
+        assert!(failed.progress_text().contains("网络错误"));
+    }
+
+    #[test]
+    fn test_file_entry_modified_display_none() {
+        let entry = FileEntry {
+            name: "a".to_string(),
+            path: "/a".to_string(),
+            is_dir: false,
+            size: 0,
+            modified: None,
+            permissions: None,
+        };
+        assert_eq!(entry.modified_display(), "-");
+    }
+}
