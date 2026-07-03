@@ -61,6 +61,37 @@ impl TerminalEmulator {
         (col, row)
     }
 
+    /// 获取光标位置字符的宽度（1 或 2）
+    /// 宽字符（如中文）返回 2，普通字符返回 1
+    pub fn cursor_char_width(&self) -> u16 {
+        let screen = self.parser.screen();
+        let (row, col) = screen.cursor_position();
+        if let Some(cell) = screen.cell(row, col) {
+            if cell.is_wide() {
+                2
+            } else if cell.is_wide_continuation() {
+                // 光标在宽字符的后半部分，需要获取前一个字符
+                if col > 0 {
+                    if let Some(prev_cell) = screen.cell(row, col - 1) {
+                        if prev_cell.is_wide() {
+                            2
+                        } else {
+                            1
+                        }
+                    } else {
+                        1
+                    }
+                } else {
+                    1
+                }
+            } else {
+                1
+            }
+        } else {
+            1
+        }
+    }
+
     /// 将终端屏幕渲染为 egui::LayoutJob
     pub fn render_to_layout_job(&mut self, is_dark_mode: bool) -> LayoutJob {
         let screen = self.parser.screen();
@@ -86,12 +117,23 @@ impl TerminalEmulator {
             for col in 0..current_cols {
                 match screen.cell(row, col) {
                     Some(c) => {
+                        // 跳过宽字符的后半部分，避免中文字符间出现缝隙
+                        if c.is_wide_continuation() {
+                            continue;
+                        }
+
                         let contents = c.contents();
+                        // 空单元格（如 TAB 跳过的位置）用空格填充
+                        let text = if contents.is_empty() {
+                            " "
+                        } else {
+                            &contents
+                        };
                         let fg = ansi_color_to_egui(c.fgcolor(), default_fg);
                         let bg_color = ansi_color_to_egui(c.bgcolor(), default_bg);
 
                         job.append(
-                            &contents,
+                            text,
                             0.0,
                             TextFormat {
                                 font_id: FontId::monospace(self.font_size),
@@ -107,7 +149,7 @@ impl TerminalEmulator {
                         );
                     }
                     None => {
-                        // 空单元格填充空格
+                        // 超出范围的单元格填充空格
                         job.append(
                             " ",
                             0.0,
@@ -121,17 +163,19 @@ impl TerminalEmulator {
                     }
                 }
             }
-            // 每行末尾追加换行符
-            job.append(
-                "\n",
-                0.0,
-                TextFormat {
-                    font_id: FontId::monospace(self.font_size),
-                    color: default_fg,
-                    background: default_bg,
-                    ..Default::default()
-                },
-            );
+            // 非最后一行追加换行符
+            if row < current_rows - 1 {
+                job.append(
+                    "\n",
+                    0.0,
+                    TextFormat {
+                        font_id: FontId::monospace(self.font_size),
+                        color: default_fg,
+                        background: default_bg,
+                        ..Default::default()
+                    },
+                );
+            }
         }
 
         job

@@ -288,11 +288,13 @@ impl SshClientUi {
 
                     // 绘制闪烁光标
                     let (c_col, c_row) = term.cursor_position();
+                    let cursor_w = term.cursor_char_width();
                     let time = ui.ctx().input(|i| i.time);
                     let blink_on = (time * 2.0) as u64 % 2 == 0;
                     // 计算光标位置（用于绘制和 IME 定位）
                     let cursor_x = text_rect.left() + f32::from(c_col) * char_width.round();
                     let cursor_y = text_rect.top() + f32::from(c_row) * line_height.round();
+                    let cursor_width = char_width * f32::from(cursor_w);
                     if blink_on {
                         let cursor_color = if is_dark_mode {
                             Color32::from_rgb(0xd0, 0xd0, 0xd0)
@@ -302,7 +304,7 @@ impl SshClientUi {
                         ui.painter().rect_filled(
                             egui::Rect::from_min_size(
                                 egui::pos2(cursor_x, cursor_y),
-                                egui::vec2(char_width, line_height),
+                                egui::vec2(cursor_width, line_height),
                             ),
                             0.0,
                             cursor_color,
@@ -312,7 +314,7 @@ impl SshClientUi {
                     // 设置 IME 输出位置，使输入法候选窗口跟随光标
                     let cursor_rect = egui::Rect::from_min_size(
                         egui::pos2(cursor_x, cursor_y),
-                        egui::vec2(char_width, line_height),
+                        egui::vec2(cursor_width, line_height),
                     );
                     let to_global = ui
                         .ctx()
@@ -356,8 +358,9 @@ impl SshClientUi {
     /// 终端视图独占键盘输入，因此消费所有事件后清空队列。
     /// 完全依赖服务器回显，不进行本地回显，避免双重回显问题。
     fn process_terminal_input(&mut self, tx: &mpsc::SyncSender<SshInput>, ctx: &egui::Context) {
-        ctx.input(|i| {
-            for event in &i.events {
+        // 使用 input_mut 读取并消费事件，防止事件传播到其他 UI 组件
+        ctx.input_mut(|i| {
+            for event in i.events.clone() {
                 match event {
                     egui::Event::Key {
                         key,
@@ -370,53 +373,65 @@ impl SshClientUi {
                         if self.ime_active && !modifiers.ctrl {
                             continue;
                         }
-                        if *key == egui::Key::C && modifiers.ctrl {
+                        if key == egui::Key::C && modifiers.ctrl {
                             let _ = tx.send(SshInput::KeyInput(vec![0x03]));
+                            i.consume_key(modifiers, key);
                             continue;
                         }
-                        if *key == egui::Key::D && modifiers.ctrl {
+                        if key == egui::Key::D && modifiers.ctrl {
                             let _ = tx.send(SshInput::KeyInput(vec![0x04]));
+                            i.consume_key(modifiers, key);
                             continue;
                         }
-                        if *key == egui::Key::Z && modifiers.ctrl {
+                        if key == egui::Key::Z && modifiers.ctrl {
                             let _ = tx.send(SshInput::KeyInput(vec![0x1a]));
+                            i.consume_key(modifiers, key);
                             continue;
                         }
-                        if *key == egui::Key::L && modifiers.ctrl {
+                        if key == egui::Key::L && modifiers.ctrl {
                             let _ = tx.send(SshInput::KeyInput(vec![0x0c]));
+                            i.consume_key(modifiers, key);
                             continue;
                         }
-                        if *key == egui::Key::Enter {
+                        if key == egui::Key::Enter {
                             let _ = tx.send(SshInput::KeyInput(vec![0x0d]));
+                            i.consume_key(modifiers, key);
                             continue;
                         }
-                        if *key == egui::Key::Backspace {
+                        if key == egui::Key::Backspace {
                             let _ = tx.send(SshInput::KeyInput(vec![0x7f]));
+                            i.consume_key(modifiers, key);
                             continue;
                         }
-                        if *key == egui::Key::Tab {
+                        if key == egui::Key::Tab {
                             let _ = tx.send(SshInput::KeyInput(vec![0x09]));
+                            i.consume_key(modifiers, key);
                             continue;
                         }
-                        if *key == egui::Key::Escape {
+                        if key == egui::Key::Escape {
                             let _ = tx.send(SshInput::KeyInput(vec![0x1b]));
+                            i.consume_key(modifiers, key);
                             continue;
                         }
                         // 方向键
-                        if *key == egui::Key::ArrowUp {
+                        if key == egui::Key::ArrowUp {
                             let _ = tx.send(SshInput::KeyInput(b"\x1b[A".to_vec()));
+                            i.consume_key(modifiers, key);
                             continue;
                         }
-                        if *key == egui::Key::ArrowDown {
+                        if key == egui::Key::ArrowDown {
                             let _ = tx.send(SshInput::KeyInput(b"\x1b[B".to_vec()));
+                            i.consume_key(modifiers, key);
                             continue;
                         }
-                        if *key == egui::Key::ArrowRight {
+                        if key == egui::Key::ArrowRight {
                             let _ = tx.send(SshInput::KeyInput(b"\x1b[C".to_vec()));
+                            i.consume_key(modifiers, key);
                             continue;
                         }
-                        if *key == egui::Key::ArrowLeft {
+                        if key == egui::Key::ArrowLeft {
                             let _ = tx.send(SshInput::KeyInput(b"\x1b[D".to_vec()));
+                            i.consume_key(modifiers, key);
                             continue;
                         }
                     }
@@ -457,10 +472,24 @@ impl SshClientUi {
                     _ => {}
                 }
             }
+            // 清空所有事件，防止传播到其他 UI 组件
+            i.events.clear();
         });
 
-        // 消费键盘事件，防止影响其他 UI 组件
-        ctx.input_mut(|i| i.events.clear());
+        // 设置焦点锁定过滤器，阻止 Tab/Enter 等按键传播到其他组件
+        let terminal_id = egui::Id::new("ssh_terminal_input");
+        ctx.memory_mut(|mem| {
+            mem.request_focus(terminal_id);
+            mem.set_focus_lock_filter(
+                terminal_id,
+                egui::EventFilter {
+                    tab: true,
+                    horizontal_arrows: true,
+                    vertical_arrows: true,
+                    escape: true,
+                },
+            );
+        });
     }
 
     // ===================================================================
