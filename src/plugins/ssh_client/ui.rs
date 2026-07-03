@@ -32,6 +32,8 @@ pub struct SshClientUi {
     output_rx: Option<mpsc::Receiver<SshOutput>>,
     /// 当前连接的会话索引
     connected_session_idx: Option<usize>,
+    /// IME（输入法）是否激活，用于避免 Event::Text 和 Event::Ime::Commit 重复触发
+    ime_active: bool,
 }
 
 impl SshClientUi {
@@ -52,6 +54,7 @@ impl SshClientUi {
             input_tx: None,
             output_rx: None,
             connected_session_idx: None,
+            ime_active: false,
         }
     }
 
@@ -183,7 +186,7 @@ impl SshClientUi {
         // 提前处理键盘输入，防止被其他 widget 消费
         let tx_clone = self.input_tx.clone();
         if let Some(tx) = &tx_clone {
-            Self::process_terminal_input(tx, ui.ctx());
+            self.process_terminal_input(tx, ui.ctx());
         }
 
         // 顶部连接信息栏（提前提取数据避免借用冲突）
@@ -287,10 +290,10 @@ impl SshClientUi {
                     let (c_col, c_row) = term.cursor_position();
                     let time = ui.ctx().input(|i| i.time);
                     let blink_on = (time * 2.0) as u64 % 2 == 0;
+                    // 计算光标位置（用于绘制和 IME 定位）
+                    let cursor_x = text_rect.left() + f32::from(c_col) * char_width.round();
+                    let cursor_y = text_rect.top() + f32::from(c_row) * line_height.round();
                     if blink_on {
-                        // 使用 text_rect 的左上角作为基准，加上字符偏移
-                        let cursor_x = text_rect.left() + f32::from(c_col) * char_width.round();
-                        let cursor_y = text_rect.top() + f32::from(c_row) * line_height.round();
                         let cursor_color = if is_dark_mode {
                             Color32::from_rgb(0xd0, 0xd0, 0xd0)
                         } else {
@@ -305,6 +308,22 @@ impl SshClientUi {
                             cursor_color,
                         );
                     }
+
+                    // 设置 IME 输出位置，使输入法候选窗口跟随光标
+                    let cursor_rect = egui::Rect::from_min_size(
+                        egui::pos2(cursor_x, cursor_y),
+                        egui::vec2(char_width, line_height),
+                    );
+                    let to_global = ui
+                        .ctx()
+                        .layer_transform_to_global(ui.layer_id())
+                        .unwrap_or_default();
+                    ui.ctx().output_mut(|o| {
+                        o.ime = Some(egui::output::IMEOutput {
+                            rect: to_global * text_rect,
+                            cursor_rect: to_global * cursor_rect,
+                        });
+                    });
                 } else if self.connection_state == SessionState::Connecting {
                     ui.centered_and_justified(|ui| {
                         ui.label("正在连接...");
@@ -336,7 +355,7 @@ impl SshClientUi {
     /// 本方法在 egui widget 渲染之前调用，确保事件不被其他组件消费。
     /// 终端视图独占键盘输入，因此消费所有事件后清空队列。
     /// 完全依赖服务器回显，不进行本地回显，避免双重回显问题。
-    fn process_terminal_input(tx: &mpsc::SyncSender<SshInput>, ctx: &egui::Context) {
+    fn process_terminal_input(&mut self, tx: &mpsc::SyncSender<SshInput>, ctx: &egui::Context) {
         ctx.input(|i| {
             for event in &i.events {
                 match event {
@@ -346,6 +365,11 @@ impl SshClientUi {
                         modifiers,
                         ..
                     } => {
+                        // IME 激活时跳过大部分键盘事件，将控制权交给 IME 系统
+                        // 仅保留 Ctrl 组合快捷键（如 Ctrl+C）以便用户中断命令
+                        if self.ime_active && !modifiers.ctrl {
+                            continue;
+                        }
                         if *key == egui::Key::C && modifiers.ctrl {
                             let _ = tx.send(SshInput::KeyInput(vec![0x03]));
                             continue;
@@ -397,6 +421,10 @@ impl SshClientUi {
                         }
                     }
                     egui::Event::Text(text) => {
+                        // IME 激活时跳过，由 ImeEvent::Commit 处理，避免重复输入
+                        if self.ime_active {
+                            continue;
+                        }
                         // 过滤掉控制字符事件
                         if text.is_empty()
                             || text == "\r"
@@ -406,6 +434,25 @@ impl SshClientUi {
                             continue;
                         }
                         let _ = tx.send(SshInput::KeyInput(text.as_bytes().to_vec()));
+                    }
+                    // 处理 IME（输入法）事件，支持中文等非 ASCII 字符输入
+                    egui::Event::Ime(ime_event) => {
+                        match ime_event {
+                            egui::ImeEvent::Enabled => {
+                                self.ime_active = true;
+                            }
+                            egui::ImeEvent::Disabled => {
+                                self.ime_active = false;
+                            }
+                            egui::ImeEvent::Commit(text) => {
+                                // IME 组合完成，提交最终文本
+                                if !text.is_empty() {
+                                    let _ = tx.send(SshInput::KeyInput(text.as_bytes().to_vec()));
+                                }
+                            }
+                            // Preedit 事件（组合中）不需要处理，等待 Commit
+                            egui::ImeEvent::Preedit(_) => {}
+                        }
                     }
                     _ => {}
                 }
