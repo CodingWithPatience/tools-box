@@ -85,6 +85,79 @@ impl SshClientUi {
         }
     }
 
+    /// 重新连接终端
+    fn reconnect_terminal(&mut self, ui: &mut egui::Ui) {
+        let Some(tab) = self.current_tab_mut() else {
+            return;
+        };
+
+        let session_id = tab.session_id;
+        let session = self.sessions.iter().find(|s| s.id == session_id);
+        let Some(session) = session else {
+            return;
+        };
+
+        let host = session.host.clone();
+        let port = session.port;
+        let username = session.username.clone();
+        let auth = session.auth_method.clone();
+
+        let mono_font = egui::FontId::monospace(
+            ui.style()
+                .text_styles
+                .get(&egui::TextStyle::Monospace)
+                .map(|f| f.size)
+                .unwrap_or(14.0),
+        );
+        let est_char_w = ui.fonts(|f| f.glyph_width(&mono_font, 'M'));
+        let est_line_h = ui.fonts(|f| f.row_height(&mono_font));
+        let est_cols = if est_char_w > 0.0 {
+            ((ui.available_width() * 0.7 / est_char_w)
+                .max(80.0)
+                .min(f32::from(u16::MAX))) as u16
+        } else {
+            120
+        };
+        let est_rows = if est_line_h > 0.0 {
+            ((ui.available_height() * 0.5 / est_line_h)
+                .max(24.0)
+                .min(f32::from(u16::MAX))) as u16
+        } else {
+            30
+        };
+
+        match SshClient::connect(&host, port, &username, &auth, est_cols, est_rows) {
+            Ok((tx, rx)) => {
+                let Some(tab) = self.current_tab_mut() else {
+                    return;
+                };
+                tab.input_tx = Some(tx);
+                tab.output_rx = Some(rx);
+                tab.terminal = Some(TerminalEmulator::new(
+                    est_cols,
+                    est_rows,
+                    ui.style()
+                        .text_styles
+                        .get(&egui::TextStyle::Monospace)
+                        .map(|f| f.size)
+                        .unwrap_or(14.0),
+                ));
+                tab.connection_state = SessionState::Connecting;
+                tab.status_msg = "正在重新连接...".to_string();
+                tab.active_tab = SessionViewTab::Terminal;
+                log::info!("SSH 重新连接已发起: {}@{}", username, host);
+            }
+            Err(e) => {
+                let Some(tab) = self.current_tab_mut() else {
+                    return;
+                };
+                tab.connection_state = SessionState::Error(format!("重连失败: {}", e));
+                tab.status_msg = format!("重连失败: {}", e);
+                log::error!("SSH 重新连接失败: {}", e);
+            }
+        }
+    }
+
     /// 刷新会话列表
     fn refresh_sessions(&mut self, store: &SshStore) {
         match store.list_sessions() {
@@ -493,6 +566,7 @@ impl SshClientUi {
 
         // 顶部连接信息栏
         let mut disconnect_terminal = false;
+        let mut reconnect_terminal = false;
         let mut disconnect_sftp = false;
 
         ui.horizontal(|ui| {
@@ -520,9 +594,17 @@ impl SshClientUi {
                 ui.colored_label(Color32::from_rgb(200, 200, 50), "🟡 SFTP...");
             }
 
-            // 断开终端（仅断开终端，不影响 SFTP）
-            if ui.button("🔌 断开终端").clicked() {
-                disconnect_terminal = true;
+            // 终端按钮：根据连接状态显示不同按钮
+            let has_terminal = tab_state.0 == SessionState::Connected
+                || tab_state.0 == SessionState::Connecting;
+            if has_terminal {
+                if ui.button("🔌 断开终端").clicked() {
+                    disconnect_terminal = true;
+                }
+            } else {
+                if ui.button("🔄 重连终端").clicked() {
+                    reconnect_terminal = true;
+                }
             }
 
             // 断开 SFTP（仅在 SFTP 已连接时显示）
@@ -543,6 +625,9 @@ impl SshClientUi {
             if let Some(tab) = self.current_tab_mut() {
                 tab.disconnect_sftp();
             }
+        }
+        if reconnect_terminal {
+            self.reconnect_terminal(ui);
         }
 
         // 终端已断开但 SFTP 仍连接时，自动切换到 SFTP tab
