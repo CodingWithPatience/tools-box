@@ -519,11 +519,16 @@ impl SshClientUi {
         let available_height = ui.available_height() - status_height - header_height;
 
         let mono_font = egui::FontId::monospace(font_size);
-        let char_width = ui.fonts(|f| {
+        let raw_char_width = ui.fonts(|f| {
             let glyph = f.glyph_width(&mono_font, 'M');
             if glyph > 0.0 { glyph } else { font_size * 0.6 }
         });
-        let line_height = ui.fonts(|f| f.row_height(&mono_font));
+        let raw_line_height = ui.fonts(|f| f.row_height(&mono_font));
+        // 像素级舍入，确保光标位置与 egui 渲染的文本精确对齐
+        // 参考 diff 工具的处理方式，避免字体大小改变时的累积误差
+        let pixels_per_point = ui.pixels_per_point();
+        let char_width = (raw_char_width * pixels_per_point).round() / pixels_per_point;
+        let line_height = (raw_line_height * pixels_per_point).round() / pixels_per_point;
 
         let new_cols = ((ui.available_width() - 20.0) / char_width)
             .max(1.0)
@@ -569,8 +574,8 @@ impl SshClientUi {
                     let cursor_w = term.cursor_char_width();
                     let time = ui.ctx().input(|i| i.time);
                     let blink_on = (time * 2.0) as u64 % 2 == 0;
-                    let cursor_x = text_rect.left() + f32::from(c_col) * char_width.round();
-                    let cursor_y = text_rect.top() + f32::from(c_row) * line_height.round();
+                    let cursor_x = text_rect.left() + f32::from(c_col) * char_width;
+                    let cursor_y = text_rect.top() + f32::from(c_row) * line_height;
                     let cursor_width = char_width * f32::from(cursor_w);
                     if blink_on {
                         let cursor_color = if is_dark_mode {
