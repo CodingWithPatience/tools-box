@@ -6,25 +6,16 @@ use egui::{Color32, RichText};
 use super::client::SshClient;
 use super::crypto;
 use super::models::{
-    AuthMethod, AuthType, FileEntry, NewSession, SessionForm, SessionState, SftpRequest,
-    SftpResponse, SshInput, SshOutput, TransferTask,
+    AuthMethod, AuthType, NewSession, SessionForm, SessionState, SessionTab, SessionViewTab,
+    SftpRequest, SftpResponse, SshInput, SshOutput,
 };
 use super::sftp::{self, SftpClient};
 use super::store::SshStore;
 use super::terminal::TerminalEmulator;
 
-/// 会话视图中的 Tab 页
-#[derive(Debug, Clone, PartialEq)]
-enum SessionViewTab {
-    /// 交互终端
-    Terminal,
-    /// SFTP 文件传输
-    Sftp,
-}
-
 /// SSH 客户端 UI 状态
 pub struct SshClientUi {
-    // ===== 会话管理 =====
+    // ===== 会话配置管理 =====
     sessions: Vec<super::models::SshSession>,
     selected_index: Option<usize>,
     form: SessionForm,
@@ -32,54 +23,18 @@ pub struct SshClientUi {
     show_edit_modal: bool,
     editing_id: Option<i64>,
     form_error: Option<String>,
-    connection_state: SessionState,
-    status_msg: String,
     left_panel_width: f32,
     last_load_error: String,
 
-    // ===== 终端相关 =====
-    terminal: Option<TerminalEmulator>,
-    input_tx: Option<mpsc::SyncSender<SshInput>>,
-    output_rx: Option<mpsc::Receiver<SshOutput>>,
-    connected_session_idx: Option<usize>,
-    ime_active: bool,
-    /// 用户自定义字体大小（None 表示使用全局字体大小）
-    custom_font_size: Option<f32>,
-
-    // ===== SFTP 相关 =====
-    /// 当前活动的 Tab 页
-    active_tab: SessionViewTab,
-    /// SFTP 请求发送端
-    sftp_tx: Option<mpsc::SyncSender<SftpRequest>>,
-    /// SFTP 响应接收端
-    sftp_rx: Option<mpsc::Receiver<SftpResponse>>,
-    /// 本地当前目录
-    local_current_dir: String,
-    /// 本地目录文件列表
-    local_files: Vec<FileEntry>,
-    /// 远程当前目录
-    remote_current_dir: String,
-    /// 远程目录文件列表
-    remote_files: Vec<FileEntry>,
-    /// 本地选中的文件索引
-    local_selected: Option<usize>,
-    /// 远程选中的文件索引
-    remote_selected: Option<usize>,
-    /// 当前传输任务列表
-    transfer_tasks: Vec<TransferTask>,
-    /// SFTP 连接状态
-    sftp_connected: bool,
-    /// SFTP 操作状态消息
-    sftp_status_msg: String,
-    /// 远程目录输入框
-    remote_dir_input: String,
-    /// 本地目录输入框
-    local_dir_input: String,
+    // ===== 多标签会话 =====
+    /// 打开的会话标签列表
+    tabs: Vec<SessionTab>,
+    /// 当前活动标签索引
+    active_tab_index: Option<usize>,
 }
 
 impl SshClientUi {
     pub fn new() -> Self {
-        let home = sftp::home_dir();
         Self {
             sessions: Vec::new(),
             selected_index: None,
@@ -88,37 +43,46 @@ impl SshClientUi {
             show_edit_modal: false,
             editing_id: None,
             form_error: None,
-            connection_state: SessionState::Disconnected,
-            status_msg: "就绪".to_string(),
             left_panel_width: 250.0,
             last_load_error: String::new(),
-            terminal: None,
-            input_tx: None,
-            output_rx: None,
-            connected_session_idx: None,
-            ime_active: false,
-            custom_font_size: None,
-            active_tab: SessionViewTab::Terminal,
-            sftp_tx: None,
-            sftp_rx: None,
-            local_current_dir: home.clone(),
-            local_files: Vec::new(),
-            remote_current_dir: String::new(),
-            remote_files: Vec::new(),
-            local_selected: None,
-            remote_selected: None,
-            transfer_tasks: Vec::new(),
-            sftp_connected: false,
-            sftp_status_msg: String::new(),
-            remote_dir_input: String::new(),
-            local_dir_input: home,
+            tabs: Vec::new(),
+            active_tab_index: None,
         }
     }
 
-    /// 是否在会话视图中（终端或 SFTP 任一连接即显示会话视图）
+    /// 是否在会话视图中（有活动标签即显示会话视图）
     fn is_terminal_view(&self) -> bool {
-        self.connected_session_idx.is_some()
-            && (self.terminal.is_some() || self.sftp_connected || self.sftp_tx.is_some())
+        self.active_tab_index.is_some() && !self.tabs.is_empty()
+    }
+
+    /// 获取当前活动标签的不可变引用
+    fn current_tab(&self) -> Option<&SessionTab> {
+        self.active_tab_index.and_then(|idx| self.tabs.get(idx))
+    }
+
+    /// 获取当前活动标签的可变引用
+    fn current_tab_mut(&mut self) -> Option<&mut SessionTab> {
+        self.active_tab_index.and_then(|idx| self.tabs.get_mut(idx))
+    }
+
+    /// 关闭指定索引的标签
+    fn close_tab(&mut self, index: usize) {
+        if index < self.tabs.len() {
+            // 断开该标签的所有连接
+            self.tabs[index].disconnect_all();
+            // 移除标签
+            self.tabs.remove(index);
+            // 调整活动标签索引
+            if self.tabs.is_empty() {
+                self.active_tab_index = None;
+            } else if let Some(active) = self.active_tab_index {
+                if active >= self.tabs.len() {
+                    self.active_tab_index = Some(self.tabs.len() - 1);
+                } else if active > index {
+                    self.active_tab_index = Some(active - 1);
+                }
+            }
+        }
     }
 
     /// 刷新会话列表
@@ -139,7 +103,6 @@ impl SshClientUi {
             }
             Err(e) => {
                 let err_msg = format!("加载连接列表失败: {}", e);
-                self.status_msg = err_msg.clone();
                 if self.last_load_error != err_msg {
                     log::error!("{}", err_msg);
                     self.last_load_error = err_msg;
@@ -148,67 +111,19 @@ impl SshClientUi {
         }
     }
 
-    /// 断开当前 SSH 连接（同时断开终端和 SFTP）
-    fn disconnect(&mut self) {
-        // 断开 SFTP
-        if let Some(tx) = &self.sftp_tx {
-            let _ = tx.send(SftpRequest::Disconnect);
-        }
-        self.sftp_tx = None;
-        self.sftp_rx = None;
-        self.sftp_connected = false;
-        self.remote_files.clear();
-        self.remote_current_dir.clear();
-        self.transfer_tasks.clear();
-
-        // 断开终端
-        if let Some(tx) = &self.input_tx {
-            let _ = tx.send(SshInput::Disconnect);
-        }
-        self.cleanup_connection();
-    }
-
-    /// 仅断开终端连接，保持 SFTP 不变
-    fn disconnect_terminal_only(&mut self) {
-        if let Some(tx) = &self.input_tx {
-            let _ = tx.send(SshInput::Disconnect);
-        }
-        self.terminal = None;
-        self.input_tx = None;
-        self.output_rx = None;
-        self.connection_state = SessionState::Disconnected;
-        self.status_msg = "终端已断开".to_string();
-        self.custom_font_size = None;
-        // 如果 SFTP 仍连接，切换到 SFTP tab；否则清除会话索引
-        if self.sftp_connected || self.sftp_tx.is_some() {
-            self.active_tab = SessionViewTab::Sftp;
-        } else {
-            self.connected_session_idx = None;
-        }
-    }
-
-    /// 清理连接状态
-    fn cleanup_connection(&mut self) {
-        self.terminal = None;
-        self.input_tx = None;
-        self.output_rx = None;
-        self.connected_session_idx = None;
-        self.connection_state = SessionState::Disconnected;
-        self.status_msg = "已断开连接".to_string();
-        self.active_tab = SessionViewTab::Terminal;
-        self.custom_font_size = None;
-    }
-
     /// 刷新本地文件列表
     fn refresh_local_files(&mut self) {
-        match sftp::list_local_dir(&self.local_current_dir) {
+        let Some(tab) = self.current_tab_mut() else {
+            return;
+        };
+        match sftp::list_local_dir(&tab.local_current_dir) {
             Ok(files) => {
-                self.local_files = files;
-                self.local_selected = None;
-                self.local_dir_input = self.local_current_dir.clone();
+                tab.local_files = files;
+                tab.local_selected = None;
+                tab.local_dir_input = tab.local_current_dir.clone();
             }
             Err(e) => {
-                self.sftp_status_msg = format!("无法读取本地目录: {}", e);
+                tab.sftp_status_msg = format!("无法读取本地目录: {}", e);
                 log::warn!("读取本地目录失败: {}", e);
             }
         }
@@ -216,20 +131,24 @@ impl SshClientUi {
 
     /// 请求刷新远程文件列表
     fn refresh_remote_files(&mut self) {
-        if let Some(tx) = &self.sftp_tx {
-            let _ = tx.send(SftpRequest::ListDirectory(self.remote_current_dir.clone()));
+        let Some(tab) = self.current_tab_mut() else {
+            return;
+        };
+        if let Some(tx) = &tab.sftp_tx {
+            let _ = tx.send(SftpRequest::ListDirectory(tab.remote_current_dir.clone()));
         }
     }
 
     /// 初始化 SFTP 连接
     fn init_sftp_connection(&mut self) {
-        if self.sftp_tx.is_some() {
-            return; // 已连接
-        }
-        let Some(idx) = self.connected_session_idx else {
+        let Some(tab) = self.current_tab_mut() else {
             return;
         };
-        let Some(session) = self.sessions.get(idx) else {
+        if tab.sftp_tx.is_some() {
+            return; // 已连接
+        }
+        let session_id = tab.session_id;
+        let Some(session) = self.sessions.iter().find(|s| s.id == session_id) else {
             return;
         };
 
@@ -240,12 +159,18 @@ impl SshClientUi {
 
         match SftpClient::connect(&host, port, &username, &auth) {
             Ok((tx, rx)) => {
-                self.sftp_tx = Some(tx);
-                self.sftp_rx = Some(rx);
+                let Some(tab) = self.current_tab_mut() else {
+                    return;
+                };
+                tab.sftp_tx = Some(tx);
+                tab.sftp_rx = Some(rx);
                 log::info!("SFTP 连接已发起");
             }
             Err(e) => {
-                self.sftp_status_msg = format!("SFTP 连接失败: {}", e);
+                let Some(tab) = self.current_tab_mut() else {
+                    return;
+                };
+                tab.sftp_status_msg = format!("SFTP 连接失败: {}", e);
                 log::error!("SFTP 连接失败: {}", e);
             }
         }
@@ -273,12 +198,22 @@ impl SshClientUi {
                 .unwrap_or(14.0);
 
             // 在渲染前处理终端键盘输入，避免与 disconnect 按钮的借用冲突
-            if self.active_tab == SessionViewTab::Terminal {
-                let had_input = if let Some(tx) = self.input_tx.clone() {
-                    self.process_terminal_input(&tx, ui.ctx())
+            let active_tab_is_terminal = self.current_tab()
+                .map(|t| t.active_tab == SessionViewTab::Terminal)
+                .unwrap_or(false);
+
+            if active_tab_is_terminal {
+                let had_input = if let Some(tab) = self.current_tab() {
+                    if let Some(tx) = &tab.input_tx {
+                        let tx_clone = tx.clone();
+                        self.process_terminal_input(&tx_clone, ui.ctx())
+                    } else {
+                        false
+                    }
                 } else {
                     false
                 };
+
                 // 处理滚轮事件
                 let (ctrl_held, scroll_y) = ui.ctx().input(|i| {
                     (i.modifiers.ctrl, i.raw_scroll_delta.y)
@@ -286,35 +221,43 @@ impl SshClientUi {
                 // 使用 signum 确保各平台步进一致，避免触控板/滚轮差异
                 if ctrl_held && scroll_y != 0.0 {
                     // Ctrl+滚轮调整终端字体大小
-                    if let Some(term) = &mut self.terminal {
-                        let delta = scroll_y.signum();
-                        let current_size = self.custom_font_size.unwrap_or(global_font_size);
-                        let new_size = (current_size + delta).clamp(8.0, 36.0);
-                        self.custom_font_size = Some(new_size);
-                        term.set_font_size(new_size);
+                    if let Some(tab) = self.current_tab_mut() {
+                        if let Some(term) = &mut tab.terminal {
+                            let delta = scroll_y.signum();
+                            let current_size = tab.custom_font_size.unwrap_or(global_font_size);
+                            let new_size = (current_size + delta).clamp(8.0, 36.0);
+                            tab.custom_font_size = Some(new_size);
+                            term.set_font_size(new_size);
+                        }
                     }
                 } else if scroll_y != 0.0 {
                     // 滚轮滚动终端历史
-                    if let Some(term) = &mut self.terminal {
-                        let scrollback = term.scrollback();
-                        let scrollback_size = term.scrollback_size();
-                        if scroll_y > 0.0 && scrollback < scrollback_size {
-                            // 向上滚动
-                            term.set_scrollback(scrollback + 1);
-                        } else if scroll_y < 0.0 && scrollback > 0 {
-                            // 向下滚动
-                            term.set_scrollback(scrollback - 1);
+                    if let Some(tab) = self.current_tab_mut() {
+                        if let Some(term) = &mut tab.terminal {
+                            let scrollback = term.scrollback();
+                            let scrollback_size = term.scrollback_size();
+                            if scroll_y > 0.0 && scrollback < scrollback_size {
+                                // 向上滚动
+                                term.set_scrollback(scrollback + 1);
+                            } else if scroll_y < 0.0 && scrollback > 0 {
+                                // 向下滚动
+                                term.set_scrollback(scrollback - 1);
+                            }
                         }
                     }
                 } else if had_input {
                     // 有键盘输入时，自动滚动到光标位置
-                    if let Some(term) = &mut self.terminal {
-                        term.set_scrollback(0);
+                    if let Some(tab) = self.current_tab_mut() {
+                        if let Some(term) = &mut tab.terminal {
+                            term.set_scrollback(0);
+                        }
                     }
-                } else if let Some(term) = &mut self.terminal {
+                } else if let Some(tab) = self.current_tab_mut() {
                     // 同步全局字体大小（用户未自定义且大小变化时）
-                    if self.custom_font_size.is_none() && term.font_size() != global_font_size {
-                        term.set_font_size(global_font_size);
+                    if let Some(term) = &mut tab.terminal {
+                        if tab.custom_font_size.is_none() && term.font_size() != global_font_size {
+                            term.set_font_size(global_font_size);
+                        }
                     }
                 }
             }
@@ -329,43 +272,56 @@ impl SshClientUi {
     // ===================================================================
 
     fn poll_ssh_output(&mut self) {
-        let rx = match &self.output_rx {
-            Some(rx) => rx,
-            None => return,
-        };
+        // 轮询所有标签的 SSH 输出
+        for tab in &mut self.tabs {
+            let has_rx = tab.output_rx.is_some();
+            if !has_rx {
+                continue;
+            }
 
-        loop {
-            match rx.try_recv() {
-                Ok(SshOutput::TerminalData(data)) => {
-                    if let Some(term) = &mut self.terminal {
-                        term.process(&data);
+            // 收集需要处理的断开/错误状态
+            let mut disconnect_reason: Option<String> = None;
+            let mut error_msg: Option<String> = None;
+
+            loop {
+                let rx = tab.output_rx.as_ref().unwrap();
+                match rx.try_recv() {
+                    Ok(SshOutput::TerminalData(data)) => {
+                        if let Some(term) = &mut tab.terminal {
+                            term.process(&data);
+                        }
+                    }
+                    Ok(SshOutput::Connected) => {
+                        tab.connection_state = SessionState::Connected;
+                        tab.status_msg = "已连接".to_string();
+                        log::info!("SSH 连接就绪: {}", tab.name);
+                    }
+                    Ok(SshOutput::Disconnected(reason)) => {
+                        tab.status_msg = format!("连接断开: {}", reason);
+                        log::info!("SSH 连接断开: {} - {}", tab.name, reason);
+                        tab.connection_state = SessionState::Error(reason.clone());
+                        disconnect_reason = Some(reason);
+                        break;
+                    }
+                    Ok(SshOutput::Error(err)) => {
+                        tab.status_msg = format!("连接错误: {}", err);
+                        tab.connection_state = SessionState::Error(err.clone());
+                        log::error!("SSH 错误: {} - {}", tab.name, err);
+                        error_msg = Some(err);
+                        break;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        tab.status_msg = "SSH 连接已断开".to_string();
+                        disconnect_reason = Some("通道已断开".to_string());
+                        break;
                     }
                 }
-                Ok(SshOutput::Connected) => {
-                    self.connection_state = SessionState::Connected;
-                    self.status_msg = "已连接".to_string();
-                    log::info!("SSH 连接就绪");
-                }
-                Ok(SshOutput::Disconnected(reason)) => {
-                    self.status_msg = format!("连接断开: {}", reason);
-                    log::info!("SSH 连接断开: {}", reason);
-                    self.connection_state = SessionState::Error(reason.clone());
-                    self.cleanup_connection();
-                    return;
-                }
-                Ok(SshOutput::Error(err)) => {
-                    self.status_msg = format!("连接错误: {}", err);
-                    self.connection_state = SessionState::Error(err.clone());
-                    log::error!("SSH 错误: {}", err);
-                    self.cleanup_connection();
-                    return;
-                }
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    self.status_msg = "SSH 连接已断开".to_string();
-                    self.cleanup_connection();
-                    return;
-                }
+            }
+
+            // 在循环外处理断开连接
+            if disconnect_reason.is_some() || error_msg.is_some() {
+                tab.disconnect_terminal();
             }
         }
     }
@@ -375,65 +331,68 @@ impl SshClientUi {
     // ===================================================================
 
     fn poll_sftp_output(&mut self) {
-        // 先收集所有待处理的消息，再逐个处理，避免借用冲突
-        let mut messages = Vec::new();
-        if let Some(rx) = &self.sftp_rx {
-            loop {
-                match rx.try_recv() {
-                    Ok(msg) => messages.push(msg),
-                    Err(mpsc::TryRecvError::Empty) => break,
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        self.sftp_connected = false;
-                        self.sftp_tx = None;
-                        self.sftp_rx = None;
-                        self.sftp_status_msg = "SFTP 通道已关闭".to_string();
-                        return;
+        // 轮询所有标签的 SFTP 输出
+        for tab in &mut self.tabs {
+            // 先收集所有待处理的消息，再逐个处理，避免借用冲突
+            let mut messages = Vec::new();
+            if let Some(rx) = &tab.sftp_rx {
+                loop {
+                    match rx.try_recv() {
+                        Ok(msg) => messages.push(msg),
+                        Err(mpsc::TryRecvError::Empty) => break,
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            tab.sftp_connected = false;
+                            tab.sftp_tx = None;
+                            tab.sftp_rx = None;
+                            tab.sftp_status_msg = "SFTP 通道已关闭".to_string();
+                            break;
+                        }
                     }
                 }
             }
-        }
 
-        for msg in messages {
-            match msg {
-                SftpResponse::DirectoryList(path, entries) => {
-                    self.remote_current_dir = path.clone();
-                    self.remote_dir_input = path;
-                    self.remote_files = entries;
-                    self.remote_selected = None;
-                }
-                SftpResponse::TransferProgress(task) => {
-                    let existing = self.transfer_tasks.iter_mut().find(|t| {
-                        t.source == task.source && t.destination == task.destination
-                    });
-                    if let Some(existing) = existing {
-                        *existing = task;
-                    } else {
-                        self.transfer_tasks.push(task);
+            for msg in messages {
+                match msg {
+                    SftpResponse::DirectoryList(path, entries) => {
+                        tab.remote_current_dir = path.clone();
+                        tab.remote_dir_input = path;
+                        tab.remote_files = entries;
+                        tab.remote_selected = None;
                     }
-                }
-                SftpResponse::OperationDone(msg) => {
-                    self.sftp_status_msg = msg;
-                }
-                SftpResponse::Error(err) => {
-                    self.sftp_status_msg = err;
-                    log::warn!("SFTP 错误: {}", self.sftp_status_msg);
-                }
-                SftpResponse::Connected => {
-                    self.sftp_connected = true;
-                    self.sftp_status_msg = "SFTP 已连接".to_string();
-                    log::info!("SFTP 连接就绪");
-                    // 请求列出远程家目录
-                    if let Some(tx) = &self.sftp_tx {
-                        let _ = tx.send(SftpRequest::ListDirectory(".".to_string()));
+                    SftpResponse::TransferProgress(task) => {
+                        let existing = tab.transfer_tasks.iter_mut().find(|t| {
+                            t.source == task.source && t.destination == task.destination
+                        });
+                        if let Some(existing) = existing {
+                            *existing = task;
+                        } else {
+                            tab.transfer_tasks.push(task);
+                        }
                     }
-                }
-                SftpResponse::Disconnected => {
-                    self.sftp_connected = false;
-                    self.sftp_tx = None;
-                    self.sftp_rx = None;
-                    self.remote_files.clear();
-                    self.sftp_status_msg = "SFTP 已断开".to_string();
-                    log::info!("SFTP 连接已断开");
+                    SftpResponse::OperationDone(msg) => {
+                        tab.sftp_status_msg = msg;
+                    }
+                    SftpResponse::Error(err) => {
+                        tab.sftp_status_msg = err;
+                        log::warn!("SFTP 错误: {}", tab.sftp_status_msg);
+                    }
+                    SftpResponse::Connected => {
+                        tab.sftp_connected = true;
+                        tab.sftp_status_msg = "SFTP 已连接".to_string();
+                        log::info!("SFTP 连接就绪: {}", tab.name);
+                        // 请求列出远程家目录
+                        if let Some(tx) = &tab.sftp_tx {
+                            let _ = tx.send(SftpRequest::ListDirectory(".".to_string()));
+                        }
+                    }
+                    SftpResponse::Disconnected => {
+                        tab.sftp_connected = false;
+                        tab.sftp_tx = None;
+                        tab.sftp_rx = None;
+                        tab.remote_files.clear();
+                        tab.sftp_status_msg = "SFTP 已断开".to_string();
+                        log::info!("SFTP 连接已断开: {}", tab.name);
+                    }
                 }
             }
         }
@@ -446,11 +405,95 @@ impl SshClientUi {
     fn render_session_view(&mut self, ui: &mut egui::Ui) {
         ui.ctx().request_repaint();
 
-        // 顶部连接信息栏 + Tab 切换
-        let session_info = self
-            .connected_session_idx
-            .and_then(|idx| self.sessions.get(idx))
+        // 顶部标签栏
+        let mut go_back = false;
+        let mut tab_to_close = None;
+        let mut tab_to_activate = None;
+
+        ui.horizontal(|ui| {
+            // 返回按钮
+            if ui.button("⬅ 返回列表").clicked() {
+                go_back = true;
+            }
+
+            ui.separator();
+
+            // 渲染会话标签
+            for (idx, tab) in self.tabs.iter().enumerate() {
+                let is_active = self.active_tab_index == Some(idx);
+
+                // 状态图标
+                let status_icon = match tab.connection_state {
+                    SessionState::Connected => "🟢",
+                    SessionState::Connecting => "🟡",
+                    SessionState::Error(_) => "🔴",
+                    SessionState::Disconnected => "⚪",
+                };
+
+                let label = format!("{} {}", status_icon, tab.name);
+
+                // 标签按钮
+                let response = ui.selectable_label(is_active, &label);
+                if response.clicked() {
+                    tab_to_activate = Some(idx);
+                }
+
+                // 关闭按钮
+                if ui.small_button("✕").clicked() {
+                    tab_to_close = Some(idx);
+                }
+
+                ui.separator();
+            }
+        });
+
+        // 处理返回操作
+        if go_back {
+            self.active_tab_index = None;
+            return;
+        }
+
+        // 处理标签切换
+        if let Some(idx) = tab_to_activate {
+            self.active_tab_index = Some(idx);
+        }
+
+        // 处理标签关闭
+        if let Some(idx) = tab_to_close {
+            self.close_tab(idx);
+        }
+
+        ui.separator();
+
+        // 如果没有活动标签，显示提示
+        let Some(active_idx) = self.active_tab_index else {
+            ui.centered_and_justified(|ui| {
+                ui.label("请从左侧选择一个连接，点击「创建会话」打开新标签");
+            });
+            return;
+        };
+
+        // 确保活动标签索引有效
+        if active_idx >= self.tabs.len() {
+            self.active_tab_index = None;
+            return;
+        }
+
+        // 获取当前标签的会话信息用于显示
+        let session_info = self.sessions.iter()
+            .find(|s| s.id == self.tabs[active_idx].session_id)
             .map(|s| (s.name.clone(), s.username.clone(), s.host.clone(), s.port));
+
+        // 克隆标签状态用于显示
+        let tab_state = (
+            self.tabs[active_idx].connection_state.clone(),
+            self.tabs[active_idx].sftp_connected,
+            self.tabs[active_idx].sftp_tx.is_some(),
+        );
+
+        // 顶部连接信息栏
+        let mut disconnect_terminal = false;
+        let mut disconnect_sftp = false;
 
         ui.horizontal(|ui| {
             if let Some((ref name, ref username, ref host, port)) = session_info {
@@ -458,12 +501,12 @@ impl SshClientUi {
             }
 
             // 终端连接状态
-            let term_color = match self.connection_state {
+            let term_color = match &tab_state.0 {
                 SessionState::Connected => Color32::from_rgb(50, 200, 50),
                 SessionState::Connecting => Color32::from_rgb(200, 200, 50),
                 _ => Color32::from_rgb(220, 50, 50),
             };
-            let term_text = match self.connection_state {
+            let term_text = match &tab_state.0 {
                 SessionState::Connected => "🟢 终端",
                 SessionState::Connecting => "🟡 终端...",
                 _ => "🔴 终端",
@@ -471,65 +514,83 @@ impl SshClientUi {
             ui.colored_label(term_color, term_text);
 
             // SFTP 连接状态
-            if self.sftp_connected {
+            if tab_state.1 {
                 ui.colored_label(Color32::from_rgb(50, 200, 50), "🟢 SFTP");
-            } else if self.sftp_tx.is_some() {
+            } else if tab_state.2 {
                 ui.colored_label(Color32::from_rgb(200, 200, 50), "🟡 SFTP...");
             }
 
             // 断开终端（仅断开终端，不影响 SFTP）
             if ui.button("🔌 断开终端").clicked() {
-                self.disconnect_terminal_only();
+                disconnect_terminal = true;
             }
 
             // 断开 SFTP（仅在 SFTP 已连接时显示）
-            if self.sftp_connected || self.sftp_tx.is_some() {
+            if tab_state.1 || tab_state.2 {
                 if ui.button("📁 断开SFTP").clicked() {
-                    if let Some(tx) = &self.sftp_tx {
-                        let _ = tx.send(SftpRequest::Disconnect);
-                    }
-                    self.sftp_tx = None;
-                    self.sftp_rx = None;
-                    self.sftp_connected = false;
-                    self.remote_files.clear();
-                    self.sftp_status_msg = "SFTP 已断开".to_string();
+                    disconnect_sftp = true;
                 }
             }
         });
 
-        // 终端已断开但 SFTP 仍连接时，自动切换到 SFTP tab
-        if self.terminal.is_none()
-            && self.active_tab == SessionViewTab::Terminal
-            && (self.sftp_connected || self.sftp_tx.is_some())
-        {
-            self.active_tab = SessionViewTab::Sftp;
+        // 在闭包外处理断开操作
+        if disconnect_terminal {
+            if let Some(tab) = self.current_tab_mut() {
+                tab.disconnect_terminal();
+            }
+        }
+        if disconnect_sftp {
+            if let Some(tab) = self.current_tab_mut() {
+                tab.disconnect_sftp();
+            }
         }
 
-        // Tab 栏
+        // 终端已断开但 SFTP 仍连接时，自动切换到 SFTP tab
+        if let Some(tab) = self.current_tab_mut() {
+            if tab.terminal.is_none()
+                && tab.active_tab == SessionViewTab::Terminal
+                && (tab.sftp_connected || tab.sftp_tx.is_some())
+            {
+                tab.active_tab = SessionViewTab::Sftp;
+            }
+        }
+
+        // 子 Tab 栏（终端/SFTP)
         ui.horizontal(|ui| {
-            if self.terminal.is_some() {
+            let tab = &self.tabs[active_idx];
+            if tab.terminal.is_some() {
+                let mut active_sub_tab = tab.active_tab.clone();
                 ui.selectable_value(
-                    &mut self.active_tab,
+                    &mut active_sub_tab,
                     SessionViewTab::Terminal,
                     "🖥 终端",
                 );
+                // 更新到标签
+                if active_sub_tab != tab.active_tab {
+                    self.tabs[active_idx].active_tab = active_sub_tab;
+                }
             } else {
                 ui.add_enabled(false, egui::Label::new("🖥 终端(已断开)"));
             }
+
+            let tab = &self.tabs[active_idx];
+            let mut active_sub_tab = tab.active_tab.clone();
             if ui
-                .selectable_value(&mut self.active_tab, SessionViewTab::Sftp, "📁 SFTP")
+                .selectable_value(&mut active_sub_tab, SessionViewTab::Sftp, "📁 SFTP")
                 .clicked()
             {
+                self.tabs[active_idx].active_tab = active_sub_tab;
                 self.init_sftp_connection();
-                if self.local_files.is_empty() {
+                if self.tabs[active_idx].local_files.is_empty() {
                     self.refresh_local_files();
                 }
             }
         });
         ui.separator();
 
-        // 根据当前 Tab 渲染内容
-        match self.active_tab {
+        // 根据当前子 Tab 渲染内容
+        let active_sub_tab = self.tabs[active_idx].active_tab.clone();
+        match active_sub_tab {
             SessionViewTab::Terminal => self.render_terminal_content(ui),
             SessionViewTab::Sftp => self.render_sftp_panel(ui),
         }
@@ -540,19 +601,25 @@ impl SshClientUi {
     // ===================================================================
 
     fn render_terminal_content(&mut self, ui: &mut egui::Ui) {
-        if self.terminal.is_none() {
+        let Some(tab) = self.current_tab() else {
+            ui.centered_and_justified(|ui| {
+                ui.label("没有活动的会话标签");
+            });
+            return;
+        };
+
+        if tab.terminal.is_none() {
             ui.centered_and_justified(|ui| {
                 ui.label("终端未连接");
             });
             return;
         }
 
-        let font_size = self
-            .terminal
-            .as_ref()
+        let font_size = tab.terminal.as_ref()
             .map(|t| t.font_size())
             .unwrap_or(14.0);
         let is_dark_mode = ui.visuals().dark_mode;
+        let status_msg = tab.status_msg.clone();
 
         let header_height = 40.0;
         let status_height = 28.0;
@@ -578,11 +645,14 @@ impl SshClientUi {
             .min(f32::from(u16::MAX)) as u16;
 
         // 调整终端大小
-        if let Some(term) = &mut self.terminal {
+        let Some(tab) = self.current_tab_mut() else {
+            return;
+        };
+        if let Some(term) = &mut tab.terminal {
             let (cur_cols, cur_rows) = term.size();
             if new_cols != cur_cols || new_rows != cur_rows {
                 term.resize(new_cols, new_rows);
-                if let Some(tx) = &self.input_tx {
+                if let Some(tx) = &tab.input_tx {
                     let _ = tx.send(SshInput::Resize(new_cols, new_rows));
                 }
             }
@@ -599,7 +669,10 @@ impl SshClientUi {
         let available_rect = ui.available_rect_before_wrap();
         ui.painter().rect_filled(available_rect, 0.0, bg_color);
 
-        if let Some(term) = &mut self.terminal {
+        let Some(tab) = self.current_tab_mut() else {
+            return;
+        };
+        if let Some(term) = &mut tab.terminal {
             let job = term.render_to_layout_job(is_dark_mode);
             let content_w = f32::from(new_cols) * char_width + 20.0;
             ui.set_min_width(content_w);
@@ -655,23 +728,21 @@ impl SshClientUi {
                     cursor_rect: to_global * cursor_rect,
                 });
             });
-        } else if self.connection_state == SessionState::Connecting {
+        } else if tab.connection_state == SessionState::Connecting {
             ui.centered_and_justified(|ui| {
                 ui.label("正在连接...");
             });
         }
 
         // 底部状态栏
-        let cursor_pos = self
-            .terminal
-            .as_ref()
+        let cursor_pos = tab.terminal.as_ref()
             .map(|t| t.cursor_position())
             .unwrap_or((0, 0));
         ui.separator();
         ui.horizontal(|ui| {
             ui.label(format!(
                 "列: {} 行: {} | 字号: {:.0} | {}",
-                cursor_pos.0, cursor_pos.1, font_size, self.status_msg
+                cursor_pos.0, cursor_pos.1, font_size, status_msg
             ));
         });
     }
@@ -681,24 +752,42 @@ impl SshClientUi {
     // ===================================================================
 
     fn render_sftp_panel(&mut self, ui: &mut egui::Ui) {
-        if !self.sftp_connected {
-            if self.sftp_tx.is_some() {
+        // 克隆需要的状态，避免借用冲突
+        let sftp_state = self.current_tab().map(|t| {
+            (t.sftp_connected, t.sftp_tx.is_some())
+        });
+
+        let Some((sftp_connected, has_sftp_tx)) = sftp_state else {
+            ui.centered_and_justified(|ui| {
+                ui.label("没有活动的会话标签");
+            });
+            return;
+        };
+
+        if !sftp_connected {
+            if has_sftp_tx {
                 ui.centered_and_justified(|ui| {
                     ui.label("正在连接 SFTP...");
                 });
             } else {
+                let mut init_sftp = false;
                 ui.centered_and_justified(|ui| {
                     ui.label("SFTP 未连接");
                     if ui.button("连接 SFTP").clicked() {
-                        self.init_sftp_connection();
+                        init_sftp = true;
                     }
                 });
+                if init_sftp {
+                    self.init_sftp_connection();
+                }
             }
             return;
         }
 
         // 清理已完成的传输任务
-        self.transfer_tasks.retain(|t| !t.done);
+        if let Some(tab) = self.current_tab_mut() {
+            tab.transfer_tasks.retain(|t| !t.done);
+        }
 
         let total_h = ui.available_height();
 
@@ -732,39 +821,38 @@ impl SshClientUi {
 
                 // 路径导航栏
                 ui.horizontal(|ui| {
-                    let resp = ui.text_edit_singleline(&mut self.local_dir_input);
+                    let Some(tab) = self.current_tab_mut() else {
+                        return;
+                    };
+                    let resp = ui.text_edit_singleline(&mut tab.local_dir_input);
                     if resp.lost_focus()
                         && ui.input(|i| i.key_pressed(egui::Key::Enter))
                     {
-                        let p = self.local_dir_input.trim().to_string();
+                        let p = tab.local_dir_input.trim().to_string();
                         if Path::new(&p).is_dir() {
-                            self.local_current_dir = p;
-                            self.refresh_local_files();
+                            tab.local_current_dir = p;
                         }
                     }
                     if ui.button("📂").clicked() {
                         if let Some(path) = rfd::FileDialog::new()
                             .set_title("选择本地目录")
-                            .set_directory(&self.local_current_dir)
+                            .set_directory(&tab.local_current_dir)
                             .pick_folder()
                         {
-                            self.local_current_dir =
+                            tab.local_current_dir =
                                 path.to_string_lossy().to_string();
-                            self.refresh_local_files();
                         }
                     }
                     if ui.button("⬆").clicked() {
                         if let Some(parent) =
-                            Path::new(&self.local_current_dir).parent()
+                            Path::new(&tab.local_current_dir).parent()
                         {
-                            self.local_current_dir =
+                            tab.local_current_dir =
                                 parent.to_string_lossy().to_string();
-                            self.refresh_local_files();
                         }
                     }
                     if ui.button("🏠").clicked() {
-                        self.local_current_dir = sftp::home_dir();
-                        self.refresh_local_files();
+                        tab.local_current_dir = sftp::home_dir();
                     }
                 });
 
@@ -772,7 +860,10 @@ impl SshClientUi {
                 render_file_header(ui);
 
                 // 文件列表为空时加载
-                if self.local_files.is_empty() {
+                let should_refresh = self.current_tab()
+                    .map(|t| t.local_files.is_empty())
+                    .unwrap_or(false);
+                if should_refresh {
                     self.refresh_local_files();
                 }
 
@@ -783,17 +874,24 @@ impl SshClientUi {
                     .max_height(list_h)
                     .id_salt("local_files_scroll")
                     .show(ui, |ui| {
+                        let Some(tab) = self.current_tab() else {
+                            return;
+                        };
                         let action = render_file_rows(
                             ui,
-                            &self.local_files,
-                            self.local_selected,
+                            &tab.local_files,
+                            tab.local_selected,
                         );
                         if let Some(idx) = action.select {
-                            self.local_selected = Some(idx);
+                            if let Some(tab) = self.current_tab_mut() {
+                                tab.local_selected = Some(idx);
+                            }
                         }
                         if let Some(idx) = action.open {
-                            self.local_current_dir =
-                                self.local_files[idx].path.clone();
+                            if let Some(tab) = self.current_tab_mut() {
+                                tab.local_current_dir =
+                                    tab.local_files[idx].path.clone();
+                            }
                             self.refresh_local_files();
                         }
                     });
@@ -810,29 +908,30 @@ impl SshClientUi {
                 let btn_area_h = panel_inner_h - 70.0;
                 ui.add_space(btn_area_h / 2.0 - 30.0);
 
-                let can_upload = matches!(
-                    self.local_selected
-                        .and_then(|i| self.local_files.get(i)),
-                    Some(f) if !f.is_dir
-                );
+                let can_upload = self.current_tab()
+                    .and_then(|t| t.local_selected.and_then(|i| t.local_files.get(i)))
+                    .map(|f| !f.is_dir)
+                    .unwrap_or(false);
+
                 if ui
                     .add_enabled(can_upload, egui::Button::new("上传 →"))
                     .clicked()
                 {
-                    if let Some(idx) = self.local_selected {
-                        if let Some(entry) = self.local_files.get(idx) {
-                            let local_path = entry.path.clone();
-                            let remote_path = format!(
-                                "{}/{}",
-                                self.remote_current_dir
-                                    .trim_end_matches('/'),
-                                entry.name
-                            );
-                            if let Some(tx) = &self.sftp_tx {
-                                let _ = tx.send(SftpRequest::Upload(
-                                    local_path,
-                                    remote_path,
-                                ));
+                    if let Some(tab) = self.current_tab() {
+                        if let Some(idx) = tab.local_selected {
+                            if let Some(entry) = tab.local_files.get(idx) {
+                                let local_path = entry.path.clone();
+                                let remote_path = format!(
+                                    "{}/{}",
+                                    tab.remote_current_dir.trim_end_matches('/'),
+                                    entry.name
+                                );
+                                if let Some(tx) = &tab.sftp_tx {
+                                    let _ = tx.send(SftpRequest::Upload(
+                                        local_path,
+                                        remote_path,
+                                    ));
+                                }
                             }
                         }
                     }
@@ -840,29 +939,30 @@ impl SshClientUi {
 
                 ui.add_space(12.0);
 
-                let can_download = matches!(
-                    self.remote_selected
-                        .and_then(|i| self.remote_files.get(i)),
-                    Some(f) if !f.is_dir
-                );
+                let can_download = self.current_tab()
+                    .and_then(|t| t.remote_selected.and_then(|i| t.remote_files.get(i)))
+                    .map(|f| !f.is_dir)
+                    .unwrap_or(false);
+
                 if ui
                     .add_enabled(can_download, egui::Button::new("← 下载"))
                     .clicked()
                 {
-                    if let Some(idx) = self.remote_selected {
-                        if let Some(entry) = self.remote_files.get(idx) {
-                            let remote_path = entry.path.clone();
-                            let local_path = format!(
-                                "{}/{}",
-                                self.local_current_dir
-                                    .trim_end_matches('/'),
-                                entry.name
-                            );
-                            if let Some(tx) = &self.sftp_tx {
-                                let _ = tx.send(SftpRequest::Download(
-                                    remote_path,
-                                    local_path,
-                                ));
+                    if let Some(tab) = self.current_tab() {
+                        if let Some(idx) = tab.remote_selected {
+                            if let Some(entry) = tab.remote_files.get(idx) {
+                                let remote_path = entry.path.clone();
+                                let local_path = format!(
+                                    "{}/{}",
+                                    tab.local_current_dir.trim_end_matches('/'),
+                                    entry.name
+                                );
+                                if let Some(tx) = &tab.sftp_tx {
+                                    let _ = tx.send(SftpRequest::Download(
+                                        remote_path,
+                                        local_path,
+                                    ));
+                                }
                             }
                         }
                     }
@@ -880,21 +980,22 @@ impl SshClientUi {
 
                 // 路径导航栏
                 ui.horizontal(|ui| {
-                    let resp = ui.text_edit_singleline(&mut self.remote_dir_input);
+                    let Some(tab) = self.current_tab_mut() else {
+                        return;
+                    };
+                    let resp = ui.text_edit_singleline(&mut tab.remote_dir_input);
                     if resp.lost_focus()
                         && ui.input(|i| i.key_pressed(egui::Key::Enter))
                     {
-                        self.remote_current_dir =
-                            self.remote_dir_input.trim().to_string();
-                        self.refresh_remote_files();
+                        tab.remote_current_dir =
+                            tab.remote_dir_input.trim().to_string();
                     }
                     if ui.button("⬆").clicked() {
                         if let Some(parent) =
-                            Path::new(&self.remote_current_dir).parent()
+                            Path::new(&tab.remote_current_dir).parent()
                         {
-                            self.remote_current_dir =
+                            tab.remote_current_dir =
                                 parent.to_string_lossy().to_string();
-                            self.refresh_remote_files();
                         }
                     }
                     if ui.button("🔄").clicked() {
@@ -912,17 +1013,24 @@ impl SshClientUi {
                     .max_height(list_h)
                     .id_salt("remote_files_scroll")
                     .show(ui, |ui| {
+                        let Some(tab) = self.current_tab() else {
+                            return;
+                        };
                         let action = render_file_rows(
                             ui,
-                            &self.remote_files,
-                            self.remote_selected,
+                            &tab.remote_files,
+                            tab.remote_selected,
                         );
                         if let Some(idx) = action.select {
-                            self.remote_selected = Some(idx);
+                            if let Some(tab) = self.current_tab_mut() {
+                                tab.remote_selected = Some(idx);
+                            }
                         }
                         if let Some(idx) = action.open {
-                            self.remote_current_dir =
-                                self.remote_files[idx].path.clone();
+                            if let Some(tab) = self.current_tab_mut() {
+                                tab.remote_current_dir =
+                                    tab.remote_files[idx].path.clone();
+                            }
                             self.refresh_remote_files();
                         }
                     });
@@ -932,14 +1040,21 @@ impl SshClientUi {
         // ---- 下方：传输进度区（始终显示） ----
         ui.separator();
         ui.strong("传输进度:");
-        if self.transfer_tasks.is_empty() {
+        let has_transfer_tasks = self.current_tab()
+            .map(|t| !t.transfer_tasks.is_empty())
+            .unwrap_or(false);
+
+        if !has_transfer_tasks {
             ui.weak("暂无传输任务");
         } else {
             egui::ScrollArea::vertical()
                 .max_height(transfer_h - 40.0)
                 .id_salt("transfer_progress_scroll")
                 .show(ui, |ui| {
-                    for task in &self.transfer_tasks {
+                    let Some(tab) = self.current_tab() else {
+                        return;
+                    };
+                    for task in &tab.transfer_tasks {
                         ui.horizontal(|ui| {
                             let icon = match task.direction {
                                 super::models::TransferDirection::Upload => {
@@ -962,7 +1077,9 @@ impl SshClientUi {
         // 底部状态栏
         ui.separator();
         ui.horizontal(|ui| {
-            ui.label(&self.sftp_status_msg);
+            if let Some(tab) = self.current_tab() {
+                ui.label(&tab.sftp_status_msg);
+            }
         });
     }
 
@@ -972,6 +1089,8 @@ impl SshClientUi {
 
     fn process_terminal_input(&mut self, tx: &mpsc::SyncSender<SshInput>, ctx: &egui::Context) -> bool {
         let mut had_input = false;
+        let mut ime_active = self.current_tab().map(|t| t.ime_active).unwrap_or(false);
+
         ctx.input_mut(|i| {
             for event in i.events.clone() {
                 match event {
@@ -981,7 +1100,7 @@ impl SshClientUi {
                         modifiers,
                         ..
                     } => {
-                        if self.ime_active && !modifiers.ctrl {
+                        if ime_active && !modifiers.ctrl {
                             continue;
                         }
                         if key == egui::Key::C && modifiers.ctrl {
@@ -1058,7 +1177,7 @@ impl SshClientUi {
                         }
                     }
                     egui::Event::Text(text) => {
-                        if self.ime_active {
+                        if ime_active {
                             continue;
                         }
                         if text.is_empty() || text == "\r" || text == "\x08" || text == "\t" {
@@ -1070,10 +1189,10 @@ impl SshClientUi {
                     egui::Event::Ime(ime_event) => {
                         match ime_event {
                             egui::ImeEvent::Enabled => {
-                                self.ime_active = true;
+                                ime_active = true;
                             }
                             egui::ImeEvent::Disabled => {
-                                self.ime_active = false;
+                                ime_active = false;
                             }
                             egui::ImeEvent::Commit(text) => {
                                 if !text.is_empty() {
@@ -1089,6 +1208,11 @@ impl SshClientUi {
             }
             i.events.clear();
         });
+
+        // 更新当前标签的 IME 状态
+        if let Some(tab) = self.current_tab_mut() {
+            tab.ime_active = ime_active;
+        }
 
         let terminal_id = egui::Id::new("ssh_terminal_input");
         ctx.memory_mut(|mem| {
@@ -1344,7 +1468,14 @@ impl SshClientUi {
 
             if ui.button("🔄 刷新").clicked() {
                 self.refresh_sessions(store);
-                self.status_msg = "列表已刷新".to_string();
+            }
+
+            // 会话按钮：如果有打开的标签，点击进入最近的会话
+            if !self.tabs.is_empty() {
+                if ui.button("🖥 会话").clicked() {
+                    // 进入最近的会话（最后一个标签）
+                    self.active_tab_index = Some(self.tabs.len() - 1);
+                }
             }
         });
     }
@@ -1367,21 +1498,40 @@ impl SshClientUi {
 
                 for (idx, session) in self.sessions.iter().enumerate() {
                     let is_selected = self.selected_index == Some(idx);
-                    let icon = match &self.connection_state {
-                        SessionState::Connected => "🟢",
-                        SessionState::Connecting => "🟡",
-                        SessionState::Error(_) => "🔴",
-                        SessionState::Disconnected => "⚪",
+
+                    // 检查该会话是否有打开的标签
+                    let tab_index = self.tabs.iter().position(|t| t.session_id == session.id);
+                    let icon = if let Some(tab_idx) = tab_index {
+                        match &self.tabs[tab_idx].connection_state {
+                            SessionState::Connected => "🟢",
+                            SessionState::Connecting => "🟡",
+                            SessionState::Error(_) => "🔴",
+                            SessionState::Disconnected => "⚪",
+                        }
+                    } else {
+                        "⚪"
                     };
-                    let label = format!(
+
+                    let mut label = format!(
                         "{} {} ({})",
                         icon,
                         session.name,
                         format_session_addr(session)
                     );
 
-                    if ui.selectable_label(is_selected, label).clicked() {
+                    // 如果有打开的标签，添加标记
+                    if tab_index.is_some() {
+                        label.push_str(" [已打开]");
+                    }
+
+                    let response = ui.selectable_label(is_selected, &label);
+                    if response.clicked() {
                         to_select = Some(idx);
+                    }
+
+                    // 添加工具提示
+                    if response.hovered() {
+                        response.on_hover_text("点击选中连接配置");
                     }
                 }
 
@@ -1449,9 +1599,7 @@ impl SshClientUi {
                 let port = s.port;
                 let username = s.username.clone();
                 let auth = s.auth_method.clone();
-
-                self.status_msg = format!("正在连接 {}...", session_name);
-                self.connection_state = SessionState::Connecting;
+                let session_id = s.id;
 
                 let mono_font = egui::FontId::monospace(
                     ui.style()
@@ -1477,13 +1625,16 @@ impl SshClientUi {
                     30
                 };
 
+                // 创建新的会话标签
+                let mut new_tab = SessionTab::new(session_id, session_name.clone());
+                new_tab.connection_state = SessionState::Connecting;
+                new_tab.status_msg = format!("正在连接 {}...", session_name);
+
                 match SshClient::connect(&host, port, &username, &auth, est_cols, est_rows) {
                     Ok((tx, rx)) => {
-                        self.input_tx = Some(tx);
-                        self.output_rx = Some(rx);
-                        self.connected_session_idx = Some(idx);
-                        self.custom_font_size = None;
-                        self.terminal = Some(TerminalEmulator::new(
+                        new_tab.input_tx = Some(tx);
+                        new_tab.output_rx = Some(rx);
+                        new_tab.terminal = Some(TerminalEmulator::new(
                             est_cols,
                             est_rows,
                             ui.style()
@@ -1492,13 +1643,23 @@ impl SshClientUi {
                                 .map(|f| f.size)
                                 .unwrap_or(14.0),
                         ));
-                        self.active_tab = SessionViewTab::Terminal;
+                        new_tab.active_tab = SessionViewTab::Terminal;
+
+                        // 添加标签并设置为活动标签
+                        self.tabs.push(new_tab);
+                        self.active_tab_index = Some(self.tabs.len() - 1);
+
                         log::info!("SSH 连接已发起: {}@{}", username, host);
                     }
                     Err(e) => {
-                        self.connection_state =
+                        new_tab.connection_state =
                             SessionState::Error(format!("连接失败: {}", e));
-                        self.status_msg = format!("连接失败: {}", e);
+                        new_tab.status_msg = format!("连接失败: {}", e);
+
+                        // 添加标签并设置为活动标签（显示错误状态）
+                        self.tabs.push(new_tab);
+                        self.active_tab_index = Some(self.tabs.len() - 1);
+
                         log::error!("SSH 连接失败: {}", e);
                     }
                 }
@@ -1518,12 +1679,21 @@ impl SshClientUi {
             {
                 match store.delete_session(session_id) {
                     Ok(()) => {
-                        self.status_msg = format!("已删除连接: {}", session_name);
+                        // 关闭该会话的所有标签
+                        let tabs_to_close: Vec<usize> = self.tabs.iter()
+                            .enumerate()
+                            .filter(|(_, t)| t.session_id == session_id)
+                            .map(|(i, _)| i)
+                            .collect();
+                        for idx in tabs_to_close.into_iter().rev() {
+                            self.close_tab(idx);
+                        }
+
                         self.selected_index = None;
                         self.refresh_sessions(store);
+                        log::info!("已删除连接: {}", session_name);
                     }
                     Err(e) => {
-                        self.status_msg = format!("删除失败: {}", e);
                         log::error!("删除 SSH 连接失败: {}", e);
                     }
                 }
@@ -1590,21 +1760,25 @@ impl SshClientUi {
 
     fn render_status_bar(&self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            let state_color = match &self.connection_state {
-                SessionState::Connected => Color32::from_rgb(50, 200, 50),
-                SessionState::Connecting => Color32::from_rgb(200, 200, 50),
-                SessionState::Error(_) => Color32::from_rgb(220, 50, 50),
-                SessionState::Disconnected => Color32::from_rgb(128, 128, 128),
-            };
-            let state_text = match &self.connection_state {
-                SessionState::Connected => "已连接",
-                SessionState::Connecting => "连接中...",
-                SessionState::Error(e) => e,
-                SessionState::Disconnected => "未连接",
-            };
-            ui.colored_label(state_color, state_text);
-            ui.separator();
-            ui.label(&self.status_msg);
+            if let Some(tab) = self.current_tab() {
+                let state_color = match &tab.connection_state {
+                    SessionState::Connected => Color32::from_rgb(50, 200, 50),
+                    SessionState::Connecting => Color32::from_rgb(200, 200, 50),
+                    SessionState::Error(_) => Color32::from_rgb(220, 50, 50),
+                    SessionState::Disconnected => Color32::from_rgb(128, 128, 128),
+                };
+                let state_text = match &tab.connection_state {
+                    SessionState::Connected => "已连接",
+                    SessionState::Connecting => "连接中...",
+                    SessionState::Error(e) => e.as_str(),
+                    SessionState::Disconnected => "未连接",
+                };
+                ui.colored_label(state_color, state_text);
+                ui.separator();
+                ui.label(&tab.status_msg);
+            } else {
+                ui.label("就绪");
+            }
         });
     }
 }

@@ -342,6 +342,141 @@ pub enum SftpResponse {
     Disconnected,
 }
 
+// ===================================================================
+// 多标签会话相关数据结构
+// ===================================================================
+
+/// 会话视图中的 Tab 页类型
+#[derive(Debug, Clone, PartialEq)]
+pub enum SessionViewTab {
+    /// 交互终端
+    Terminal,
+    /// SFTP 文件传输
+    Sftp,
+}
+
+/// 单个会话标签的状态
+pub struct SessionTab {
+    /// 关联的会话配置 ID
+    pub session_id: i64,
+    /// 会话名称（用于标签显示）
+    pub name: String,
+    /// 终端仿真器
+    pub terminal: Option<super::terminal::TerminalEmulator>,
+    /// SSH 输入通道
+    pub input_tx: Option<std::sync::mpsc::SyncSender<SshInput>>,
+    /// SSH 输出通道
+    pub output_rx: Option<std::sync::mpsc::Receiver<SshOutput>>,
+    /// 连接状态
+    pub connection_state: SessionState,
+    /// 状态消息
+    pub status_msg: String,
+    /// 用户自定义字体大小
+    pub custom_font_size: Option<f32>,
+    /// IME 状态
+    pub ime_active: bool,
+
+    // ===== SFTP 相关 =====
+    /// 当前活动的子 Tab（终端/SFTP)
+    pub active_tab: SessionViewTab,
+    /// SFTP 请求发送端
+    pub sftp_tx: Option<std::sync::mpsc::SyncSender<SftpRequest>>,
+    /// SFTP 响应接收端
+    pub sftp_rx: Option<std::sync::mpsc::Receiver<SftpResponse>>,
+    /// 本地当前目录
+    pub local_current_dir: String,
+    /// 本地目录文件列表
+    pub local_files: Vec<FileEntry>,
+    /// 远程当前目录
+    pub remote_current_dir: String,
+    /// 远程目录文件列表
+    pub remote_files: Vec<FileEntry>,
+    /// 本地选中的文件索引
+    pub local_selected: Option<usize>,
+    /// 远程选中的文件索引
+    pub remote_selected: Option<usize>,
+    /// 当前传输任务列表
+    pub transfer_tasks: Vec<TransferTask>,
+    /// SFTP 连接状态
+    pub sftp_connected: bool,
+    /// SFTP 操作状态消息
+    pub sftp_status_msg: String,
+    /// 远程目录输入框
+    pub remote_dir_input: String,
+    /// 本地目录输入框
+    pub local_dir_input: String,
+}
+
+impl SessionTab {
+    /// 创建新的会话标签
+    pub fn new(session_id: i64, name: String) -> Self {
+        let home = super::sftp::home_dir();
+        Self {
+            session_id,
+            name,
+            terminal: None,
+            input_tx: None,
+            output_rx: None,
+            connection_state: SessionState::Disconnected,
+            status_msg: "就绪".to_string(),
+            custom_font_size: None,
+            ime_active: false,
+            active_tab: SessionViewTab::Terminal,
+            sftp_tx: None,
+            sftp_rx: None,
+            local_current_dir: home.clone(),
+            local_files: Vec::new(),
+            remote_current_dir: String::new(),
+            remote_files: Vec::new(),
+            local_selected: None,
+            remote_selected: None,
+            transfer_tasks: Vec::new(),
+            sftp_connected: false,
+            sftp_status_msg: String::new(),
+            remote_dir_input: String::new(),
+            local_dir_input: home,
+        }
+    }
+
+    /// 是否有活跃连接（终端或 SFTP）
+    pub fn has_connection(&self) -> bool {
+        self.terminal.is_some() || self.sftp_connected || self.sftp_tx.is_some()
+    }
+
+    /// 断开终端连接
+    pub fn disconnect_terminal(&mut self) {
+        if let Some(tx) = &self.input_tx {
+            let _ = tx.send(SshInput::Disconnect);
+        }
+        self.terminal = None;
+        self.input_tx = None;
+        self.output_rx = None;
+        self.connection_state = SessionState::Disconnected;
+        self.status_msg = "终端已断开".to_string();
+        self.custom_font_size = None;
+    }
+
+    /// 断开 SFTP 连接
+    pub fn disconnect_sftp(&mut self) {
+        if let Some(tx) = &self.sftp_tx {
+            let _ = tx.send(SftpRequest::Disconnect);
+        }
+        self.sftp_tx = None;
+        self.sftp_rx = None;
+        self.sftp_connected = false;
+        self.remote_files.clear();
+        self.remote_current_dir.clear();
+        self.transfer_tasks.clear();
+        self.sftp_status_msg = "SFTP 已断开".to_string();
+    }
+
+    /// 断开所有连接
+    pub fn disconnect_all(&mut self) {
+        self.disconnect_terminal();
+        self.disconnect_sftp();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
