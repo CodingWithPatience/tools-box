@@ -1,6 +1,9 @@
 use egui::text::LayoutJob;
 use egui::{Color32, FontId, TextFormat};
 
+/// 默认滚动缓冲区大小
+const DEFAULT_SCROLLBACK_SIZE: usize = 10000;
+
 /// 终端仿真器（封装 vt100 解析器 + egui 渲染）
 pub struct TerminalEmulator {
     /// vt100 ANSI 解析器
@@ -11,17 +14,20 @@ pub struct TerminalEmulator {
     rows: u16,
     /// 字体大小
     font_size: f32,
+    /// 滚动缓冲区大小
+    scrollback_size: usize,
 }
 
 impl TerminalEmulator {
     /// 创建新的终端仿真器
     pub fn new(cols: u16, rows: u16, font_size: f32) -> Self {
-        let parser = vt100::Parser::new(rows, cols, 0);
+        let parser = vt100::Parser::new(rows, cols, DEFAULT_SCROLLBACK_SIZE);
         Self {
             parser,
             cols,
             rows,
             font_size,
+            scrollback_size: DEFAULT_SCROLLBACK_SIZE,
         }
     }
 
@@ -47,6 +53,38 @@ impl TerminalEmulator {
     /// 获取字体大小
     pub fn font_size(&self) -> f32 {
         self.font_size
+    }
+
+    /// 获取滚动缓冲区大小
+    pub fn scrollback_size(&self) -> usize {
+        self.scrollback_size
+    }
+
+    /// 获取当前滚动位置（0 表示在最底部）
+    pub fn scrollback(&self) -> usize {
+        let screen = self.parser.screen();
+        screen.scrollback()
+    }
+
+    /// 设置滚动位置
+    pub fn set_scrollback(&mut self, offset: usize) {
+        self.parser.set_scrollback(offset);
+    }
+
+    /// 获取可见行数（包括滚动缓冲区的行）
+    /// vt100 的 cell(row, col) 已通过 visible_cell 内部处理了滚动偏移
+    pub fn visible_rows(&self) -> usize {
+        let screen = self.parser.screen();
+        let (rows, _cols) = screen.size();
+        // 遍历可见行来获取实际行数
+        // visible_rows() 返回的迭代器包含滚动缓冲区的行和当前屏幕的行
+        let mut count = 0;
+        for row in 0..rows {
+            if screen.cell(row, 0).is_some() {
+                count += 1;
+            }
+        }
+        count
     }
 
     /// 调整字体大小
@@ -97,6 +135,13 @@ impl TerminalEmulator {
         let screen = self.parser.screen();
         // vt100 的 size() 返回 (rows, cols)
         let (current_rows, current_cols) = screen.size();
+        // 计算可见行数（包括滚动缓冲区）
+        let visible_rows = self.visible_rows();
+        let total_rows = if visible_rows > 0 {
+            visible_rows as u16
+        } else {
+            current_rows
+        };
 
         let default_fg = if is_dark_mode {
             Color32::from_rgb(0xd0, 0xd0, 0xd0)
@@ -112,7 +157,7 @@ impl TerminalEmulator {
         let mut job = LayoutJob::default();
         job.wrap.max_width = f32::INFINITY;
 
-        for row in 0..current_rows {
+        for row in 0..total_rows {
             // 构建当前行，不创建中间 LayoutJob，直接 append 到主 job
             for col in 0..current_cols {
                 match screen.cell(row, col) {
@@ -164,7 +209,7 @@ impl TerminalEmulator {
                 }
             }
             // 非最后一行追加换行符
-            if row < current_rows - 1 {
+            if row < total_rows - 1 {
                 job.append(
                     "\n",
                     0.0,

@@ -274,21 +274,42 @@ impl SshClientUi {
 
             // 在渲染前处理终端键盘输入，避免与 disconnect 按钮的借用冲突
             if self.active_tab == SessionViewTab::Terminal {
-                if let Some(tx) = self.input_tx.clone() {
-                    self.process_terminal_input(&tx, ui.ctx());
-                }
-                // 处理 Ctrl+滚轮调整终端字体大小
+                let had_input = if let Some(tx) = self.input_tx.clone() {
+                    self.process_terminal_input(&tx, ui.ctx())
+                } else {
+                    false
+                };
+                // 处理滚轮事件
                 let (ctrl_held, scroll_y) = ui.ctx().input(|i| {
                     (i.modifiers.ctrl, i.raw_scroll_delta.y)
                 });
                 // 使用 signum 确保各平台步进一致，避免触控板/滚轮差异
                 if ctrl_held && scroll_y != 0.0 {
+                    // Ctrl+滚轮调整终端字体大小
                     if let Some(term) = &mut self.terminal {
                         let delta = scroll_y.signum();
                         let current_size = self.custom_font_size.unwrap_or(global_font_size);
                         let new_size = (current_size + delta).clamp(8.0, 36.0);
                         self.custom_font_size = Some(new_size);
                         term.set_font_size(new_size);
+                    }
+                } else if scroll_y != 0.0 {
+                    // 滚轮滚动终端历史
+                    if let Some(term) = &mut self.terminal {
+                        let scrollback = term.scrollback();
+                        let scrollback_size = term.scrollback_size();
+                        if scroll_y > 0.0 && scrollback < scrollback_size {
+                            // 向上滚动
+                            term.set_scrollback(scrollback + 1);
+                        } else if scroll_y < 0.0 && scrollback > 0 {
+                            // 向下滚动
+                            term.set_scrollback(scrollback - 1);
+                        }
+                    }
+                } else if had_input {
+                    // 有键盘输入时，自动滚动到光标位置
+                    if let Some(term) = &mut self.terminal {
+                        term.set_scrollback(0);
                     }
                 } else if let Some(term) = &mut self.terminal {
                     // 同步全局字体大小（用户未自定义且大小变化时）
@@ -567,72 +588,78 @@ impl SshClientUi {
             }
         }
 
-        // 渲染终端内容
-        egui::ScrollArea::both()
-            .id_salt("ssh_terminal_scroll")
-            .show(ui, |ui| {
-                let bg_color = if is_dark_mode {
-                    Color32::from_rgb(0x1e, 0x1e, 0x1e)
-                } else {
-                    Color32::from_rgb(0xff, 0xff, 0xff)
-                };
-                ui.painter().rect_filled(ui.max_rect(), 0.0, bg_color);
+        // 渲染终端内容（不使用 ScrollArea，直接用滚轮控制终端滚动）
+        let bg_color = if is_dark_mode {
+            Color32::from_rgb(0x1e, 0x1e, 0x1e)
+        } else {
+            Color32::from_rgb(0xff, 0xff, 0xff)
+        };
 
-                if let Some(term) = &mut self.terminal {
-                    let job = term.render_to_layout_job(is_dark_mode);
-                    let content_w = f32::from(new_cols) * char_width + 20.0;
-                    let content_h = f32::from(new_rows) * line_height;
-                    ui.set_min_width(content_w);
-                    ui.set_min_height(content_h);
+        // 获取当前可用区域（不覆盖标题）
+        let available_rect = ui.available_rect_before_wrap();
+        ui.painter().rect_filled(available_rect, 0.0, bg_color);
 
-                    let response = ui.label(job);
-                    let text_rect = response.rect;
+        if let Some(term) = &mut self.terminal {
+            let job = term.render_to_layout_job(is_dark_mode);
+            let content_w = f32::from(new_cols) * char_width + 20.0;
+            ui.set_min_width(content_w);
+            ui.set_min_height(available_height);
 
-                    // 绘制闪烁光标
-                    let (c_col, c_row) = term.cursor_position();
-                    let cursor_w = term.cursor_char_width();
-                    let time = ui.ctx().input(|i| i.time);
-                    let blink_on = (time * 2.0) as u64 % 2 == 0;
-                    let cursor_x = text_rect.left() + f32::from(c_col) * char_width;
-                    let cursor_y = text_rect.top() + f32::from(c_row) * line_height;
-                    let cursor_width = char_width * f32::from(cursor_w);
-                    if blink_on {
-                        let cursor_color = if is_dark_mode {
-                            Color32::from_rgb(0xd0, 0xd0, 0xd0)
-                        } else {
-                            Color32::from_rgb(0x30, 0x30, 0x30)
-                        };
-                        ui.painter().rect_filled(
-                            egui::Rect::from_min_size(
-                                egui::pos2(cursor_x, cursor_y),
-                                egui::vec2(cursor_width, line_height),
-                            ),
-                            0.0,
-                            cursor_color,
-                        );
-                    }
+            let response = ui.label(job);
+            let text_rect = response.rect;
 
-                    // 设置 IME 输出位置
-                    let cursor_rect = egui::Rect::from_min_size(
-                        egui::pos2(cursor_x, cursor_y),
-                        egui::vec2(cursor_width, line_height),
+            // 绘制闪烁光标（考虑滚动偏移）
+            let (c_col, c_row) = term.cursor_position();
+            let scrollback = term.scrollback();
+            let cursor_w = term.cursor_char_width();
+            let cursor_x = text_rect.left() + f32::from(c_col) * char_width;
+            // 光标位置需要考虑滚动偏移
+            let cursor_y = text_rect.top() + f32::from(c_row + scrollback as u16) * line_height;
+            let cursor_width = char_width * f32::from(cursor_w);
+
+            // 只有光标在可视区域内才显示
+            let cursor_in_view = cursor_y >= text_rect.top()
+                && cursor_y + line_height <= text_rect.bottom();
+            if cursor_in_view {
+                let time = ui.ctx().input(|i| i.time);
+                let blink_on = (time * 2.0) as u64 % 2 == 0;
+                if blink_on {
+                    let cursor_color = if is_dark_mode {
+                        Color32::from_rgb(0xd0, 0xd0, 0xd0)
+                    } else {
+                        Color32::from_rgb(0x30, 0x30, 0x30)
+                    };
+                    ui.painter().rect_filled(
+                        egui::Rect::from_min_size(
+                            egui::pos2(cursor_x, cursor_y),
+                            egui::vec2(cursor_width, line_height),
+                        ),
+                        0.0,
+                        cursor_color,
                     );
-                    let to_global = ui
-                        .ctx()
-                        .layer_transform_to_global(ui.layer_id())
-                        .unwrap_or_default();
-                    ui.ctx().output_mut(|o| {
-                        o.ime = Some(egui::output::IMEOutput {
-                            rect: to_global * text_rect,
-                            cursor_rect: to_global * cursor_rect,
-                        });
-                    });
-                } else if self.connection_state == SessionState::Connecting {
-                    ui.centered_and_justified(|ui| {
-                        ui.label("正在连接...");
-                    });
                 }
+            }
+
+            // 设置 IME 输出位置
+            let cursor_rect = egui::Rect::from_min_size(
+                egui::pos2(cursor_x, cursor_y),
+                egui::vec2(cursor_width, line_height),
+            );
+            let to_global = ui
+                .ctx()
+                .layer_transform_to_global(ui.layer_id())
+                .unwrap_or_default();
+            ui.ctx().output_mut(|o| {
+                o.ime = Some(egui::output::IMEOutput {
+                    rect: to_global * text_rect,
+                    cursor_rect: to_global * cursor_rect,
+                });
             });
+        } else if self.connection_state == SessionState::Connecting {
+            ui.centered_and_justified(|ui| {
+                ui.label("正在连接...");
+            });
+        }
 
         // 底部状态栏
         let cursor_pos = self
@@ -943,7 +970,8 @@ impl SshClientUi {
     // 终端键盘输入处理
     // ===================================================================
 
-    fn process_terminal_input(&mut self, tx: &mpsc::SyncSender<SshInput>, ctx: &egui::Context) {
+    fn process_terminal_input(&mut self, tx: &mpsc::SyncSender<SshInput>, ctx: &egui::Context) -> bool {
+        let mut had_input = false;
         ctx.input_mut(|i| {
             for event in i.events.clone() {
                 match event {
@@ -959,61 +987,73 @@ impl SshClientUi {
                         if key == egui::Key::C && modifiers.ctrl {
                             let _ = tx.send(SshInput::KeyInput(vec![0x03]));
                             i.consume_key(modifiers, key);
+                            had_input = true;
                             continue;
                         }
                         if key == egui::Key::D && modifiers.ctrl {
                             let _ = tx.send(SshInput::KeyInput(vec![0x04]));
                             i.consume_key(modifiers, key);
+                            had_input = true;
                             continue;
                         }
                         if key == egui::Key::Z && modifiers.ctrl {
                             let _ = tx.send(SshInput::KeyInput(vec![0x1a]));
                             i.consume_key(modifiers, key);
+                            had_input = true;
                             continue;
                         }
                         if key == egui::Key::L && modifiers.ctrl {
                             let _ = tx.send(SshInput::KeyInput(vec![0x0c]));
                             i.consume_key(modifiers, key);
+                            had_input = true;
                             continue;
                         }
                         if key == egui::Key::Enter {
                             let _ = tx.send(SshInput::KeyInput(vec![0x0d]));
                             i.consume_key(modifiers, key);
+                            had_input = true;
                             continue;
                         }
                         if key == egui::Key::Backspace {
                             let _ = tx.send(SshInput::KeyInput(vec![0x7f]));
                             i.consume_key(modifiers, key);
+                            had_input = true;
                             continue;
                         }
                         if key == egui::Key::Tab {
                             let _ = tx.send(SshInput::KeyInput(vec![0x09]));
                             i.consume_key(modifiers, key);
+                            had_input = true;
                             continue;
                         }
                         if key == egui::Key::Escape {
                             let _ = tx.send(SshInput::KeyInput(vec![0x1b]));
                             i.consume_key(modifiers, key);
+                            had_input = true;
                             continue;
                         }
                         if key == egui::Key::ArrowUp {
                             let _ = tx.send(SshInput::KeyInput(b"\x1b[A".to_vec()));
                             i.consume_key(modifiers, key);
+                            had_input = true;
                             continue;
                         }
                         if key == egui::Key::ArrowDown {
                             let _ = tx.send(SshInput::KeyInput(b"\x1b[B".to_vec()));
                             i.consume_key(modifiers, key);
+                            had_input = true;
                             continue;
                         }
                         if key == egui::Key::ArrowRight {
                             let _ = tx.send(SshInput::KeyInput(b"\x1b[C".to_vec()));
                             i.consume_key(modifiers, key);
+                            had_input = true;
                             continue;
                         }
                         if key == egui::Key::ArrowLeft {
                             let _ = tx.send(SshInput::KeyInput(b"\x1b[D".to_vec()));
                             i.consume_key(modifiers, key);
+                            had_input = true;
                             continue;
                         }
                     }
@@ -1025,6 +1065,7 @@ impl SshClientUi {
                             continue;
                         }
                         let _ = tx.send(SshInput::KeyInput(text.as_bytes().to_vec()));
+                        had_input = true;
                     }
                     egui::Event::Ime(ime_event) => {
                         match ime_event {
@@ -1037,6 +1078,7 @@ impl SshClientUi {
                             egui::ImeEvent::Commit(text) => {
                                 if !text.is_empty() {
                                     let _ = tx.send(SshInput::KeyInput(text.as_bytes().to_vec()));
+                                    had_input = true;
                                 }
                             }
                             egui::ImeEvent::Preedit(_) => {}
@@ -1061,6 +1103,8 @@ impl SshClientUi {
                 },
             );
         });
+
+        had_input
     }
 
     // ===================================================================
