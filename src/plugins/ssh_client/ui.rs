@@ -43,6 +43,8 @@ pub struct SshClientUi {
     output_rx: Option<mpsc::Receiver<SshOutput>>,
     connected_session_idx: Option<usize>,
     ime_active: bool,
+    /// 用户自定义字体大小（None 表示使用全局字体大小）
+    custom_font_size: Option<f32>,
 
     // ===== SFTP 相关 =====
     /// 当前活动的 Tab 页
@@ -95,6 +97,7 @@ impl SshClientUi {
             output_rx: None,
             connected_session_idx: None,
             ime_active: false,
+            custom_font_size: None,
             active_tab: SessionViewTab::Terminal,
             sftp_tx: None,
             sftp_rx: None,
@@ -175,6 +178,7 @@ impl SshClientUi {
         self.output_rx = None;
         self.connection_state = SessionState::Disconnected;
         self.status_msg = "终端已断开".to_string();
+        self.custom_font_size = None;
         // 如果 SFTP 仍连接，切换到 SFTP tab；否则清除会话索引
         if self.sftp_connected || self.sftp_tx.is_some() {
             self.active_tab = SessionViewTab::Sftp;
@@ -192,6 +196,7 @@ impl SshClientUi {
         self.connection_state = SessionState::Disconnected;
         self.status_msg = "已断开连接".to_string();
         self.active_tab = SessionViewTab::Terminal;
+        self.custom_font_size = None;
     }
 
     /// 刷新本地文件列表
@@ -259,6 +264,14 @@ impl SshClientUi {
         self.poll_sftp_output();
 
         if self.is_terminal_view() {
+            // 获取全局字体大小
+            let global_font_size = ui
+                .style()
+                .text_styles
+                .get(&egui::TextStyle::Monospace)
+                .map(|f| f.size)
+                .unwrap_or(14.0);
+
             // 在渲染前处理终端键盘输入，避免与 disconnect 按钮的借用冲突
             if self.active_tab == SessionViewTab::Terminal {
                 if let Some(tx) = self.input_tx.clone() {
@@ -272,9 +285,15 @@ impl SshClientUi {
                 if ctrl_held && scroll_y != 0.0 {
                     if let Some(term) = &mut self.terminal {
                         let delta = scroll_y.signum();
-                        let current_size = term.font_size();
+                        let current_size = self.custom_font_size.unwrap_or(global_font_size);
                         let new_size = (current_size + delta).clamp(8.0, 36.0);
+                        self.custom_font_size = Some(new_size);
                         term.set_font_size(new_size);
+                    }
+                } else if let Some(term) = &mut self.terminal {
+                    // 同步全局字体大小（用户未自定义且大小变化时）
+                    if self.custom_font_size.is_none() && term.font_size() != global_font_size {
+                        term.set_font_size(global_font_size);
                     }
                 }
             }
@@ -1419,6 +1438,7 @@ impl SshClientUi {
                         self.input_tx = Some(tx);
                         self.output_rx = Some(rx);
                         self.connected_session_idx = Some(idx);
+                        self.custom_font_size = None;
                         self.terminal = Some(TerminalEmulator::new(
                             est_cols,
                             est_rows,
