@@ -328,13 +328,14 @@ impl DiffViewerUi {
         let dim_color = Color32::from_rgb(128, 128, 128);
 
         ui.vertical(|ui| {
-            let row_height = ui.text_style_height(&egui::TextStyle::Monospace) + 4.0;
             let font_size = ui
                 .style()
                 .text_styles
                 .get(&egui::TextStyle::Monospace)
-                .map(|font_id| font_id.size)
+                .map(|f| f.size)
                 .unwrap_or(14.0);
+            let font_id = egui::FontId::monospace(font_size);
+            let row_height = ui.fonts(|f| f.row_height(&font_id)) + 4.0;
             let syntax_name = self.get_syntax_name();
             let is_dark_mode = ui.visuals().dark_mode;
             let text_color = ui.visuals().text_color();
@@ -430,7 +431,7 @@ impl DiffViewerUi {
                                         );
                                         ui.allocate_ui_with_layout(
                                             egui::vec2(col_width - gutter_w, row_height),
-                                            egui::Layout::left_to_right(egui::Align::Min),
+                                            egui::Layout::left_to_right(egui::Align::Center),
                                             |ui| {
                                                 self.render_cell(
                                                     ui, line, true, row_height, font_size,
@@ -529,7 +530,7 @@ impl DiffViewerUi {
                                         );
                                         ui.allocate_ui_with_layout(
                                             egui::vec2(col_width - gutter_w, row_height),
-                                            egui::Layout::left_to_right(egui::Align::Min),
+                                            egui::Layout::left_to_right(egui::Align::Center),
                                             |ui| {
                                                 self.render_cell(
                                                     ui, line, false, row_height, font_size,
@@ -621,14 +622,19 @@ impl DiffViewerUi {
                 ui.label(job);
             } else if !segments.is_empty() && !is_whole_line_change {
                 // 有字符级差异的行（修改行）：在行级背景色基础上叠加字符级背景色
-                let job = self.create_highlighted_diff_layout(
+                let mut job = LayoutJob::default();
+                job.wrap.max_width = f32::INFINITY;
+                let (added_bg, removed_bg) = Self::diff_background_colors(is_dark_mode);
+                self.append_diff_segments_to_job(
+                    &mut job,
                     text,
                     segments,
                     syntax_name.as_deref(),
                     font_size,
                     is_dark_mode,
                     text_color,
-                    diff_type,
+                    added_bg,
+                    removed_bg,
                 );
                 ui.label(job);
             } else {
@@ -664,11 +670,23 @@ impl DiffViewerUi {
         }
     }
 
-    /// 向已有的 LayoutJob 追加差异内容（带语法高亮和差异背景）
-    ///
-    /// 对整行文本进行语法高亮，然后根据差异片段的边界分割，
-    /// 为 Added/Removed 类型的片段添加浅色背景。
-    fn append_highlighted_diff_to_job(
+    /// 计算差异背景色（深色/浅色主题）
+    fn diff_background_colors(is_dark_mode: bool) -> (Color32, Color32) {
+        if is_dark_mode {
+            (
+                Color32::from_rgba_premultiplied(53, 110, 53, 200),
+                Color32::from_rgba_premultiplied(110, 53, 53, 200),
+            )
+        } else {
+            (
+                Color32::from_rgba_premultiplied(171, 242, 188, 220),
+                Color32::from_rgba_premultiplied(255, 193, 192, 220),
+            )
+        }
+    }
+
+    /// 向 LayoutJob 追加差异片段（带语法高亮和字符级背景色）
+    fn append_diff_segments_to_job(
         &self,
         job: &mut LayoutJob,
         full_text: &str,
@@ -677,29 +695,14 @@ impl DiffViewerUi {
         font_size: f32,
         is_dark_mode: bool,
         text_color: Color32,
+        added_bg: Color32,
+        removed_bg: Color32,
     ) {
-        // 参考 VS Code / GitHub 的 diff 背景色方案
-        let (added_bg, removed_bg) = if is_dark_mode {
-            // 深色主题：深红/深绿背景
-            (
-                Color32::from_rgba_premultiplied(53, 110, 53, 200),
-                Color32::from_rgba_premultiplied(110, 53, 53, 200),
-            )
-        } else {
-            // 浅色主题：字符级背景色（比行级背景色更深，GitHub 风格）
-            (
-                Color32::from_rgba_premultiplied(171, 242, 188, 220),
-                Color32::from_rgba_premultiplied(255, 193, 192, 220),
-            )
-        };
-
         if syntax_name.is_some() {
-            // 获取整行的语法高亮结果
             let highlighted = self.highlighter.highlight_line(
                 full_text, syntax_name, font_size, is_dark_mode,
             );
 
-            // 构建字符位置到语法高亮颜色的映射
             let mut char_colors: Vec<Color32> = Vec::new();
             for (color, text) in &highlighted {
                 for _ in text.chars() {
@@ -707,7 +710,6 @@ impl DiffViewerUi {
                 }
             }
 
-            // 遍历差异片段，根据字符位置应用语法高亮颜色和差异背景
             let mut char_offset = 0;
             for segment in segments {
                 let seg_len = segment.text.chars().count();
@@ -717,7 +719,6 @@ impl DiffViewerUi {
                     DiffType::Equal => Color32::TRANSPARENT,
                 };
 
-                // 为片段中的每个字符获取语法高亮颜色
                 let mut seg_text = String::new();
                 let mut current_color = None;
                 for (i, ch) in segment.text.chars().enumerate() {
@@ -728,7 +729,6 @@ impl DiffViewerUi {
                         text_color
                     };
 
-                    // 尝试合并相邻的同色字符以减少 TextFormat 数量
                     if Some(color) != current_color {
                         if !seg_text.is_empty() {
                             job.append(
@@ -747,7 +747,6 @@ impl DiffViewerUi {
                     seg_text.push(ch);
                 }
 
-                // 输出剩余的文本
                 if !seg_text.is_empty() {
                     job.append(
                         &seg_text, 0.0,
@@ -763,7 +762,6 @@ impl DiffViewerUi {
                 char_offset += seg_len;
             }
         } else {
-            // 无语法高亮时，直接使用差异片段
             for segment in segments {
                 let color = match segment.diff_type {
                     DiffType::Equal => text_color,
@@ -786,24 +784,6 @@ impl DiffViewerUi {
                 );
             }
         }
-    }
-
-    fn create_highlighted_diff_layout(
-        &self,
-        full_text: &str,
-        segments: &[TextSegment],
-        syntax_name: Option<&str>,
-        font_size: f32,
-        is_dark_mode: bool,
-        text_color: Color32,
-        _diff_type: &DiffType,
-    ) -> LayoutJob {
-        let mut job = LayoutJob::default();
-        job.wrap.max_width = f32::INFINITY;
-        self.append_highlighted_diff_to_job(
-            &mut job, full_text, segments, syntax_name, font_size, is_dark_mode, text_color,
-        );
-        job
     }
 
     // ===================================================================
@@ -853,13 +833,14 @@ impl DiffViewerUi {
             });
 
         ui.vertical(|ui| {
-            let row_height = ui.text_style_height(&egui::TextStyle::Monospace) + 4.0;
             let font_size = ui
                 .style()
                 .text_styles
                 .get(&egui::TextStyle::Monospace)
-                .map(|font_id| font_id.size)
+                .map(|f| f.size)
                 .unwrap_or(14.0);
+            let font_id = egui::FontId::monospace(font_size);
+            let row_height = ui.fonts(|f| f.row_height(&font_id)) + 4.0;
             let syntax_name = self.get_syntax_name();
 
             let max_left_num = result.unified_lines.iter().filter_map(|l| l.line_number_left).max().unwrap_or(1);
@@ -958,7 +939,7 @@ impl DiffViewerUi {
                                 // 渲染内容区域（不再添加 prefix，因为行号区域已有 symbol）
                                 ui.allocate_ui_with_layout(
                                     egui::vec2(ui.available_width(), row_height),
-                                    egui::Layout::left_to_right(egui::Align::Min),
+                                    egui::Layout::left_to_right(egui::Align::Center),
                                     |ui| {
                                         if line.diff_type == DiffType::Equal && syntax_name.is_some() {
                                             // 相同行使用语法高亮（带缓存）
@@ -972,10 +953,11 @@ impl DiffViewerUi {
                                             ui.label(job);
                                         } else if !is_whole_line_change && !line.segments.is_empty() {
                                             // 修改行：行级背景色 + 字符级背景色
+                                            // 使用 TextFormat.background 绘制字符级背景
                                             let mut job = LayoutJob::default();
                                             job.wrap.max_width = f32::INFINITY;
-                                            // 添加差异内容（带语法高亮和字符级差异背景）
-                                            self.append_highlighted_diff_to_job(
+                                            let (added_bg, removed_bg) = Self::diff_background_colors(is_dark_mode);
+                                            self.append_diff_segments_to_job(
                                                 &mut job,
                                                 &line.content,
                                                 &line.segments,
@@ -983,6 +965,8 @@ impl DiffViewerUi {
                                                 font_size,
                                                 is_dark_mode,
                                                 text_color,
+                                                added_bg,
+                                                removed_bg,
                                             );
                                             ui.label(job);
                                         } else {
