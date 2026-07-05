@@ -436,9 +436,11 @@ impl DiffViewerUi {
                                             Some(n) => format!("{:>w$}", n, w = num_digits),
                                             None => " ".repeat(num_digits),
                                         };
-                                        // 绘制整行背景色（覆盖整行）
+                                        // 绘制整行背景色（覆盖整个可见区域，包括横向滚动后的内容）
                                         if line_bg != Color32::TRANSPARENT {
-                                            let rect = ui.max_rect();
+                                            let mut rect = ui.max_rect();
+                                            // 扩展宽度以覆盖横向滚动后的内容
+                                            rect.set_width(rect.width().max(2000.0));
                                             ui.painter().rect_filled(rect, 0.0, line_bg);
                                         }
                                         // 绘制行号背景
@@ -543,9 +545,11 @@ impl DiffViewerUi {
                                             Some(n) => format!("{:>w$}", n, w = num_digits),
                                             None => " ".repeat(num_digits),
                                         };
-                                        // 绘制整行背景色（覆盖整行）
+                                        // 绘制整行背景色（覆盖整个可见区域，包括横向滚动后的内容）
                                         if line_bg != Color32::TRANSPARENT {
-                                            let rect = ui.max_rect();
+                                            let mut rect = ui.max_rect();
+                                            // 扩展宽度以覆盖横向滚动后的内容
+                                            rect.set_width(rect.width().max(2000.0));
                                             ui.painter().rect_filled(rect, 0.0, line_bg);
                                         }
                                         // 绘制行号背景
@@ -955,10 +959,13 @@ impl DiffViewerUi {
                             egui::vec2(ui.available_width(), row_height),
                             egui::Layout::left_to_right(egui::Align::Min),
                             |ui| {
-                                // 绘制整行背景色
+                                // 绘制整行背景色（覆盖整个可见区域，包括横向滚动后的内容）
                                 let max_rect = ui.max_rect();
                                 if line_bg != Color32::TRANSPARENT {
-                                    ui.painter().rect_filled(max_rect, 0.0, line_bg);
+                                    // 扩展宽度以覆盖横向滚动后的内容
+                                    let mut bg_rect = max_rect;
+                                    bg_rect.set_width(bg_rect.width().max(2000.0));
+                                    ui.painter().rect_filled(bg_rect, 0.0, line_bg);
                                 }
 
                                 // 绘制行号背景（使用 max_rect 确保与行级背景对齐）
