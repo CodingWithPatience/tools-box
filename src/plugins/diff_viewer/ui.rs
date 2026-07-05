@@ -54,14 +54,22 @@ pub struct DiffViewerUi {
     right_highlight_cache: HighlightCache,
     /// Unified 视图行级高亮缓存
     unified_line_cache: LineHighlightCache,
-    /// 上一帧左面板的滚动偏移量
+    /// 上一帧左面板的纵向滚动偏移量
     last_left_offset: Cell<f32>,
-    /// 上一帧右面板的滚动偏移量
+    /// 上一帧右面板的纵向滚动偏移量
     last_right_offset: Cell<f32>,
-    /// 待同步到左面板的偏移量（右面板被用户滚动时设置）
+    /// 待同步到左面板的纵向偏移量（右面板被用户滚动时设置）
     pending_sync_left: Cell<Option<f32>>,
-    /// 待同步到右面板的偏移量（左面板被用户滚动时设置）
+    /// 待同步到右面板的纵向偏移量（左面板被用户滚动时设置）
     pending_sync_right: Cell<Option<f32>>,
+    /// 上一帧左面板的横向滚动偏移量
+    last_left_offset_x: Cell<f32>,
+    /// 上一帧右面板的横向滚动偏移量
+    last_right_offset_x: Cell<f32>,
+    /// 待同步到左面板的横向偏移量（右面板被用户滚动时设置）
+    pending_sync_left_x: Cell<Option<f32>>,
+    /// 待同步到右面板的横向偏移量（左面板被用户滚动时设置）
+    pending_sync_right_x: Cell<Option<f32>>,
 }
 
 impl DiffViewerUi {
@@ -83,6 +91,10 @@ impl DiffViewerUi {
             last_right_offset: Cell::new(0.0),
             pending_sync_left: Cell::new(None),
             pending_sync_right: Cell::new(None),
+            last_left_offset_x: Cell::new(0.0),
+            last_right_offset_x: Cell::new(0.0),
+            pending_sync_left_x: Cell::new(None),
+            pending_sync_right_x: Cell::new(None),
         }
     }
 
@@ -352,19 +364,26 @@ impl DiffViewerUi {
             // 读取上一帧的待同步偏移量
             let sync_left = self.pending_sync_left.get();
             let sync_right = self.pending_sync_right.get();
+            let sync_left_x = self.pending_sync_left_x.get();
+            let sync_right_x = self.pending_sync_right_x.get();
 
             // 清除 pending，准备为当前帧设置新的同步
             self.pending_sync_left.set(None);
             self.pending_sync_right.set(None);
+            self.pending_sync_left_x.set(None);
+            self.pending_sync_right_x.set(None);
 
             // 用于记录当前帧的面板偏移量
             let left_current_offset: Cell<f32> = Cell::new(0.0);
             let right_current_offset: Cell<f32> = Cell::new(0.0);
+            let left_current_offset_x: Cell<f32> = Cell::new(0.0);
+            let right_current_offset_x: Cell<f32> = Cell::new(0.0);
             // 记录面板是否可滚动（内容高度超过视口高度）
             let left_scrollable: Cell<bool> = Cell::new(false);
             let right_scrollable: Cell<bool> = Cell::new(false);
             // 标记是否因同步而应用了偏移（用于 ignoreChange 模式）
             let left_sync_applied: Cell<bool> = Cell::new(false);
+            let left_sync_applied_x: Cell<bool> = Cell::new(false);
 
             ui.horizontal(|ui| {
                 // ===== 左面板（先渲染，获取滚动位置） =====
@@ -376,10 +395,15 @@ impl DiffViewerUi {
                         let mut scroll = egui::ScrollArea::both()
                             .id_salt("split_left")
                             .auto_shrink([false, false]);
-                        // 应用上一帧右面板的同步偏移量
+                        // 应用上一帧右面板的同步偏移量（纵向）
                         if let Some(offset_y) = sync_left {
                             scroll = scroll.vertical_scroll_offset(offset_y);
                             left_sync_applied.set(true);
+                        }
+                        // 应用上一帧右面板的同步偏移量（横向）
+                        if let Some(offset_x) = sync_left_x {
+                            scroll = scroll.horizontal_scroll_offset(offset_x);
+                            left_sync_applied_x.set(true);
                         }
                         let output = scroll.show(ui, |ui| {
                             // 消除行间距
@@ -448,14 +472,22 @@ impl DiffViewerUi {
                             }
                         });
                         left_current_offset.set(output.state.offset.y);
+                        left_current_offset_x.set(output.state.offset.x);
                         // 记录左面板是否可滚动（内容高度超过视口高度）
                         left_scrollable.set(output.content_size.y > output.inner_rect.height());
-                        // 检测左面板是否被用户滚动（排除同步导致的偏移变化）
+                        // 检测左面板纵向滚动变化
                         let left_changed = !left_sync_applied.get()
                             && (output.state.offset.y - self.last_left_offset.get()).abs() > 0.5;
                         if left_changed {
                             // 用户滚动左面板 → 下一帧同步右面板
                             self.pending_sync_right.set(Some(output.state.offset.y));
+                        }
+                        // 检测左面板横向滚动变化
+                        let left_changed_x = !left_sync_applied_x.get()
+                            && (output.state.offset.x - self.last_left_offset_x.get()).abs() > 0.5;
+                        if left_changed_x {
+                            // 用户滚动左面板 → 下一帧同步右面板
+                            self.pending_sync_right_x.set(Some(output.state.offset.x));
                         }
                     },
                 );
@@ -472,9 +504,13 @@ impl DiffViewerUi {
                             .id_salt("split_right")
                             .auto_shrink([false, false]);
                         // 统一延迟同步策略：两个方向都通过 pending 机制延迟一帧同步
-                        // 应用上一帧左面板的同步偏移量
+                        // 应用上一帧左面板的同步偏移量（纵向）
                         if let Some(offset_y) = sync_right {
                             scroll = scroll.vertical_scroll_offset(offset_y);
+                        }
+                        // 应用上一帧左面板的同步偏移量（横向）
+                        if let Some(offset_x) = sync_right_x {
+                            scroll = scroll.horizontal_scroll_offset(offset_x);
                         }
                         let output = scroll.show(ui, |ui| {
                             // 消除行间距
@@ -543,19 +579,27 @@ impl DiffViewerUi {
                             }
                         });
                         right_current_offset.set(output.state.offset.y);
+                        right_current_offset_x.set(output.state.offset.x);
                         // 记录右面板是否可滚动（内容高度超过视口高度）
                         right_scrollable.set(output.content_size.y > output.inner_rect.height());
-                        // 检测右面板是否被用户滚动（排除同步导致的偏移变化）
+                        // 检测右面板纵向滚动变化
                         let right_changed = sync_right.is_none()
                             && (output.state.offset.y - self.last_right_offset.get()).abs() > 0.5;
                         if right_changed {
                             // 用户滚动右面板 → 下一帧同步左面板
                             self.pending_sync_left.set(Some(output.state.offset.y));
                         }
+                        // 检测右面板横向滚动变化
+                        let right_changed_x = sync_right_x.is_none()
+                            && (output.state.offset.x - self.last_right_offset_x.get()).abs() > 0.5;
+                        if right_changed_x {
+                            // 用户滚动右面板 → 下一帧同步左面板
+                            self.pending_sync_left_x.set(Some(output.state.offset.x));
+                        }
                     },
                 );
             });
-            // 边界补正：当滚动到顶部时，强制另一边面板也对齐
+            // 纵向边界补正：当滚动到顶部时，强制另一边面板也对齐
             // 仅当两侧面板都可滚动时才触发补正，避免短内容面板误判
             let left_offset = left_current_offset.get();
             let right_offset = right_current_offset.get();
@@ -568,9 +612,21 @@ impl DiffViewerUi {
                 // 右面板在顶部，左面板不在顶部且可滚动 → 强制左面板到顶部
                 self.pending_sync_left.set(Some(0.0));
             }
+            // 横向边界补正：当滚动到最左侧时，强制另一边面板也对齐
+            let left_offset_x = left_current_offset_x.get();
+            let right_offset_x = right_current_offset_x.get();
+            let left_at_left = left_offset_x < 1.0;
+            let right_at_left = right_offset_x < 1.0;
+            if left_at_left && !right_at_left {
+                self.pending_sync_right_x.set(Some(0.0));
+            } else if right_at_left && !left_at_left {
+                self.pending_sync_left_x.set(Some(0.0));
+            }
             // 更新上一帧的偏移量
             self.last_left_offset.set(left_offset);
             self.last_right_offset.set(right_offset);
+            self.last_left_offset_x.set(left_offset_x);
+            self.last_right_offset_x.set(right_offset_x);
         });
     }
 
