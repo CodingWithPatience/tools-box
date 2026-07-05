@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 use egui::{Color32, RichText, text::LayoutJob};
@@ -36,6 +37,8 @@ const SUPPORTED_LANGUAGES: &[(&str, &str)] = &[
 ];
 
 type HighlightCache = RefCell<Option<(u64, LayoutJob)>>;
+/// 行级高亮缓存：key 是文本内容的 hash，value 是 LayoutJob
+type LineHighlightCache = RefCell<HashMap<u64, LayoutJob>>;
 
 pub struct DiffViewerUi {
     left_text: String,
@@ -49,6 +52,8 @@ pub struct DiffViewerUi {
     selected_language: String,
     left_highlight_cache: HighlightCache,
     right_highlight_cache: HighlightCache,
+    /// Unified 视图行级高亮缓存
+    unified_line_cache: LineHighlightCache,
     /// 上一帧左面板的滚动偏移量
     last_left_offset: Cell<f32>,
     /// 上一帧右面板的滚动偏移量
@@ -73,6 +78,7 @@ impl DiffViewerUi {
             selected_language: "自动检测".to_string(),
             left_highlight_cache: RefCell::new(None),
             right_highlight_cache: RefCell::new(None),
+            unified_line_cache: RefCell::new(HashMap::new()),
             last_left_offset: Cell::new(0.0),
             last_right_offset: Cell::new(0.0),
             pending_sync_left: Cell::new(None),
@@ -827,6 +833,7 @@ impl DiffViewerUi {
         let stats_height = ui.text_style_height(&text_style) + 16.0;
         let text_color = ui.visuals().text_color();
         let dim_color = Color32::from_rgb(128, 128, 128);
+        let is_dark_mode = ui.visuals().dark_mode;
 
         egui::TopBottomPanel::bottom("diff_unified_stats")
             .exact_height(stats_height)
@@ -854,11 +861,11 @@ impl DiffViewerUi {
                 .map(|font_id| font_id.size)
                 .unwrap_or(14.0);
             let syntax_name = self.get_syntax_name();
-            let is_dark_mode = ui.visuals().dark_mode;
 
             let max_left_num = result.unified_lines.iter().filter_map(|l| l.line_number_left).max().unwrap_or(1);
             let max_right_num = result.unified_lines.iter().filter_map(|l| l.line_number_right).max().unwrap_or(1);
             let num_digits = format!("{}", max_left_num.max(max_right_num)).len().max(3);
+            // 双行号 + 分隔符的宽度
             let gutter_w = ((num_digits * 2 + 4) as f32 * font_size * 0.6).max(80.0);
 
             let available_height = ui.available_height() - 10.0;
@@ -868,149 +875,152 @@ impl DiffViewerUi {
                 .id_salt("unified_scroll")
                 .max_height(available_height)
                 .show(ui, |ui| {
+                    // 消除行间距（参考 split 视图）
+                    ui.spacing_mut().item_spacing.y = 0.0;
+
                     for line in &result.unified_lines {
-                        ui.horizontal(|ui| {
-                            let left_num = match line.line_number_left {
-                                Some(n) => format!("{:>w$}", n, w = num_digits),
-                                None => " ".repeat(num_digits),
-                            };
-                            let right_num = match line.line_number_right {
-                                Some(n) => format!("{:>w$}", n, w = num_digits),
-                                None => " ".repeat(num_digits),
-                            };
-                            ui.add_sized(
-                                [gutter_w, row_height],
-                                egui::Label::new(
-                                    RichText::new(format!("{} {} │ ", left_num, right_num))
-                                        .monospace()
-                                        .color(dim_color),
-                                ),
-                            );
+                        // 计算行级背景色和行号背景色（GitHub 风格）
+                        let (line_bg, gutter_bg, symbol) = match line.diff_type {
+                            DiffType::Removed => {
+                                let (line_bg, gutter_bg) = if is_dark_mode {
+                                    (
+                                        Color32::from_rgba_premultiplied(61, 31, 35, 180),
+                                        Color32::from_rgba_premultiplied(80, 40, 45, 200),
+                                    )
+                                } else {
+                                    (
+                                        Color32::from_rgba_premultiplied(255, 235, 236, 220),
+                                        Color32::from_rgba_premultiplied(255, 210, 215, 230),
+                                    )
+                                };
+                                (line_bg, gutter_bg, "-")
+                            }
+                            DiffType::Added => {
+                                let (line_bg, gutter_bg) = if is_dark_mode {
+                                    (
+                                        Color32::from_rgba_premultiplied(31, 61, 38, 180),
+                                        Color32::from_rgba_premultiplied(40, 80, 50, 200),
+                                    )
+                                } else {
+                                    (
+                                        Color32::from_rgba_premultiplied(218, 251, 225, 220),
+                                        Color32::from_rgba_premultiplied(190, 245, 200, 230),
+                                    )
+                                };
+                                (line_bg, gutter_bg, "+")
+                            }
+                            DiffType::Equal => (Color32::TRANSPARENT, Color32::TRANSPARENT, " "),
+                        };
 
-                            let prefix = match line.diff_type {
-                                DiffType::Added => "+ ",
-                                DiffType::Removed => "- ",
-                                DiffType::Equal => "  ",
-                            };
+                        // 判断是否是整行删除/新增（无字符级差异）
+                        let is_whole_line_change = line.segments.is_empty()
+                            || (line.diff_type != DiffType::Equal
+                                && line.segments.iter().all(|s| s.diff_type != DiffType::Equal));
 
-                            ui.allocate_ui_with_layout(
-                                egui::vec2(ui.available_width(), row_height),
-                                egui::Layout::left_to_right(egui::Align::Min),
-                                |ui| {
-                                    if line.diff_type == DiffType::Equal && syntax_name.is_some() {
-                                        // 相同行使用语法高亮
-                                        let mut job = LayoutJob::default();
-                                        job.wrap.max_width = f32::INFINITY;
-                                        job.append(
-                                            prefix, 0.0,
-                                            egui::TextFormat {
-                                                font_id: egui::FontId::monospace(font_size),
-                                                color: dim_color,
-                                                ..Default::default()
-                                            },
-                                        );
-                                        let highlighted = self.highlighter.highlight_line(
-                                            &line.content, syntax_name.as_deref(), font_size, is_dark_mode,
-                                        );
-                                        for (color, t) in highlighted {
-                                            job.append(
-                                                &t, 0.0,
-                                                egui::TextFormat {
-                                                    font_id: egui::FontId::monospace(font_size),
-                                                    color,
-                                                    ..Default::default()
-                                                },
+                        // 使用 allocate_ui_with_layout 确保固定行高（参考 split 视图）
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(ui.available_width(), row_height),
+                            egui::Layout::left_to_right(egui::Align::Min),
+                            |ui| {
+                                // 绘制整行背景色
+                                let max_rect = ui.max_rect();
+                                if line_bg != Color32::TRANSPARENT {
+                                    ui.painter().rect_filled(max_rect, 0.0, line_bg);
+                                }
+
+                                // 绘制行号背景（使用 max_rect 确保与行级背景对齐）
+                                let gutter_rect = egui::Rect::from_min_size(
+                                    max_rect.left_top(),
+                                    egui::vec2(gutter_w, row_height),
+                                );
+                                if gutter_bg != Color32::TRANSPARENT {
+                                    ui.painter().rect_filled(gutter_rect, 0.0, gutter_bg);
+                                }
+
+                                // 渲染行号（双行号格式 + 符号）
+                                let left_num = match line.line_number_left {
+                                    Some(n) => format!("{:>w$}", n, w = num_digits),
+                                    None => " ".repeat(num_digits),
+                                };
+                                let right_num = match line.line_number_right {
+                                    Some(n) => format!("{:>w$}", n, w = num_digits),
+                                    None => " ".repeat(num_digits),
+                                };
+                                ui.add_sized(
+                                    [gutter_w, row_height],
+                                    egui::Label::new(
+                                        RichText::new(format!("{} {} {} ", left_num, right_num, symbol))
+                                            .monospace()
+                                            .color(dim_color),
+                                    ),
+                                );
+
+                                // 渲染内容区域（不再添加 prefix，因为行号区域已有 symbol）
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(ui.available_width(), row_height),
+                                    egui::Layout::left_to_right(egui::Align::Min),
+                                    |ui| {
+                                        if line.diff_type == DiffType::Equal && syntax_name.is_some() {
+                                            // 相同行使用语法高亮（带缓存）
+                                            let mut job = self.get_line_highlight_job(
+                                                &line.content,
+                                                syntax_name.as_deref(),
+                                                font_size,
+                                                is_dark_mode,
                                             );
-                                        }
-                                        ui.label(job);
-                                    } else if !line.segments.is_empty() {
-                                        // 有字符级差异的行：语法高亮 + 差异背景色
-                                        let mut job = LayoutJob::default();
-                                        job.wrap.max_width = f32::INFINITY;
-                                        // 添加前缀符号（使用 dim_color，不参与语法高亮）
-                                        job.append(
-                                            prefix, 0.0,
-                                            egui::TextFormat {
-                                                font_id: egui::FontId::monospace(font_size),
-                                                color: dim_color,
-                                                ..Default::default()
-                                            },
-                                        );
-                                        // 添加差异内容（带语法高亮和差异背景）
-                                        self.append_highlighted_diff_to_job(
-                                            &mut job,
-                                            &line.content,
-                                            &line.segments,
-                                            syntax_name.as_deref(),
-                                            font_size,
-                                            is_dark_mode,
-                                            text_color,
-                                        );
-                                        ui.label(job);
-                                    } else {
-                                        // 无字符级差异的行：语法高亮 + 整行差异背景色
-                                        let bg = if is_dark_mode {
-                                            match line.diff_type {
-                                                DiffType::Added => Color32::from_rgba_premultiplied(31, 60, 31, 180),
-                                                DiffType::Removed => Color32::from_rgba_premultiplied(60, 31, 31, 180),
-                                                DiffType::Equal => Color32::TRANSPARENT,
-                                            }
+                                            job.wrap.max_width = f32::INFINITY;
+                                            ui.label(job);
+                                        } else if !is_whole_line_change && !line.segments.is_empty() {
+                                            // 修改行：行级背景色 + 字符级背景色
+                                            let mut job = LayoutJob::default();
+                                            job.wrap.max_width = f32::INFINITY;
+                                            // 添加差异内容（带语法高亮和字符级差异背景）
+                                            self.append_highlighted_diff_to_job(
+                                                &mut job,
+                                                &line.content,
+                                                &line.segments,
+                                                syntax_name.as_deref(),
+                                                font_size,
+                                                is_dark_mode,
+                                                text_color,
+                                            );
+                                            ui.label(job);
                                         } else {
-                                            match line.diff_type {
-                                                DiffType::Added => Color32::from_rgba_premultiplied(200, 255, 200, 180),
-                                                DiffType::Removed => Color32::from_rgba_premultiplied(255, 200, 200, 180),
-                                                DiffType::Equal => Color32::TRANSPARENT,
-                                            }
-                                        };
-                                        let mut job = LayoutJob::default();
-                                        job.wrap.max_width = f32::INFINITY;
-                                        // 添加前缀符号
-                                        job.append(
-                                            prefix, 0.0,
-                                            egui::TextFormat {
-                                                font_id: egui::FontId::monospace(font_size),
-                                                color: dim_color,
-                                                ..Default::default()
-                                            },
-                                        );
-                                        if syntax_name.is_some() {
-                                            // 有语法高亮时，保留语法高亮颜色
-                                            let highlighted = self.highlighter.highlight_line(
-                                                &line.content, syntax_name.as_deref(), font_size, is_dark_mode,
-                                            );
-                                            for (color, t) in highlighted {
+                                            // 整行删除/新增：只有行级背景色，无字符级背景色
+                                            if syntax_name.is_some() {
+                                                // 有语法高亮时，保留语法高亮颜色，不添加字符级背景
+                                                let mut job = self.get_line_highlight_job(
+                                                    &line.content,
+                                                    syntax_name.as_deref(),
+                                                    font_size,
+                                                    is_dark_mode,
+                                                );
+                                                job.wrap.max_width = f32::INFINITY;
+                                                ui.label(job);
+                                            } else {
+                                                // 无语法高亮时，使用差异颜色
+                                                let color = match line.diff_type {
+                                                    DiffType::Added => Color32::from_rgb(0, 150, 0),
+                                                    DiffType::Removed => Color32::from_rgb(180, 0, 0),
+                                                    _ => text_color,
+                                                };
+                                                let mut job = LayoutJob::default();
+                                                job.wrap.max_width = f32::INFINITY;
                                                 job.append(
-                                                    &t, 0.0,
+                                                    &line.content, 0.0,
                                                     egui::TextFormat {
                                                         font_id: egui::FontId::monospace(font_size),
                                                         color,
-                                                        background: bg,
                                                         ..Default::default()
                                                     },
                                                 );
+                                                ui.label(job);
                                             }
-                                        } else {
-                                            // 无语法高亮时，使用默认颜色
-                                            let color = match line.diff_type {
-                                                DiffType::Added => Color32::from_rgb(0, 150, 0),
-                                                DiffType::Removed => Color32::from_rgb(180, 0, 0),
-                                                _ => text_color,
-                                            };
-                                            job.append(
-                                                &line.content, 0.0,
-                                                egui::TextFormat {
-                                                    font_id: egui::FontId::monospace(font_size),
-                                                    color,
-                                                    background: bg,
-                                                    ..Default::default()
-                                                },
-                                            );
                                         }
-                                        ui.label(job);
-                                    }
-                                },
-                            );
-                        });
+                                    },
+                                );
+                            },
+                        );
                     }
                 });
         });
@@ -1157,8 +1167,31 @@ impl DiffViewerUi {
         galley
     }
 
+    /// 获取行级语法高亮的 LayoutJob（带缓存）
+    ///
+    /// 用于 Unified 视图中每行的语法高亮，避免每帧重复计算。
+    fn get_line_highlight_job(
+        &self,
+        text: &str,
+        syntax_name: Option<&str>,
+        font_size: f32,
+        is_dark_mode: bool,
+    ) -> LayoutJob {
+        let hash = Self::compute_highlight_hash(text, &syntax_name.map(|s| s.to_string()), is_dark_mode, font_size);
+        let mut cache = self.unified_line_cache.borrow_mut();
+
+        if let Some(job) = cache.get(&hash) {
+            return job.clone();
+        }
+
+        let job = self.highlighter.highlight_to_layout_job(text, syntax_name, font_size, is_dark_mode);
+        cache.insert(hash, job.clone());
+        job
+    }
+
     fn clear_cache(&self) {
         self.left_highlight_cache.borrow_mut().take();
         self.right_highlight_cache.borrow_mut().take();
+        self.unified_line_cache.borrow_mut().clear();
     }
 }
