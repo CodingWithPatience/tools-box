@@ -11,6 +11,8 @@ enum UiState {
     RequireMasterPassword,
     /// 首次设置主密码
     SetMasterPassword,
+    /// 修改主密码
+    ChangeMasterPassword,
     /// 密码列表主界面
     MainList,
     /// 新增密码条目
@@ -21,14 +23,23 @@ enum UiState {
     Generator,
 }
 
+/// 导出格式选择弹窗状态
+#[derive(Debug, Clone, PartialEq)]
+enum ExportDialogState {
+    Closed,
+    SelectFormat,
+}
+
 /// 密码管理器 UI
 pub struct PasswordManagerUi {
     state: UiState,
     entries: Vec<EncryptedPasswordEntry>,
     search_query: String,
     master_password: String,
+    new_password: String,
     confirm_password: String,
     derived_key: Option<[u8; 32]>,
+    has_master_password: bool,
     form: PasswordForm,
     generator_config: GeneratorConfig,
     generated_password: String,
@@ -36,6 +47,8 @@ pub struct PasswordManagerUi {
     success_msg: Option<String>,
     /// 临时显示的密码 (id -> password)
     visible_passwords: std::collections::HashMap<i64, String>,
+    /// 导出弹窗状态
+    export_dialog: ExportDialogState,
 }
 
 impl PasswordManagerUi {
@@ -45,14 +58,17 @@ impl PasswordManagerUi {
             entries: Vec::new(),
             search_query: String::new(),
             master_password: String::new(),
+            new_password: String::new(),
             confirm_password: String::new(),
             derived_key: None,
+            has_master_password: false,
             form: PasswordForm::new(),
             generator_config: GeneratorConfig::default(),
             generated_password: String::new(),
             error_msg: None,
             success_msg: None,
             visible_passwords: std::collections::HashMap::new(),
+            export_dialog: ExportDialogState::Closed,
         }
     }
 
@@ -61,6 +77,7 @@ impl PasswordManagerUi {
         match self.state.clone() {
             UiState::RequireMasterPassword => self.render_require_password(ui, conn),
             UiState::SetMasterPassword => self.render_set_password(ui, conn),
+            UiState::ChangeMasterPassword => self.render_change_password(ui, conn),
             UiState::MainList => self.render_main_list(ui, conn),
             UiState::AddEntry => self.render_add_entry(ui, conn),
             UiState::EditEntry(id) => self.render_edit_entry(ui, conn, id),
@@ -98,43 +115,74 @@ impl PasswordManagerUi {
 
     /// 渲染主密码输入界面
     fn render_require_password(&mut self, ui: &mut egui::Ui, conn: &Connection) {
+        // 检查是否已设置主密码
+        self.check_master_password(conn);
+
         ui.heading("🔑 密码管理器");
         ui.separator();
 
-        ui.add_space(20.0);
-        ui.label("请输入主密码以访问密码库：");
-        ui.add_space(8.0);
+        if self.has_master_password {
+            ui.add_space(20.0);
+            ui.label("请输入主密码以访问密码库：");
+            ui.add_space(8.0);
 
-        ui.horizontal(|ui| {
-            ui.label("🔐");
-            let response = ui.add_sized(
-                [250.0, 24.0],
-                egui::TextEdit::singleline(&mut self.master_password)
-                    .password(true)
-                    .hint_text("输入主密码..."),
-            );
+            ui.horizontal(|ui| {
+                ui.label("🔐");
+                let response = ui.add_sized(
+                    [250.0, 24.0],
+                    egui::TextEdit::singleline(&mut self.master_password)
+                        .password(true)
+                        .hint_text("输入主密码..."),
+                );
 
-            // 回车提交
-            if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                // 回车提交
+                if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    self.try_unlock(conn);
+                }
+            });
+
+            ui.add_space(8.0);
+
+            if ui.button("🔓 解锁").clicked() {
                 self.try_unlock(conn);
             }
-        });
 
-        ui.add_space(8.0);
+            ui.add_space(16.0);
+            self.render_messages(ui);
 
-        if ui.button("🔓 解锁").clicked() {
-            self.try_unlock(conn);
+            ui.add_space(8.0);
+            ui.separator();
+            if ui.link("点击修改主密码").clicked() {
+                self.state = UiState::ChangeMasterPassword;
+                self.clear_messages();
+                self.master_password.clear();
+                self.new_password.clear();
+                self.confirm_password.clear();
+            }
+        } else {
+            ui.add_space(20.0);
+            ui.label("尚未设置主密码，请先设置主密码以保护您的密码库：");
+            ui.add_space(16.0);
+            self.render_messages(ui);
+
+            ui.add_space(8.0);
+            ui.separator();
+            if ui.link("首次使用？点击设置主密码").clicked() {
+                self.state = UiState::SetMasterPassword;
+                self.clear_messages();
+                self.master_password.clear();
+            }
         }
+    }
 
-        ui.add_space(16.0);
-        self.render_messages(ui);
-
-        ui.add_space(8.0);
-        ui.separator();
-        if ui.link("首次使用？点击设置主密码").clicked() {
-            self.state = UiState::SetMasterPassword;
-            self.clear_messages();
-            self.master_password.clear();
+    /// 检查主密码是否已设置
+    fn check_master_password(&mut self, conn: &Connection) {
+        let store = PasswordStore::new(conn);
+        match store.has_master_password() {
+            Ok(has) => self.has_master_password = has,
+            Err(e) => {
+                log::error!("检查主密码状态失败: {}", e);
+            }
         }
     }
 
@@ -181,7 +229,7 @@ impl PasswordManagerUi {
                 [200.0, 24.0],
                 egui::TextEdit::singleline(&mut self.master_password)
                     .password(true)
-                    .hint_text("输入主密码..."),
+                    .hint_text("输入主密码（至少 6 位）..."),
             );
         });
 
@@ -234,6 +282,7 @@ impl PasswordManagerUi {
         match store.setup_master_password(&self.master_password) {
             Ok(key) => {
                 self.derived_key = Some(key);
+                self.has_master_password = true;
                 self.state = UiState::MainList;
                 self.master_password.clear();
                 self.confirm_password.clear();
@@ -241,6 +290,114 @@ impl PasswordManagerUi {
             }
             Err(e) => {
                 self.set_error(format!("设置失败: {}", e));
+            }
+        }
+    }
+
+    /// 渲染修改主密码界面
+    fn render_change_password(&mut self, ui: &mut egui::Ui, conn: &Connection) {
+        ui.horizontal(|ui| {
+            ui.heading("🔑 修改主密码");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("← 返回").clicked() {
+                    self.state = UiState::RequireMasterPassword;
+                    self.clear_messages();
+                    self.master_password.clear();
+                    self.new_password.clear();
+                    self.confirm_password.clear();
+                }
+            });
+        });
+        ui.separator();
+
+        ui.add_space(10.0);
+        ui.label("请输入当前主密码和新密码：");
+        ui.add_space(8.0);
+
+        egui::Grid::new("change_password_form")
+            .num_columns(2)
+            .spacing([8.0, 8.0])
+            .show(ui, |ui| {
+                ui.label("🔐 当前密码：");
+                ui.add_sized(
+                    [200.0, 24.0],
+                    egui::TextEdit::singleline(&mut self.master_password)
+                        .password(true)
+                        .hint_text("输入当前主密码..."),
+                );
+                ui.end_row();
+
+                ui.label("🔐 新密码：");
+                ui.add_sized(
+                    [200.0, 24.0],
+                    egui::TextEdit::singleline(&mut self.new_password)
+                        .password(true)
+                        .hint_text("输入新主密码（至少 6 位）..."),
+                );
+                ui.end_row();
+
+                ui.label("🔐 确认：");
+                ui.add_sized(
+                    [200.0, 24.0],
+                    egui::TextEdit::singleline(&mut self.confirm_password)
+                        .password(true)
+                        .hint_text("再次输入新密码..."),
+                );
+                ui.end_row();
+            });
+
+        ui.add_space(8.0);
+
+        ui.horizontal(|ui| {
+            if ui.button("✓ 确认修改").clicked() {
+                self.change_master_password(conn);
+            }
+
+            if ui.button("← 返回").clicked() {
+                self.state = UiState::RequireMasterPassword;
+                self.clear_messages();
+                self.master_password.clear();
+                self.new_password.clear();
+                self.confirm_password.clear();
+            }
+        });
+
+        ui.add_space(8.0);
+        self.render_messages(ui);
+    }
+
+    /// 修改主密码
+    fn change_master_password(&mut self, conn: &Connection) {
+        self.clear_messages();
+
+        if self.master_password.is_empty() {
+            self.set_error("请输入当前主密码".to_string());
+            return;
+        }
+
+        if self.new_password.len() < 6 {
+            self.set_error("新密码长度至少 6 位".to_string());
+            return;
+        }
+
+        if self.new_password != self.confirm_password {
+            self.set_error("两次输入的新密码不一致".to_string());
+            return;
+        }
+
+        let store = PasswordStore::new(conn);
+        match store.change_master_password(&self.master_password, &self.new_password) {
+            Ok(key) => {
+                self.derived_key = Some(key);
+                self.state = UiState::MainList;
+                self.master_password.clear();
+                self.new_password.clear();
+                self.confirm_password.clear();
+                self.set_success("主密码修改成功！".to_string());
+                self.load_entries(conn);
+            }
+            Err(e) => {
+                self.set_error(format!("修改失败: {}", e));
             }
         }
     }
@@ -288,11 +445,11 @@ impl PasswordManagerUi {
 
             // 导出/导入按钮
             if ui.button("📤 导出").clicked() {
-                self.export_data(conn);
+                self.export_dialog = ExportDialogState::SelectFormat;
             }
 
             if ui.button("📥 导入").clicked() {
-                self.import_data(conn);
+                self.import_from_file(conn);
             }
 
             ui.separator();
@@ -326,6 +483,44 @@ impl PasswordManagerUi {
         ui.horizontal(|ui| {
             ui.label(format!("共 {} 条记录", self.entries.len()));
         });
+
+        // 导出格式选择弹窗
+        self.render_export_dialog(ui, conn);
+    }
+
+    /// 渲染导出格式选择弹窗
+    fn render_export_dialog(&mut self, ui: &mut egui::Ui, conn: &Connection) {
+        if self.export_dialog == ExportDialogState::Closed {
+            return;
+        }
+
+        egui::Window::new("选择导出格式")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ui.ctx(), |ui| {
+                ui.label("请选择导出文件格式：");
+                ui.add_space(8.0);
+
+                ui.horizontal(|ui| {
+                    if ui.button("📋 JSON 格式").clicked() {
+                        self.export_dialog = ExportDialogState::Closed;
+                        self.export_to_file(conn, ExportFormat::Json);
+                    }
+
+                    if ui.button("📊 CSV 格式").clicked() {
+                        self.export_dialog = ExportDialogState::Closed;
+                        self.export_to_file(conn, ExportFormat::Csv);
+                    }
+                });
+
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.button("取消").clicked() {
+                        self.export_dialog = ExportDialogState::Closed;
+                    }
+                });
+            });
     }
 
     /// 渲染密码表格（延迟解密版本）
@@ -339,7 +534,7 @@ impl PasswordManagerUi {
             .spacing([8.0, 4.0])
             .show(ui, |ui| {
                 // 表头
-                ui.strong("网站");
+                ui.strong("名称");
                 ui.strong("账号");
                 ui.strong("密码");
                 ui.strong("操作");
@@ -354,8 +549,8 @@ impl PasswordManagerUi {
                 }
 
                 for entry in &entries {
-                    // 网站
-                    ui.label(&entry.website);
+                    // 名称
+                    ui.label(&entry.name);
 
                     // 账号
                     ui.label(&entry.username);
@@ -496,7 +691,7 @@ impl PasswordManagerUi {
         self.clear_messages();
 
         if !self.form.is_valid() {
-            self.set_error("请填写网站、账号和密码".to_string());
+            self.set_error("请填写名称、账号和密码".to_string());
             return;
         }
 
@@ -561,7 +756,7 @@ impl PasswordManagerUi {
         self.clear_messages();
 
         if !self.form.is_valid() {
-            self.set_error("请填写网站、账号和密码".to_string());
+            self.set_error("请填写名称、账号和密码".to_string());
             return;
         }
 
@@ -569,7 +764,7 @@ impl PasswordManagerUi {
             let store = PasswordStore::new(conn);
             let entry = PasswordEntry {
                 id,
-                website: self.form.website.clone(),
+                name: self.form.name.clone(),
                 url: if self.form.url.is_empty() {
                     None
                 } else {
@@ -605,8 +800,8 @@ impl PasswordManagerUi {
             .num_columns(2)
             .spacing([8.0, 8.0])
             .show(ui, |ui| {
-                ui.label("网站 *");
-                ui.text_edit_singleline(&mut self.form.website);
+                ui.label("名称 *");
+                ui.text_edit_singleline(&mut self.form.name);
                 ui.end_row();
 
                 ui.label("网址");
@@ -714,61 +909,107 @@ impl PasswordManagerUi {
         self.render_messages(ui);
     }
 
-    /// 导出密码数据
-    fn export_data(&mut self, conn: &Connection) {
+    /// 导出密码数据到文件
+    fn export_to_file(&mut self, conn: &Connection, format: ExportFormat) {
         self.clear_messages();
 
-        if let Some(key) = &self.derived_key {
-            let store = PasswordStore::new(conn);
-            match store.export_entries(key) {
-                Ok(json) => {
-                    // 复制到剪贴板
-                    self.copy_to_clipboard(&json);
-                    self.set_success(format!(
-                        "已导出 {} 条记录到剪贴板（JSON 格式）",
-                        self.entries.len()
-                    ));
-                    log::info!("密码数据已导出到剪贴板");
-                }
-                Err(e) => {
-                    self.set_error(format!("导出失败: {}", e));
+        let (title, extension, filter_name) = match format {
+            ExportFormat::Json => ("导出密码数据 - JSON", "json", "JSON 文件"),
+            ExportFormat::Csv => ("导出密码数据 - CSV", "csv", "CSV 文件"),
+        };
+
+        let default_name = format!("passwords.{}", extension);
+        let dialog = rfd::FileDialog::new()
+            .set_title(title)
+            .set_file_name(&default_name)
+            .add_filter(filter_name, &[extension]);
+
+        if let Some(path) = dialog.save_file() {
+            if let Some(key) = &self.derived_key {
+                let store = PasswordStore::new(conn);
+                match store.export_entries(key, format) {
+                    Ok(data) => {
+                        match std::fs::write(&path, &data) {
+                            Ok(()) => {
+                                let fmt_name = match format {
+                                    ExportFormat::Json => "JSON",
+                                    ExportFormat::Csv => "CSV",
+                                };
+                                self.set_success(format!(
+                                    "已导出 {} 条记录到 {}（{} 格式）",
+                                    self.entries.len(),
+                                    path.display(),
+                                    fmt_name
+                                ));
+                                log::info!("密码数据已导出到: {}", path.display());
+                            }
+                            Err(e) => {
+                                self.set_error(format!("写入文件失败: {}", e));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        self.set_error(format!("导出失败: {}", e));
+                    }
                 }
             }
         }
     }
 
-    /// 导入密码数据
-    fn import_data(&mut self, conn: &Connection) {
+    /// 从文件导入密码数据
+    fn import_from_file(&mut self, conn: &Connection) {
         self.clear_messages();
 
-        // 从剪贴板读取
-        match arboard::Clipboard::new() {
-            Ok(mut clipboard) => match clipboard.get_text() {
-                Ok(text) => {
-                    if text.is_empty() {
-                        self.set_error("剪贴板为空".to_string());
-                        return;
-                    }
+        let dialog = rfd::FileDialog::new()
+            .set_title("选择导入文件")
+            .add_filter("支持的格式", &["json", "csv"])
+            .add_filter("JSON 文件", &["json"])
+            .add_filter("CSV 文件", &["csv"]);
 
-                    if let Some(key) = &self.derived_key {
-                        let store = PasswordStore::new(conn);
-                        match store.import_entries(&text, key) {
-                            Ok(count) => {
-                                self.set_success(format!("成功导入 {} 条记录", count));
-                                self.load_entries(conn);
-                            }
-                            Err(e) => {
-                                self.set_error(format!("导入失败: {}", e));
-                            }
-                        }
+        if let Some(path) = dialog.pick_file() {
+            let content = match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(e) => {
+                    self.set_error(format!("读取文件失败: {}", e));
+                    return;
+                }
+            };
+
+            if content.is_empty() {
+                self.set_error("文件内容为空，请检查文件是否正确".to_string());
+                return;
+            }
+
+            // 根据文件扩展名判断格式
+            let format = match path.extension().and_then(|e| e.to_str()) {
+                Some("csv") => ExportFormat::Csv,
+                Some("json") => ExportFormat::Json,
+                _ => {
+                    self.set_error("不支持的文件格式，请使用 .json 或 .csv 文件".to_string());
+                    return;
+                }
+            };
+
+            if let Some(key) = &self.derived_key {
+                let store = PasswordStore::new(conn);
+                match store.import_entries(&content, key, format) {
+                    Ok(count) => {
+                        let fmt_name = match format {
+                            ExportFormat::Json => "JSON",
+                            ExportFormat::Csv => "CSV",
+                        };
+                        self.set_success(format!(
+                            "成功从 {} 导入 {} 条记录（{} 格式）",
+                            path.file_name().unwrap_or_default().to_string_lossy(),
+                            count,
+                            fmt_name
+                        ));
+                        self.load_entries(conn);
+                    }
+                    Err(e) => {
+                        self.set_error(format!("导入失败: {}", e));
                     }
                 }
-                Err(e) => {
-                    self.set_error(format!("读取剪贴板失败: {}", e));
-                }
-            },
-            Err(e) => {
-                self.set_error(format!("无法访问剪贴板: {}", e));
             }
         }
     }

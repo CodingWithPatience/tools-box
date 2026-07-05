@@ -61,7 +61,7 @@ impl Database {
         self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS passwords (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                website     TEXT NOT NULL,
+                name        TEXT NOT NULL,
                 url         TEXT,
                 username    TEXT NOT NULL,
                 password    BLOB NOT NULL,
@@ -69,8 +69,7 @@ impl Database {
                 notes       TEXT,
                 created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
                 updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
-            CREATE INDEX IF NOT EXISTS idx_passwords_website ON passwords(website);",
+            );",
         )?;
 
         // Hosts 管理器 - 环境表
@@ -137,6 +136,40 @@ impl Database {
                 .pragma_update(None, "user_version", 1)
                 .context("更新数据库版本号失败")?;
             log::info!("SSH 连接配置表已迁移到 v1（清除旧数据，添加唯一约束）");
+        }
+
+        // 数据库迁移：密码管理器 website 字段重命名为 name
+        if db_version < 2 {
+            // 通过 PRAGMA table_info 检查旧的 website 列是否存在
+            let has_website = self
+                .conn
+                .prepare("PRAGMA table_info(passwords)")
+                .context("查询密码表结构失败")?
+                .query_map([], |row| {
+                    let col_name: String = row.get(1)?;
+                    Ok(col_name)
+                })
+                .context("读取密码表列信息失败")?
+                .filter_map(|r| r.ok())
+                .any(|col| col == "website");
+
+            if has_website {
+                self.conn
+                    .execute_batch("ALTER TABLE passwords RENAME COLUMN website TO name")
+                    .context("迁移密码表 website → name 失败")?;
+                // 重建索引
+                self.conn
+                    .execute_batch("DROP INDEX IF EXISTS idx_passwords_website")
+                    .context("删除旧索引失败")?;
+                log::info!("密码管理器表已迁移到 v2（website → name）");
+            }
+            // 确保索引存在（新数据库或迁移后都需要）
+            self.conn
+                .execute_batch("CREATE INDEX IF NOT EXISTS idx_passwords_name ON passwords(name)")
+                .context("创建密码表索引失败")?;
+            self.conn
+                .pragma_update(None, "user_version", 2)
+                .context("更新数据库版本号失败")?;
         }
 
         // SSH 客户端 - 连接历史表

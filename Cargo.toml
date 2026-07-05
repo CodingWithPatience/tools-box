@@ -38,6 +38,9 @@ hmac = "0.12"
 # Serialization
 serde = { version = "1", features = ["derive"] }
 
+# CSV import/export
+csv = "1"
+
 # DateTime
 chrono = "0.4"
 

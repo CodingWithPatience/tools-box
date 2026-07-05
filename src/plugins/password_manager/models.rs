@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone)]
 pub struct PasswordEntry {
     pub id: i64,
-    pub website: String,
+    pub name: String,
     pub url: Option<String>,
     pub username: String,
     pub password: String,
@@ -17,7 +17,7 @@ pub struct PasswordEntry {
 #[derive(Debug, Clone)]
 pub struct EncryptedPasswordEntry {
     pub id: i64,
-    pub website: String,
+    pub name: String,
     pub url: Option<String>,
     pub username: String,
     pub encrypted_password: Vec<u8>,
@@ -38,7 +38,7 @@ impl EncryptedPasswordEntry {
     pub fn to_decrypted(&self, key: &[u8; 32]) -> PasswordEntry {
         PasswordEntry {
             id: self.id,
-            website: self.website.clone(),
+            name: self.name.clone(),
             url: self.url.clone(),
             username: self.username.clone(),
             password: self.decrypt_password(key),
@@ -52,7 +52,7 @@ impl EncryptedPasswordEntry {
 /// 新增密码条目的表单数据
 #[derive(Debug, Clone)]
 pub struct NewPasswordEntry {
-    pub website: String,
+    pub name: String,
     pub url: Option<String>,
     pub username: String,
     pub password: String,
@@ -77,7 +77,9 @@ pub struct ExportData {
 /// 导出的单条密码条目
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ExportEntry {
-    pub website: String,
+    /// 兼容旧版 JSON 中的 "website" 字段
+    #[serde(alias = "website")]
+    pub name: String,
     pub url: Option<String>,
     pub username: String,
     pub password: String,
@@ -87,7 +89,7 @@ pub struct ExportEntry {
 impl ExportEntry {
     pub fn from_password_entry(entry: &PasswordEntry) -> Self {
         Self {
-            website: entry.website.clone(),
+            name: entry.name.clone(),
             url: entry.url.clone(),
             username: entry.username.clone(),
             password: entry.password.clone(),
@@ -97,7 +99,7 @@ impl ExportEntry {
 
     pub fn to_new_entry(&self) -> NewPasswordEntry {
         NewPasswordEntry {
-            website: self.website.clone(),
+            name: self.name.clone(),
             url: self.url.clone(),
             username: self.username.clone(),
             password: self.password.clone(),
@@ -106,10 +108,17 @@ impl ExportEntry {
     }
 }
 
+/// 导入/导出格式
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ExportFormat {
+    Json,
+    Csv,
+}
+
 /// 密码编辑表单状态
 #[derive(Debug, Clone)]
 pub struct PasswordForm {
-    pub website: String,
+    pub name: String,
     pub url: String,
     pub username: String,
     pub password: String,
@@ -120,7 +129,7 @@ pub struct PasswordForm {
 impl PasswordForm {
     pub fn new() -> Self {
         Self {
-            website: String::new(),
+            name: String::new(),
             url: String::new(),
             username: String::new(),
             password: String::new(),
@@ -131,7 +140,7 @@ impl PasswordForm {
 
     pub fn from_entry(entry: &PasswordEntry) -> Self {
         Self {
-            website: entry.website.clone(),
+            name: entry.name.clone(),
             url: entry.url.clone().unwrap_or_default(),
             username: entry.username.clone(),
             password: entry.password.clone(),
@@ -142,7 +151,7 @@ impl PasswordForm {
 
     pub fn to_new_entry(&self) -> NewPasswordEntry {
         NewPasswordEntry {
-            website: self.website.clone(),
+            name: self.name.clone(),
             url: if self.url.is_empty() {
                 None
             } else {
@@ -159,7 +168,7 @@ impl PasswordForm {
     }
 
     pub fn is_valid(&self) -> bool {
-        !self.website.is_empty() && !self.username.is_empty() && !self.password.is_empty()
+        !self.name.is_empty() && !self.username.is_empty() && !self.password.is_empty()
     }
 }
 
