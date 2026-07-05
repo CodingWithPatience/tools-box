@@ -150,21 +150,37 @@ src/
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│  🔑 密码管理器                    [ + 新增 ]  [ 🔍 搜索... ]       │
+│  🔑 密码管理器        [ + 新增 ] [ 🔑 生成密码 ] [ 📤 导出 ] [ 📥 导入 ] [ 🔍 搜索... ] [ 🔒 锁定 ] │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                     │
-│  网站列表：                                                          │
+│  密码列表：                                                          │
 │  ┌─────┬──────────────────┬──────────────────┬──────────┐          │
-│  │  #  │ 网站              │ 账号              │ 操作      │          │
+│  │  #  │ 名称              │ 账号              │ 操作      │          │
 │  ├─────┼──────────────────┼──────────────────┼──────────┤          │
-│  │  1  │ github.com       │ user@email.com   │ 👁 👋 🗑  │          │
-│  │  2  │ google.com       │ user@gmail.com   │ 👁 👋 🗑  │          │
-│  │  3  │ stackoverflow.com│ dev_user         │ 👁 👋 🗑  │          │
+│  │  1  │ GitHub           │ user@email.com   │ 👁 📋 ✏️ 🗑 │          │
+│  │  2  │ Google           │ user@gmail.com   │ 👁 📋 ✏️ 🗑 │          │
+│  │  3  │ Stack Overflow   │ dev_user         │ 👁 📋 ✏️ 🗑 │          │
 │  └─────┴──────────────────┴──────────────────┴──────────┘          │
 │                                                                     │
-│  [👁 查看密码]  [👋 复制密码]  [🗑 删除]                              │
-│                                                                     │
+│  共 3 条记录                                                         │
 └─────────────────────────────────────────────────────────────────────┘
+
+导出弹窗：
+┌─────────────────────────────┐
+│  选择导出格式                 │
+│  [ 📋 JSON 格式 ] [ 📊 CSV 格式 ] │
+│  [ 取消 ]                   │
+└─────────────────────────────┘
+
+修改主密码：
+┌──────────────────────────────────────────┐
+│  🔑 修改主密码                     [ ← 返回 ] │
+├──────────────────────────────────────────┤
+│  🔐 当前密码：  [________________]         │
+│  🔐 新密码：    [________________]         │
+│  🔐 确认：      [________________]         │
+│  [ ✓ 确认修改 ] [ ← 返回 ]                 │
+└──────────────────────────────────────────┘
 ```
 
 #### 3.2.2 JSON 编辑器
@@ -234,6 +250,8 @@ src/
 | 密码生成 | `rand` + `password-hash` | 随机密码生成 |
 | 剪贴板 | `arboard` | 跨平台剪贴板操作 |
 | JSON 处理 | `serde_json` | JSON 格式化/解析/压缩 |
+| CSV 处理 | `csv` | CSV 格式导入导出 |
+| 文件对话框 | `rfd` | 跨平台文件选择对话框 |
 | 配置存储 | `dirs` | 获取用户目录路径 |
 | 错误处理 | `thiserror` + `anyhow` | 错误类型定义与上下文包装 |
 | 日志 | `log` + `env_logger` | 日志记录 |
@@ -333,17 +351,18 @@ src/
 | 3.4 | 新增/编辑/删除 | 密码的增删改操作 | ✅ |
 | 3.5 | 查看/复制密码 | 解密显示，一键复制 | ✅ |
 | 3.6 | 随机密码生成 | 可配置长度和字符类型的密码生成器 | ✅ |
-| 3.7 | 搜索功能 | 按网站名称搜索 | ✅ |
+| 3.7 | 搜索功能 | 按名称搜索 | ✅ |
+| 3.8 | 修改主密码 | 验证旧密码后修改，重新加密所有条目 | ✅ |
 
 **阶段三产出文件：**
 - `src/plugins/password_manager/mod.rs` — 插件入口，数据库连接管理
 - `src/plugins/password_manager/crypto.rs` — 加密模块（AES-256-GCM + PBKDF2 密钥派生）
-- `src/plugins/password_manager/models.rs` — 数据模型（PasswordEntry、PasswordForm、GeneratorConfig）
-- `src/plugins/password_manager/store.rs` — 数据库 CRUD 操作
-- `src/plugins/password_manager/ui.rs` — UI 渲染（主密码界面、密码列表、表单、生成器）
-- `Cargo.toml` — 新增 `aes-gcm`、`pbkdf2`、`hmac`、`sha2`、`rand`、`serde` 依赖
+- `src/plugins/password_manager/models.rs` — 数据模型（PasswordEntry、PasswordForm、GeneratorConfig、ExportFormat）
+- `src/plugins/password_manager/store.rs` — 数据库 CRUD、导入导出（JSON/CSV）、修改主密码
+- `src/plugins/password_manager/ui.rs` — UI 渲染（主密码界面、密码列表、表单、生成器、导入导出、修改主密码）
+- `Cargo.toml` — 新增 `aes-gcm`、`pbkdf2`、`hmac`、`sha2`、`rand`、`serde`、`csv` 依赖
 
-**测试覆盖：** 5 个单元测试全部通过（加密解密、错误密钥验证、密码生成、密钥派生确定性、主密码哈希验证）
+**测试覆盖：** 7 个单元测试全部通过（加密解密、错误密钥验证、密码生成、密钥派生确定性、主密码哈希验证、JSON 导出导入往返、CSV 导出导入往返）
 
 ### 阶段四：Hosts 管理器插件（优先级：P2） ✅ 已完成
 
@@ -371,14 +390,15 @@ src/
 | 5.1 | 快捷键支持 | 插件唤出快捷键 | ✅ |
 | 5.2 | 主题切换 | 亮色/暗色主题 | ✅ |
 | 5.3 | 搜索全局插件 | 侧边栏搜索过滤插件 | ✅ |
-| 5.4 | 数据导出/导入 | 密码数据的备份恢复 | ✅ |
+| 5.4 | 数据导出/导入 | 密码数据的备份恢复（JSON/CSV 格式，文件对话框选择路径） | ✅ |
 | 5.5 | 打包发布 | 配置 GitHub Actions，构建 release | ⏳ |
 
 **阶段五产出文件：**
 - `src/app.rs` — 新增快捷键支持（Ctrl+1-9 切换插件、Ctrl+F 搜索、Esc 清空）、主题切换（亮色/暗色）、搜索增强
-- `src/plugins/password_manager/models.rs` — 新增 ExportData、ExportEntry 数据结构
-- `src/plugins/password_manager/store.rs` — 新增 export_entries、import_entries 方法
-- `src/plugins/password_manager/ui.rs` — 新增导出/导入按钮和处理逻辑
+- `src/plugins/password_manager/models.rs` — 新增 ExportData、ExportEntry、ExportFormat 数据结构，`website` 字段重命名为 `name`
+- `src/plugins/password_manager/store.rs` — 新增 export_entries、import_entries 方法（支持 JSON/CSV），修改主密码方法，RAII 事务管理
+- `src/plugins/password_manager/ui.rs` — 新增文件对话框导入导出、格式选择弹窗、修改主密码界面
+- `src/storage/database.rs` — 新增数据库迁移（`website` → `name`）
 
 **测试覆盖：** 14 个单元测试全部通过
 
@@ -400,7 +420,7 @@ CREATE TABLE master_config (
 -- 密码条目
 CREATE TABLE passwords (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    website    TEXT NOT NULL,
+    name       TEXT NOT NULL,     -- 网站/服务名称
     url        TEXT,
     username   TEXT NOT NULL,
     password   BLOB NOT NULL,     -- AES-GCM 加密后的密文
@@ -410,7 +430,7 @@ CREATE TABLE passwords (
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX idx_passwords_website ON passwords(website);
+CREATE INDEX idx_passwords_name ON passwords(name);
 ```
 
 ### 6.2 Hosts 管理器
@@ -490,11 +510,19 @@ cargo fmt
 ### 密码管理器流程
 
 ```
-[打开插件] → [输入主密码] → [密码列表]
-                              ├── [新增] → [填写表单] → [保存]
-                              ├── [查看] → [解密显示]
-                              ├── [复制] → [剪贴板]
-                              └── [删除] → [确认] → [移除]
+[打开插件] → [已设置主密码?]
+              ├── 否 → [首次使用？点击设置主密码] → [设置主密码] → [密码列表]
+              └── 是 → [输入主密码] → [解锁] → [密码列表]
+                                                  ├── [新增] → [填写表单] → [保存]
+                                                  ├── [查看] → [解密显示]
+                                                  ├── [复制] → [剪贴板]
+                                                  ├── [编辑] → [修改表单] → [保存]
+                                                  ├── [删除] → [确认] → [移除]
+                                                  ├── [导出] → [选择格式 JSON/CSV] → [选择保存路径] → [写入文件]
+                                                  ├── [导入] → [选择文件 .json/.csv] → [解析并导入]
+                                                  ├── [生成密码] → [配置参数] → [生成]
+                                                  ├── [修改主密码] → [验证旧密码] → [输入新密码] → [重新加密所有条目]
+                                                  └── [锁定] → [返回主密码输入]
 ```
 
 ### JSON 编辑器流程
