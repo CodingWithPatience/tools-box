@@ -381,18 +381,18 @@ impl DiffViewerUi {
                             // 消除行间距
                             ui.spacing_mut().item_spacing.y = 0.0;
                             for line in &result.split_lines {
-                                // 计算行级背景色（GitHub 风格：更浅的颜色）
+                                // 计算行级背景色（GitHub 风格）
                                 let (line_bg, gutter_bg, symbol) = match line.left_type {
                                     DiffType::Removed => {
                                         let (line, gutter) = if is_dark_mode {
                                             (
-                                                Color32::from_rgba_premultiplied(61, 31, 35, 180),
-                                                Color32::from_rgba_premultiplied(80, 40, 45, 200),
+                                                Color32::from_rgba_unmultiplied(61, 31, 35, 180),
+                                                Color32::from_rgba_unmultiplied(80, 40, 45, 200),
                                             )
                                         } else {
                                             (
-                                                Color32::from_rgba_premultiplied(255, 235, 236, 220),
-                                                Color32::from_rgba_premultiplied(255, 210, 215, 230),
+                                                Color32::from_rgba_unmultiplied(255, 210, 215, 230),
+                                                Color32::from_rgba_unmultiplied(255, 180, 185, 240),
                                             )
                                         };
                                         (line, gutter, "-")
@@ -480,18 +480,18 @@ impl DiffViewerUi {
                             // 消除行间距
                             ui.spacing_mut().item_spacing.y = 0.0;
                             for line in &result.split_lines {
-                                // 计算行级背景色（GitHub 风格：更浅的颜色）
+                                // 计算行级背景色（GitHub 风格）
                                 let (line_bg, gutter_bg, symbol) = match line.right_type {
                                     DiffType::Added => {
                                         let (line, gutter) = if is_dark_mode {
                                             (
-                                                Color32::from_rgba_premultiplied(31, 61, 38, 180),
-                                                Color32::from_rgba_premultiplied(40, 80, 50, 200),
+                                                Color32::from_rgba_unmultiplied(31, 61, 38, 180),
+                                                Color32::from_rgba_unmultiplied(40, 80, 50, 200),
                                             )
                                         } else {
                                             (
-                                                Color32::from_rgba_premultiplied(218, 251, 225, 220),
-                                                Color32::from_rgba_premultiplied(190, 245, 200, 230),
+                                                Color32::from_rgba_unmultiplied(180, 240, 195, 230),
+                                                Color32::from_rgba_unmultiplied(150, 230, 170, 240),
                                             )
                                         };
                                         (line, gutter, "+")
@@ -670,17 +670,19 @@ impl DiffViewerUi {
         }
     }
 
-    /// 计算差异背景色（深色/浅色主题）
+    /// 计算字符级差异背景色（深色/浅色主题）
+    ///
+    /// 字符级背景色比行级背景色更深，用于区分修改行中的具体差异字符。
     fn diff_background_colors(is_dark_mode: bool) -> (Color32, Color32) {
         if is_dark_mode {
             (
-                Color32::from_rgba_premultiplied(53, 110, 53, 200),
-                Color32::from_rgba_premultiplied(110, 53, 53, 200),
+                Color32::from_rgba_unmultiplied(53, 110, 53, 200),
+                Color32::from_rgba_unmultiplied(110, 53, 53, 200),
             )
         } else {
             (
-                Color32::from_rgba_premultiplied(171, 242, 188, 220),
-                Color32::from_rgba_premultiplied(255, 193, 192, 220),
+                Color32::from_rgba_unmultiplied(120, 220, 145, 220),
+                Color32::from_rgba_unmultiplied(255, 150, 150, 220),
             )
         }
     }
@@ -865,13 +867,13 @@ impl DiffViewerUi {
                             DiffType::Removed => {
                                 let (line_bg, gutter_bg) = if is_dark_mode {
                                     (
-                                        Color32::from_rgba_premultiplied(61, 31, 35, 180),
-                                        Color32::from_rgba_premultiplied(80, 40, 45, 200),
+                                        Color32::from_rgba_unmultiplied(61, 31, 35, 180),
+                                        Color32::from_rgba_unmultiplied(80, 40, 45, 200),
                                     )
                                 } else {
                                     (
-                                        Color32::from_rgba_premultiplied(255, 235, 236, 220),
-                                        Color32::from_rgba_premultiplied(255, 210, 215, 230),
+                                        Color32::from_rgba_unmultiplied(255, 210, 215, 230),
+                                        Color32::from_rgba_unmultiplied(255, 180, 185, 240),
                                     )
                                 };
                                 (line_bg, gutter_bg, "-")
@@ -879,13 +881,13 @@ impl DiffViewerUi {
                             DiffType::Added => {
                                 let (line_bg, gutter_bg) = if is_dark_mode {
                                     (
-                                        Color32::from_rgba_premultiplied(31, 61, 38, 180),
-                                        Color32::from_rgba_premultiplied(40, 80, 50, 200),
+                                        Color32::from_rgba_unmultiplied(31, 61, 38, 180),
+                                        Color32::from_rgba_unmultiplied(40, 80, 50, 200),
                                     )
                                 } else {
                                     (
-                                        Color32::from_rgba_premultiplied(218, 251, 225, 220),
-                                        Color32::from_rgba_premultiplied(190, 245, 200, 230),
+                                        Color32::from_rgba_unmultiplied(180, 240, 195, 230),
+                                        Color32::from_rgba_unmultiplied(150, 230, 170, 240),
                                     )
                                 };
                                 (line_bg, gutter_bg, "+")
