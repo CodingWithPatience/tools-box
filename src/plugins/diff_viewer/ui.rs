@@ -1185,6 +1185,7 @@ impl DiffViewerUi {
     ///
     /// 在指定矩形区域内绘制右上到左下的45度斜线。
     /// 使用全局 y位置计算斜线偏移，确保相邻行的斜线对接。
+    /// 使用 extend 批量绘制以提升性能。
     ///
     /// # 参数
     /// - `painter`: 绘制器
@@ -1209,8 +1210,11 @@ impl DiffViewerUi {
         // 计算斜线的起始偏移（基于全局 y 位置）
         let offset = global_y_start % spacing;
 
+        // 收集所有线段形状，批量绘制
+        let stroke = egui::Stroke::new(line_width, color);
+        let mut shapes = Vec::new();
+
         // 绘制斜线（从右上到左下）
-        // 只绘制完整跨越矩形高度的斜线，避免裁剪导致的竖线问题
         let mut x_start = rect.min.x - offset;
         while x_start <= rect.max.x {
             let x1 = x_start;
@@ -1218,16 +1222,17 @@ impl DiffViewerUi {
 
             // 只绘制起点和终点都在矩形区域内的斜线
             if x1 >= rect.min.x && x2 <= rect.max.x {
-                painter.line_segment(
-                    [
-                        egui::pos2(x1, rect.min.y),
-                        egui::pos2(x2, rect.max.y),
-                    ],
-                    egui::Stroke::new(line_width, color),
-                );
+                let p1 = egui::pos2(x1, rect.min.y);
+                let p2 = egui::pos2(x2, rect.max.y);
+                shapes.push(egui::Shape::line_segment([p1, p2], stroke));
             }
 
             x_start += spacing;
+        }
+
+        // 批量绘制所有线段
+        if !shapes.is_empty() {
+            painter.extend(shapes);
         }
     }
 
