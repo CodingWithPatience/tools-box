@@ -706,22 +706,14 @@ impl DiffViewerUi {
 
         if let Some(text) = content {
             if *diff_type == DiffType::Equal && syntax_name.is_some() {
-                // 相同行使用语法高亮
-                let mut job = LayoutJob::default();
-                job.wrap.max_width = f32::INFINITY;
-                let highlighted = self.highlighter.highlight_line(
-                    text, syntax_name.as_deref(), font_size, is_dark_mode,
+                // 相同行使用语法高亮（带缓存）
+                let mut job = self.get_line_highlight_job(
+                    text,
+                    syntax_name.as_deref(),
+                    font_size,
+                    is_dark_mode,
                 );
-                for (color, t) in highlighted {
-                    job.append(
-                        &t, 0.0,
-                        egui::TextFormat {
-                            font_id: egui::FontId::monospace(font_size),
-                            color,
-                            ..Default::default()
-                        },
-                    );
-                }
+                job.wrap.max_width = f32::INFINITY;
                 ui.label(job);
             } else if !segments.is_empty() && !is_whole_line_change {
                 // 有字符级差异的行（修改行）：在行级背景色基础上叠加字符级背景色
@@ -742,23 +734,20 @@ impl DiffViewerUi {
                 ui.label(job);
             } else {
                 // 整行删除/新增或无字符级差异：只有行级背景色（已在外部绘制），这里只渲染文本
-                let mut job = LayoutJob::default();
-                job.wrap.max_width = f32::INFINITY;
                 if syntax_name.is_some() {
-                    let highlighted = self.highlighter.highlight_line(
-                        text, syntax_name.as_deref(), font_size, is_dark_mode,
+                    // 有语法高亮时，使用缓存
+                    let mut job = self.get_line_highlight_job(
+                        text,
+                        syntax_name.as_deref(),
+                        font_size,
+                        is_dark_mode,
                     );
-                    for (color, t) in highlighted {
-                        job.append(
-                            &t, 0.0,
-                            egui::TextFormat {
-                                font_id: egui::FontId::monospace(font_size),
-                                color,
-                                ..Default::default()
-                            },
-                        );
-                    }
+                    job.wrap.max_width = f32::INFINITY;
+                    ui.label(job);
                 } else {
+                    // 无语法高亮时，直接渲染文本
+                    let mut job = LayoutJob::default();
+                    job.wrap.max_width = f32::INFINITY;
                     job.append(
                         text.as_str(), 0.0,
                         egui::TextFormat {
@@ -767,8 +756,8 @@ impl DiffViewerUi {
                             ..Default::default()
                         },
                     );
+                    ui.label(job);
                 }
-                ui.label(job);
             }
         } else {
             // 空行（删除/新增行的对侧行）：绘制斜线背景，标识行不存在
