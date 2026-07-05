@@ -371,31 +371,69 @@ impl DiffViewerUi {
                             left_sync_applied.set(true);
                         }
                         let output = scroll.show(ui, |ui| {
+                            // 消除行间距
+                            ui.spacing_mut().item_spacing.y = 0.0;
                             for line in &result.split_lines {
-                                ui.horizontal(|ui| {
-                                    let num_text = match line.left_line_number {
-                                        Some(n) => format!("{:>w$}", n, w = num_digits),
-                                        None => " ".repeat(num_digits),
-                                    };
-                                    ui.add_sized(
-                                        [gutter_w, row_height],
-                                        egui::Label::new(
-                                            RichText::new(format!("{} │ ", num_text))
-                                                .monospace()
-                                                .color(dim_color),
-                                        ),
-                                    );
-                                    ui.allocate_ui_with_layout(
-                                        egui::vec2(col_width - gutter_w, row_height),
-                                        egui::Layout::left_to_right(egui::Align::Min),
-                                        |ui| {
-                                            self.render_cell(
-                                                ui, line, true, row_height, font_size,
-                                                &syntax_name, is_dark_mode, text_color,
-                                            );
-                                        },
-                                    );
-                                });
+                                // 计算行级背景色（GitHub 风格：更浅的颜色）
+                                let (line_bg, gutter_bg, symbol) = match line.left_type {
+                                    DiffType::Removed => {
+                                        let (line, gutter) = if is_dark_mode {
+                                            (
+                                                Color32::from_rgba_premultiplied(61, 31, 35, 180),
+                                                Color32::from_rgba_premultiplied(80, 40, 45, 200),
+                                            )
+                                        } else {
+                                            (
+                                                Color32::from_rgba_premultiplied(255, 235, 236, 220),
+                                                Color32::from_rgba_premultiplied(255, 210, 215, 230),
+                                            )
+                                        };
+                                        (line, gutter, "-")
+                                    }
+                                    _ => (Color32::TRANSPARENT, Color32::TRANSPARENT, " "),
+                                };
+                                // 使用 allocate_ui_with_layout 确保固定行高
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(col_width, row_height),
+                                    egui::Layout::left_to_right(egui::Align::Min),
+                                    |ui| {
+                                        let num_text = match line.left_line_number {
+                                            Some(n) => format!("{:>w$}", n, w = num_digits),
+                                            None => " ".repeat(num_digits),
+                                        };
+                                        // 绘制整行背景色（覆盖整行）
+                                        if line_bg != Color32::TRANSPARENT {
+                                            let rect = ui.max_rect();
+                                            ui.painter().rect_filled(rect, 0.0, line_bg);
+                                        }
+                                        // 绘制行号背景
+                                        let gutter_rect = egui::Rect::from_min_size(
+                                            ui.cursor().left_top(),
+                                            egui::vec2(gutter_w, row_height),
+                                        );
+                                        if gutter_bg != Color32::TRANSPARENT {
+                                            ui.painter().rect_filled(gutter_rect, 0.0, gutter_bg);
+                                        }
+                                        ui.add_sized(
+                                            [gutter_w, row_height],
+                                            egui::Label::new(
+                                                RichText::new(format!("{} {} ", num_text, symbol))
+                                                    .monospace()
+                                                    .color(dim_color),
+                                            ),
+                                        );
+                                        ui.allocate_ui_with_layout(
+                                            egui::vec2(col_width - gutter_w, row_height),
+                                            egui::Layout::left_to_right(egui::Align::Min),
+                                            |ui| {
+                                                self.render_cell(
+                                                    ui, line, true, row_height, font_size,
+                                                    &syntax_name, is_dark_mode, text_color,
+                                                );
+                                            },
+                                        );
+                                    },
+                                );
                             }
                         });
                         left_current_offset.set(output.state.offset.y);
@@ -432,31 +470,69 @@ impl DiffViewerUi {
                             scroll = scroll.vertical_scroll_offset(offset_y);
                         }
                         let output = scroll.show(ui, |ui| {
+                            // 消除行间距
+                            ui.spacing_mut().item_spacing.y = 0.0;
                             for line in &result.split_lines {
-                                ui.horizontal(|ui| {
-                                    let num_text = match line.right_line_number {
-                                        Some(n) => format!("{:>w$}", n, w = num_digits),
-                                        None => " ".repeat(num_digits),
-                                    };
-                                    ui.add_sized(
-                                        [gutter_w, row_height],
-                                        egui::Label::new(
-                                            RichText::new(format!("{} │ ", num_text))
-                                                .monospace()
-                                                .color(dim_color),
-                                        ),
-                                    );
-                                    ui.allocate_ui_with_layout(
-                                        egui::vec2(col_width - gutter_w, row_height),
-                                        egui::Layout::left_to_right(egui::Align::Min),
-                                        |ui| {
-                                            self.render_cell(
-                                                ui, line, false, row_height, font_size,
-                                                &syntax_name, is_dark_mode, text_color,
-                                            );
-                                        },
-                                    );
-                                });
+                                // 计算行级背景色（GitHub 风格：更浅的颜色）
+                                let (line_bg, gutter_bg, symbol) = match line.right_type {
+                                    DiffType::Added => {
+                                        let (line, gutter) = if is_dark_mode {
+                                            (
+                                                Color32::from_rgba_premultiplied(31, 61, 38, 180),
+                                                Color32::from_rgba_premultiplied(40, 80, 50, 200),
+                                            )
+                                        } else {
+                                            (
+                                                Color32::from_rgba_premultiplied(218, 251, 225, 220),
+                                                Color32::from_rgba_premultiplied(190, 245, 200, 230),
+                                            )
+                                        };
+                                        (line, gutter, "+")
+                                    }
+                                    _ => (Color32::TRANSPARENT, Color32::TRANSPARENT, " "),
+                                };
+                                // 使用 allocate_ui_with_layout 确保固定行高
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(col_width, row_height),
+                                    egui::Layout::left_to_right(egui::Align::Min),
+                                    |ui| {
+                                        let num_text = match line.right_line_number {
+                                            Some(n) => format!("{:>w$}", n, w = num_digits),
+                                            None => " ".repeat(num_digits),
+                                        };
+                                        // 绘制整行背景色（覆盖整行）
+                                        if line_bg != Color32::TRANSPARENT {
+                                            let rect = ui.max_rect();
+                                            ui.painter().rect_filled(rect, 0.0, line_bg);
+                                        }
+                                        // 绘制行号背景
+                                        let gutter_rect = egui::Rect::from_min_size(
+                                            ui.cursor().left_top(),
+                                            egui::vec2(gutter_w, row_height),
+                                        );
+                                        if gutter_bg != Color32::TRANSPARENT {
+                                            ui.painter().rect_filled(gutter_rect, 0.0, gutter_bg);
+                                        }
+                                        ui.add_sized(
+                                            [gutter_w, row_height],
+                                            egui::Label::new(
+                                                RichText::new(format!("{} {} ", num_text, symbol))
+                                                    .monospace()
+                                                    .color(dim_color),
+                                            ),
+                                        );
+                                        ui.allocate_ui_with_layout(
+                                            egui::vec2(col_width - gutter_w, row_height),
+                                            egui::Layout::left_to_right(egui::Align::Min),
+                                            |ui| {
+                                                self.render_cell(
+                                                    ui, line, false, row_height, font_size,
+                                                    &syntax_name, is_dark_mode, text_color,
+                                                );
+                                            },
+                                        );
+                                    },
+                                );
                             }
                         });
                         right_current_offset.set(output.state.offset.y);
@@ -514,19 +590,13 @@ impl DiffViewerUi {
             (&line.right_content, &line.right_type, &line.right_segments)
         };
 
-        let bg = match diff_type {
-            DiffType::Removed if is_left => Color32::from_rgb(255, 220, 220),
-            DiffType::Added if !is_left => Color32::from_rgb(220, 255, 220),
-            _ => Color32::TRANSPARENT,
-        };
-
-        if bg != Color32::TRANSPARENT {
-            let rect = ui.max_rect();
-            ui.painter().rect_filled(rect, 0.0, bg);
-        }
+        // 判断是否是整行删除/新增（只有一侧有内容，另一侧为空）
+        let is_whole_line_change = (is_left && line.right_content.is_none())
+            || (!is_left && line.left_content.is_none());
 
         if let Some(text) = content {
             if *diff_type == DiffType::Equal && syntax_name.is_some() {
+                // 相同行使用语法高亮
                 let mut job = LayoutJob::default();
                 job.wrap.max_width = f32::INFINITY;
                 let highlighted = self.highlighter.highlight_line(
@@ -543,60 +613,190 @@ impl DiffViewerUi {
                     );
                 }
                 ui.label(job);
-            } else if !segments.is_empty() {
-                let mut job = self.create_segment_layout(segments, font_size, text_color);
-                job.wrap.max_width = f32::INFINITY;
+            } else if !segments.is_empty() && !is_whole_line_change {
+                // 有字符级差异的行（修改行）：在行级背景色基础上叠加字符级背景色
+                let job = self.create_highlighted_diff_layout(
+                    text,
+                    segments,
+                    syntax_name.as_deref(),
+                    font_size,
+                    is_dark_mode,
+                    text_color,
+                    diff_type,
+                );
                 ui.label(job);
             } else {
-                let color = match diff_type {
-                    DiffType::Removed => Color32::from_rgb(180, 0, 0),
-                    DiffType::Added => Color32::from_rgb(0, 150, 0),
-                    _ => text_color,
-                };
+                // 整行删除/新增或无字符级差异：只有行级背景色（已在外部绘制），这里只渲染文本
                 let mut job = LayoutJob::default();
                 job.wrap.max_width = f32::INFINITY;
-                job.append(
-                    text.as_str(), 0.0,
-                    egui::TextFormat {
-                        font_id: egui::FontId::monospace(font_size),
-                        color,
-                        ..Default::default()
-                    },
-                );
+                if syntax_name.is_some() {
+                    let highlighted = self.highlighter.highlight_line(
+                        text, syntax_name.as_deref(), font_size, is_dark_mode,
+                    );
+                    for (color, t) in highlighted {
+                        job.append(
+                            &t, 0.0,
+                            egui::TextFormat {
+                                font_id: egui::FontId::monospace(font_size),
+                                color,
+                                ..Default::default()
+                            },
+                        );
+                    }
+                } else {
+                    job.append(
+                        text.as_str(), 0.0,
+                        egui::TextFormat {
+                            font_id: egui::FontId::monospace(font_size),
+                            color: text_color,
+                            ..Default::default()
+                        },
+                    );
+                }
                 ui.label(job);
             }
         }
     }
 
-    fn create_segment_layout(
+    /// 向已有的 LayoutJob 追加差异内容（带语法高亮和差异背景）
+    ///
+    /// 对整行文本进行语法高亮，然后根据差异片段的边界分割，
+    /// 为 Added/Removed 类型的片段添加浅色背景。
+    fn append_highlighted_diff_to_job(
         &self,
+        job: &mut LayoutJob,
+        full_text: &str,
         segments: &[TextSegment],
+        syntax_name: Option<&str>,
         font_size: f32,
+        is_dark_mode: bool,
         text_color: Color32,
+    ) {
+        // 参考 VS Code / GitHub 的 diff 背景色方案
+        let (added_bg, removed_bg) = if is_dark_mode {
+            // 深色主题：深红/深绿背景
+            (
+                Color32::from_rgba_premultiplied(53, 110, 53, 200),
+                Color32::from_rgba_premultiplied(110, 53, 53, 200),
+            )
+        } else {
+            // 浅色主题：字符级背景色（比行级背景色更深，GitHub 风格）
+            (
+                Color32::from_rgba_premultiplied(171, 242, 188, 220),
+                Color32::from_rgba_premultiplied(255, 193, 192, 220),
+            )
+        };
+
+        if syntax_name.is_some() {
+            // 获取整行的语法高亮结果
+            let highlighted = self.highlighter.highlight_line(
+                full_text, syntax_name, font_size, is_dark_mode,
+            );
+
+            // 构建字符位置到语法高亮颜色的映射
+            let mut char_colors: Vec<Color32> = Vec::new();
+            for (color, text) in &highlighted {
+                for _ in text.chars() {
+                    char_colors.push(*color);
+                }
+            }
+
+            // 遍历差异片段，根据字符位置应用语法高亮颜色和差异背景
+            let mut char_offset = 0;
+            for segment in segments {
+                let seg_len = segment.text.chars().count();
+                let bg = match segment.diff_type {
+                    DiffType::Added => added_bg,
+                    DiffType::Removed => removed_bg,
+                    DiffType::Equal => Color32::TRANSPARENT,
+                };
+
+                // 为片段中的每个字符获取语法高亮颜色
+                let mut seg_text = String::new();
+                let mut current_color = None;
+                for (i, ch) in segment.text.chars().enumerate() {
+                    let color_idx = char_offset + i;
+                    let color = if color_idx < char_colors.len() {
+                        char_colors[color_idx]
+                    } else {
+                        text_color
+                    };
+
+                    // 尝试合并相邻的同色字符以减少 TextFormat 数量
+                    if Some(color) != current_color {
+                        if !seg_text.is_empty() {
+                            job.append(
+                                &seg_text, 0.0,
+                                egui::TextFormat {
+                                    font_id: egui::FontId::monospace(font_size),
+                                    color: current_color.unwrap_or(text_color),
+                                    background: bg,
+                                    ..Default::default()
+                                },
+                            );
+                            seg_text = String::new();
+                        }
+                        current_color = Some(color);
+                    }
+                    seg_text.push(ch);
+                }
+
+                // 输出剩余的文本
+                if !seg_text.is_empty() {
+                    job.append(
+                        &seg_text, 0.0,
+                        egui::TextFormat {
+                            font_id: egui::FontId::monospace(font_size),
+                            color: current_color.unwrap_or(text_color),
+                            background: bg,
+                            ..Default::default()
+                        },
+                    );
+                }
+
+                char_offset += seg_len;
+            }
+        } else {
+            // 无语法高亮时，直接使用差异片段
+            for segment in segments {
+                let color = match segment.diff_type {
+                    DiffType::Equal => text_color,
+                    DiffType::Added => Color32::from_rgb(0, 150, 0),
+                    DiffType::Removed => Color32::from_rgb(180, 0, 0),
+                };
+                let bg = match segment.diff_type {
+                    DiffType::Added => added_bg,
+                    DiffType::Removed => removed_bg,
+                    DiffType::Equal => Color32::TRANSPARENT,
+                };
+                job.append(
+                    &segment.text, 0.0,
+                    egui::TextFormat {
+                        font_id: egui::FontId::monospace(font_size),
+                        color,
+                        background: bg,
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+    }
+
+    fn create_highlighted_diff_layout(
+        &self,
+        full_text: &str,
+        segments: &[TextSegment],
+        syntax_name: Option<&str>,
+        font_size: f32,
+        is_dark_mode: bool,
+        text_color: Color32,
+        _diff_type: &DiffType,
     ) -> LayoutJob {
         let mut job = LayoutJob::default();
         job.wrap.max_width = f32::INFINITY;
-        for segment in segments {
-            let color = match segment.diff_type {
-                DiffType::Equal => text_color,
-                DiffType::Added => Color32::from_rgb(0, 150, 0),
-                DiffType::Removed => Color32::from_rgb(180, 0, 0),
-            };
-            let bg_color = match segment.diff_type {
-                DiffType::Added => Color32::from_rgb(180, 255, 180),
-                DiffType::Removed => Color32::from_rgb(255, 180, 180),
-                DiffType::Equal => Color32::TRANSPARENT,
-            };
-            job.append(
-                &segment.text, 0.0,
-                egui::TextFormat {
-                    font_id: egui::FontId::monospace(font_size),
-                    color,
-                    background: bg_color,
-                    ..Default::default()
-                },
-            );
-        }
+        self.append_highlighted_diff_to_job(
+            &mut job, full_text, segments, syntax_name, font_size, is_dark_mode, text_color,
+        );
         job
     }
 
@@ -687,11 +887,6 @@ impl DiffViewerUi {
                                 ),
                             );
 
-                            let bg = match line.diff_type {
-                                DiffType::Added => Color32::from_rgb(220, 255, 220),
-                                DiffType::Removed => Color32::from_rgb(255, 220, 220),
-                                DiffType::Equal => Color32::TRANSPARENT,
-                            };
                             let prefix = match line.diff_type {
                                 DiffType::Added => "+ ",
                                 DiffType::Removed => "- ",
@@ -702,11 +897,8 @@ impl DiffViewerUi {
                                 egui::vec2(ui.available_width(), row_height),
                                 egui::Layout::left_to_right(egui::Align::Min),
                                 |ui| {
-                                    if bg != Color32::TRANSPARENT {
-                                        let rect = ui.max_rect();
-                                        ui.painter().rect_filled(rect, 0.0, bg);
-                                    }
                                     if line.diff_type == DiffType::Equal && syntax_name.is_some() {
+                                        // 相同行使用语法高亮
                                         let mut job = LayoutJob::default();
                                         job.wrap.max_width = f32::INFINITY;
                                         job.append(
@@ -731,23 +923,89 @@ impl DiffViewerUi {
                                             );
                                         }
                                         ui.label(job);
-                                    } else {
-                                        let text = format!("{}{}", prefix, line.content);
-                                        let color = match line.diff_type {
-                                            DiffType::Added => Color32::from_rgb(0, 150, 0),
-                                            DiffType::Removed => Color32::from_rgb(180, 0, 0),
-                                            _ => text_color,
-                                        };
+                                    } else if !line.segments.is_empty() {
+                                        // 有字符级差异的行：语法高亮 + 差异背景色
                                         let mut job = LayoutJob::default();
                                         job.wrap.max_width = f32::INFINITY;
+                                        // 添加前缀符号（使用 dim_color，不参与语法高亮）
                                         job.append(
-                                            &text, 0.0,
+                                            prefix, 0.0,
                                             egui::TextFormat {
                                                 font_id: egui::FontId::monospace(font_size),
-                                                color,
+                                                color: dim_color,
                                                 ..Default::default()
                                             },
                                         );
+                                        // 添加差异内容（带语法高亮和差异背景）
+                                        self.append_highlighted_diff_to_job(
+                                            &mut job,
+                                            &line.content,
+                                            &line.segments,
+                                            syntax_name.as_deref(),
+                                            font_size,
+                                            is_dark_mode,
+                                            text_color,
+                                        );
+                                        ui.label(job);
+                                    } else {
+                                        // 无字符级差异的行：语法高亮 + 整行差异背景色
+                                        let bg = if is_dark_mode {
+                                            match line.diff_type {
+                                                DiffType::Added => Color32::from_rgba_premultiplied(31, 60, 31, 180),
+                                                DiffType::Removed => Color32::from_rgba_premultiplied(60, 31, 31, 180),
+                                                DiffType::Equal => Color32::TRANSPARENT,
+                                            }
+                                        } else {
+                                            match line.diff_type {
+                                                DiffType::Added => Color32::from_rgba_premultiplied(200, 255, 200, 180),
+                                                DiffType::Removed => Color32::from_rgba_premultiplied(255, 200, 200, 180),
+                                                DiffType::Equal => Color32::TRANSPARENT,
+                                            }
+                                        };
+                                        let mut job = LayoutJob::default();
+                                        job.wrap.max_width = f32::INFINITY;
+                                        // 添加前缀符号
+                                        job.append(
+                                            prefix, 0.0,
+                                            egui::TextFormat {
+                                                font_id: egui::FontId::monospace(font_size),
+                                                color: dim_color,
+                                                ..Default::default()
+                                            },
+                                        );
+                                        if syntax_name.is_some() {
+                                            // 有语法高亮时，保留语法高亮颜色
+                                            let highlighted = self.highlighter.highlight_line(
+                                                &line.content, syntax_name.as_deref(), font_size, is_dark_mode,
+                                            );
+                                            for (color, t) in highlighted {
+                                                job.append(
+                                                    &t, 0.0,
+                                                    egui::TextFormat {
+                                                        font_id: egui::FontId::monospace(font_size),
+                                                        color,
+                                                        background: bg,
+                                                        ..Default::default()
+                                                    },
+                                                );
+                                            }
+                                        } else {
+                                            // 无语法高亮时，使用默认颜色
+                                            let color = match line.diff_type {
+                                                DiffType::Added => Color32::from_rgb(0, 150, 0),
+                                                DiffType::Removed => Color32::from_rgb(180, 0, 0),
+                                                _ => text_color,
+                                            };
+                                            job.append(
+                                                &line.content, 0.0,
+                                                egui::TextFormat {
+                                                    font_id: egui::FontId::monospace(font_size),
+                                                    color,
+                                                    background: bg,
+                                                    ..Default::default()
+                                                },
+                                            );
+                                        }
                                         ui.label(job);
                                     }
                                 },

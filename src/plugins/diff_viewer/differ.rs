@@ -21,7 +21,7 @@ pub fn compute_diff(left: &str, right: &str) -> DiffResult {
     }
 
     // 计算相似度
-    let similarity = diff.ratio() as f64;
+    let similarity: f64 = diff.ratio().into();
 
     DiffResult {
         unified_lines,
@@ -76,38 +76,113 @@ fn build_unified_lines<'a>(diff: &TextDiff<'a, 'a, '_, str>) -> Vec<DiffLine> {
     let mut left_line = 1;
     let mut right_line = 1;
 
-    for change in diff.iter_all_changes() {
-        let content = change.value().to_string();
-        let content = content.trim_end_matches('\n').to_string();
+    // 收集连续的删除和插入操作，用于配对显示字符级差异
+    let changes: Vec<_> = diff.iter_all_changes().collect();
+    let mut i = 0;
+
+    while i < changes.len() {
+        let change = &changes[i];
+        let content = change.value().trim_end_matches('\n').to_string();
 
         match change.tag() {
             ChangeTag::Equal => {
+                let segments = vec![TextSegment {
+                    text: content.clone(),
+                    diff_type: DiffType::Equal,
+                }];
                 lines.push(DiffLine {
                     line_number_left: Some(left_line),
                     line_number_right: Some(right_line),
                     content,
                     diff_type: DiffType::Equal,
+                    segments,
                 });
                 left_line += 1;
                 right_line += 1;
+                i += 1;
             }
             ChangeTag::Delete => {
-                lines.push(DiffLine {
-                    line_number_left: Some(left_line),
-                    line_number_right: None,
-                    content,
-                    diff_type: DiffType::Removed,
-                });
-                left_line += 1;
+                // 检查后面是否有对应的插入操作（修改操作）
+                let mut deletes = Vec::new();
+                let mut inserts = Vec::new();
+
+                // 收集连续的删除操作
+                while i < changes.len() && changes[i].tag() == ChangeTag::Delete {
+                    let c = changes[i].value().trim_end_matches('\n').to_string();
+                    deletes.push(c);
+                    i += 1;
+                }
+
+                // 收集连续的插入操作
+                while i < changes.len() && changes[i].tag() == ChangeTag::Insert {
+                    let c = changes[i].value().trim_end_matches('\n').to_string();
+                    inserts.push(c);
+                    i += 1;
+                }
+
+                // 配对删除和插入操作，多出的行单独作为纯删除/纯新增处理
+                let max_count = deletes.len().max(inserts.len());
+                for j in 0..max_count {
+                    if j < deletes.len() {
+                        let left_content = &deletes[j];
+                        // 如果有对应的插入行，计算字符级差异并缓存结果
+                        let segments = if j < inserts.len() {
+                            let (old_segments, _) = compute_char_diff(left_content, &inserts[j]);
+                            old_segments
+                        } else {
+                            vec![TextSegment {
+                                text: left_content.clone(),
+                                diff_type: DiffType::Removed,
+                            }]
+                        };
+                        lines.push(DiffLine {
+                            line_number_left: Some(left_line),
+                            line_number_right: None,
+                            content: left_content.clone(),
+                            diff_type: DiffType::Removed,
+                            segments,
+                        });
+                        left_line += 1;
+                    }
+
+                    if j < inserts.len() {
+                        let right_content = &inserts[j];
+                        // 如果有对应的删除行，复用之前的计算结果
+                        let segments = if j < deletes.len() {
+                            let (_, new_segments) = compute_char_diff(&deletes[j], right_content);
+                            new_segments
+                        } else {
+                            vec![TextSegment {
+                                text: right_content.clone(),
+                                diff_type: DiffType::Added,
+                            }]
+                        };
+                        lines.push(DiffLine {
+                            line_number_left: None,
+                            line_number_right: Some(right_line),
+                            content: right_content.clone(),
+                            diff_type: DiffType::Added,
+                            segments,
+                        });
+                        right_line += 1;
+                    }
+                }
             }
             ChangeTag::Insert => {
+                // 纯插入（没有对应的删除）
+                let segments = vec![TextSegment {
+                    text: content.clone(),
+                    diff_type: DiffType::Added,
+                }];
                 lines.push(DiffLine {
                     line_number_left: None,
                     line_number_right: Some(right_line),
                     content,
                     diff_type: DiffType::Added,
+                    segments,
                 });
                 right_line += 1;
+                i += 1;
             }
         }
     }
@@ -127,8 +202,7 @@ fn build_split_lines<'a>(diff: &TextDiff<'a, 'a, '_, str>) -> Vec<SplitLine> {
 
     while i < changes.len() {
         let change = &changes[i];
-        let content = change.value().to_string();
-        let content = content.trim_end_matches('\n').to_string();
+        let content = change.value().trim_end_matches('\n').to_string();
 
         match change.tag() {
             ChangeTag::Equal => {
@@ -159,16 +233,14 @@ fn build_split_lines<'a>(diff: &TextDiff<'a, 'a, '_, str>) -> Vec<SplitLine> {
 
                 // 收集连续的删除操作
                 while i < changes.len() && changes[i].tag() == ChangeTag::Delete {
-                    let c = changes[i].value().to_string();
-                    let c = c.trim_end_matches('\n').to_string();
+                    let c = changes[i].value().trim_end_matches('\n').to_string();
                     deletes.push(c);
                     i += 1;
                 }
 
                 // 收集连续的插入操作
                 while i < changes.len() && changes[i].tag() == ChangeTag::Insert {
-                    let c = changes[i].value().to_string();
-                    let c = c.trim_end_matches('\n').to_string();
+                    let c = changes[i].value().trim_end_matches('\n').to_string();
                     inserts.push(c);
                     i += 1;
                 }

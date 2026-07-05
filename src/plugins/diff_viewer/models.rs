@@ -40,6 +40,8 @@ pub struct DiffLine {
     pub content: String,
     /// 差异类型
     pub diff_type: DiffType,
+    /// 字符级差异片段（用于修改行的高亮显示）
+    pub segments: Vec<TextSegment>,
 }
 
 /// Split 视图的单行数据
