@@ -716,20 +716,14 @@ impl DiffViewerUi {
                 job.wrap.max_width = f32::INFINITY;
                 ui.label(job);
             } else if !segments.is_empty() && !is_whole_line_change {
-                // 有字符级差异的行（修改行）：在行级背景色基础上叠加字符级背景色
-                let mut job = LayoutJob::default();
-                job.wrap.max_width = f32::INFINITY;
-                let (added_bg, removed_bg) = Self::diff_background_colors(is_dark_mode);
-                self.append_diff_segments_to_job(
-                    &mut job,
+                // 有字符级差异的行（修改行）：在行级背景色基础上叠加字符级背景色（带缓存）
+                let job = self.get_diff_line_job(
                     text,
                     segments,
                     syntax_name.as_deref(),
                     font_size,
                     is_dark_mode,
                     text_color,
-                    added_bg,
-                    removed_bg,
                 );
                 ui.label(job);
             } else {
@@ -1338,7 +1332,7 @@ impl DiffViewerUi {
 
     /// 获取行级语法高亮的 LayoutJob（带缓存）
     ///
-    /// 用于 Unified 视图中每行的语法高亮，避免每帧重复计算。
+    /// 用于相同行的语法高亮，避免每帧重复计算。
     fn get_line_highlight_job(
         &self,
         text: &str,
@@ -1354,6 +1348,55 @@ impl DiffViewerUi {
         }
 
         let job = self.highlighter.highlight_to_layout_job(text, syntax_name, font_size, is_dark_mode);
+        cache.insert(hash, job.clone());
+        job
+    }
+
+    /// 获取修改行的 LayoutJob（带缓存）
+    ///
+    /// 用于有字符级差异的行，缓存语法高亮+差异背景的结果。
+    fn get_diff_line_job(
+        &self,
+        text: &str,
+        segments: &[TextSegment],
+        syntax_name: Option<&str>,
+        font_size: f32,
+        is_dark_mode: bool,
+        text_color: Color32,
+    ) -> LayoutJob {
+        // 计算缓存 hash（包含差异片段信息）
+        let mut hasher = DefaultHasher::new();
+        text.hash(&mut hasher);
+        syntax_name.hash(&mut hasher);
+        is_dark_mode.hash(&mut hasher);
+        font_size.to_bits().hash(&mut hasher);
+        for seg in segments {
+            seg.text.hash(&mut hasher);
+            seg.diff_type.hash(&mut hasher);
+        }
+        let hash = hasher.finish();
+
+        let mut cache = self.unified_line_cache.borrow_mut();
+        if let Some(job) = cache.get(&hash) {
+            return job.clone();
+        }
+
+        // 创建新的 LayoutJob
+        let mut job = LayoutJob::default();
+        job.wrap.max_width = f32::INFINITY;
+        let (added_bg, removed_bg) = Self::diff_background_colors(is_dark_mode);
+        self.append_diff_segments_to_job(
+            &mut job,
+            text,
+            segments,
+            syntax_name,
+            font_size,
+            is_dark_mode,
+            text_color,
+            added_bg,
+            removed_bg,
+        );
+
         cache.insert(hash, job.clone());
         job
     }

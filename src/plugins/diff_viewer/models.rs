@@ -1,5 +1,5 @@
 /// 差异类型
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub enum DiffType {
     /// 相同
     Equal,
@@ -10,7 +10,7 @@ pub enum DiffType {
 }
 
 /// 文本片段（用于字符级差异显示）
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub struct TextSegment {
     /// 文本内容
     pub text: String,
