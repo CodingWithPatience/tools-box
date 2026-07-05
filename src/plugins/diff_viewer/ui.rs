@@ -473,7 +473,7 @@ impl DiffViewerUi {
                                     }
                                     let output = content_scroll.show(ui, |ui| {
                                         ui.spacing_mut().item_spacing.y = 0.0;
-                                        for line in &result.split_lines {
+                                        for (line_index, line) in result.split_lines.iter().enumerate() {
                                             let line_bg = match line.left_type {
                                                 DiffType::Removed => if is_dark_mode {
                                                     Color32::from_rgba_unmultiplied(61, 31, 35, 180)
@@ -493,7 +493,7 @@ impl DiffViewerUi {
                                                     }
                                                     self.render_cell(
                                                         ui, line, true, row_height, font_size,
-                                                        &syntax_name, is_dark_mode, text_color,
+                                                        &syntax_name, is_dark_mode, text_color, line_index,
                                                     );
                                                 },
                                             );
@@ -604,7 +604,7 @@ impl DiffViewerUi {
                                     }
                                     let output = content_scroll.show(ui, |ui| {
                                         ui.spacing_mut().item_spacing.y = 0.0;
-                                        for line in &result.split_lines {
+                                        for (line_index, line) in result.split_lines.iter().enumerate() {
                                             let line_bg = match line.right_type {
                                                 DiffType::Added => if is_dark_mode {
                                                     Color32::from_rgba_unmultiplied(31, 61, 38, 180)
@@ -624,7 +624,7 @@ impl DiffViewerUi {
                                                     }
                                                     self.render_cell(
                                                         ui, line, false, row_height, font_size,
-                                                        &syntax_name, is_dark_mode, text_color,
+                                                        &syntax_name, is_dark_mode, text_color, line_index,
                                                     );
                                                 },
                                             );
@@ -692,6 +692,7 @@ impl DiffViewerUi {
         syntax_name: &Option<String>,
         is_dark_mode: bool,
         text_color: Color32,
+        line_index: usize,
     ) {
         let (content, diff_type, segments) = if is_left {
             (&line.left_content, &line.left_type, &line.left_segments)
@@ -770,7 +771,22 @@ impl DiffViewerUi {
                 ui.label(job);
             }
         } else {
-            // 空行（删除/新增行的对侧行）：渲染空占位符，保持高度一致
+            // 空行（删除/新增行的对侧行）：绘制斜线背景，标识行不存在
+            let mut rect = ui.max_rect();
+            // 扩展宽度以覆盖横向滚动后的内容
+            rect.set_width(rect.width().max(2000.0));
+            let hatched_color = if is_dark_mode {
+                Color32::from_rgba_unmultiplied(50, 50, 55, 255)
+            } else {
+                Color32::from_rgba_unmultiplied(180, 180, 190, 255)
+            };
+            Self::paint_hatched_background(
+                ui.painter(),
+                rect,
+                line_index,
+                row_height,
+                hatched_color,
+            );
             ui.allocate_space(egui::vec2(ui.available_width(), row_height));
         }
     }
@@ -1173,6 +1189,56 @@ impl DiffViewerUi {
                 font_id.clone(),
                 text_color,
             );
+        }
+    }
+
+    /// 绘制斜线背景（用于标识不存在的行）
+    ///
+    /// 在指定矩形区域内绘制右上到左下的45度斜线。
+    /// 使用全局 y位置计算斜线偏移，确保相邻行的斜线对接。
+    ///
+    /// # 参数
+    /// - `painter`: 绘制器
+    /// - `rect`: 绘制区域
+    /// - `line_index`: 行索引（用于计算全局 y位置）
+    /// - `row_height`: 行高
+    /// - `color`: 斜线颜色
+    fn paint_hatched_background(
+        painter: &egui::Painter,
+        rect: egui::Rect,
+        line_index: usize,
+        row_height: f32,
+        color: Color32,
+    ) {
+        let spacing = row_height; // 斜线间距等于行高，确保相邻行对接
+        let line_width = 1.0;
+        let rect_height = rect.max.y - rect.min.y;
+
+        // 计算全局 y 起始位置（基于行索引和行高）
+        let global_y_start = line_index as f32 * row_height;
+
+        // 计算斜线的起始偏移（基于全局 y 位置）
+        let offset = global_y_start % spacing;
+
+        // 绘制斜线（从右上到左下）
+        // 只绘制完整跨越矩形高度的斜线，避免裁剪导致的竖线问题
+        let mut x_start = rect.min.x - offset;
+        while x_start <= rect.max.x {
+            let x1 = x_start;
+            let x2 = x_start - rect_height;
+
+            // 只绘制起点和终点都在矩形区域内的斜线
+            if x1 >= rect.min.x && x2 <= rect.max.x {
+                painter.line_segment(
+                    [
+                        egui::pos2(x1, rect.min.y),
+                        egui::pos2(x2, rect.max.y),
+                    ],
+                    egui::Stroke::new(line_width, color),
+                );
+            }
+
+            x_start += spacing;
         }
     }
 
