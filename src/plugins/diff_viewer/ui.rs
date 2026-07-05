@@ -1078,19 +1078,14 @@ impl DiffViewerUi {
                                         job.wrap.max_width = f32::INFINITY;
                                         ui.label(job);
                                     } else if !is_whole_line_change && !line.segments.is_empty() {
-                                        let mut job = LayoutJob::default();
-                                        job.wrap.max_width = f32::INFINITY;
-                                        let (added_bg, removed_bg) = Self::diff_background_colors(is_dark_mode);
-                                        self.append_diff_segments_to_job(
-                                            &mut job,
+                                        // 修改行：使用缓存的 LayoutJob
+                                        let job = self.get_diff_line_job(
                                             &line.content,
                                             &line.segments,
                                             syntax_name.as_deref(),
                                             font_size,
                                             is_dark_mode,
                                             text_color,
-                                            added_bg,
-                                            removed_bg,
                                         );
                                         ui.label(job);
                                     } else {
