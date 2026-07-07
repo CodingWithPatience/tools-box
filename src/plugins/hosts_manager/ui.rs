@@ -8,14 +8,10 @@ use super::store::*;
 enum UiState {
     /// 环境列表主界面
     EnvironmentList,
-    /// 新增环境
-    AddEnvironment,
     /// 编辑环境名称
     EditEnvironment(i64),
     /// 条目列表
     EntryList(i64),
-    /// 新增条目
-    AddEntry(i64),
     /// 编辑条目
     EditEntry(i64, i64), // (env_id, entry_id)
 }
@@ -30,6 +26,14 @@ pub struct HostsManagerUi {
     entry_form: HostsEntryForm,
     error_msg: Option<String>,
     success_msg: Option<String>,
+    /// 新增环境弹窗是否打开
+    add_env_dialog_open: bool,
+    /// 新增条目弹窗是否打开
+    add_entry_dialog_open: bool,
+    /// 待删除的环境 ID（用于确认弹窗）
+    pending_delete_env_id: Option<i64>,
+    /// 待删除的条目 ID（用于确认弹窗）
+    pending_delete_entry_id: Option<i64>,
 }
 
 impl HostsManagerUi {
@@ -43,6 +47,10 @@ impl HostsManagerUi {
             entry_form: HostsEntryForm::new(),
             error_msg: None,
             success_msg: None,
+            add_env_dialog_open: false,
+            add_entry_dialog_open: false,
+            pending_delete_env_id: None,
+            pending_delete_entry_id: None,
         }
     }
 
@@ -50,10 +58,8 @@ impl HostsManagerUi {
     pub fn render(&mut self, ui: &mut egui::Ui, conn: &Connection) {
         match self.state.clone() {
             UiState::EnvironmentList => self.render_environment_list(ui, conn),
-            UiState::AddEnvironment => self.render_add_environment(ui, conn),
             UiState::EditEnvironment(id) => self.render_edit_environment(ui, conn, id),
             UiState::EntryList(env_id) => self.render_entry_list(ui, conn, env_id),
-            UiState::AddEntry(env_id) => self.render_add_entry(ui, conn, env_id),
             UiState::EditEntry(env_id, entry_id) => {
                 self.render_edit_entry(ui, conn, env_id, entry_id)
             }
@@ -134,7 +140,7 @@ impl HostsManagerUi {
         // 工具栏
         ui.horizontal(|ui| {
             if ui.button("➕ 新增环境").clicked() {
-                self.state = UiState::AddEnvironment;
+                self.add_env_dialog_open = true;
                 self.env_form = EnvironmentForm::new();
                 self.clear_messages();
             }
@@ -212,7 +218,7 @@ impl HostsManagerUi {
                                 }
 
                                 if ui.button("🗑").clicked() {
-                                    self.delete_environment(conn, env.id);
+                                    self.pending_delete_env_id = Some(env.id);
                                 }
                             });
 
@@ -226,6 +232,10 @@ impl HostsManagerUi {
         ui.horizontal(|ui| {
             ui.label("⚠ 应用环境需要管理员权限运行程序");
         });
+
+        // 弹窗渲染
+        self.render_add_environment_dialog(ui, conn);
+        self.render_delete_env_confirm_dialog(ui, conn);
     }
 
     /// 切换环境激活状态
@@ -271,36 +281,139 @@ impl HostsManagerUi {
         }
     }
 
-    /// 渲染新增环境界面
-    fn render_add_environment(&mut self, ui: &mut egui::Ui, conn: &Connection) {
-        ui.horizontal(|ui| {
-            ui.heading("➕ 新增环境");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("← 返回").clicked() {
-                    self.state = UiState::EnvironmentList;
-                    self.clear_messages();
-                }
+    /// 渲染删除环境确认弹窗
+    fn render_delete_env_confirm_dialog(&mut self, ui: &mut egui::Ui, conn: &Connection) {
+        let Some(env_id) = self.pending_delete_env_id else {
+            return;
+        };
+
+        let env_name = self
+            .environments
+            .iter()
+            .find(|e| e.id == env_id)
+            .map(|e| e.name.clone())
+            .unwrap_or_else(|| "未知环境".to_string());
+
+        let mut open = true;
+        let mut confirmed = false;
+
+        egui::Window::new("确认删除环境")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ui.ctx(), |ui| {
+                ui.label(format!(
+                    "确定要删除环境 \"{}\" 吗？该环境下的所有条目也将被删除。",
+                    env_name
+                ));
+                ui.add_space(12.0);
+
+                ui.horizontal(|ui| {
+                    if ui.button("🗑 确认删除").clicked() {
+                        confirmed = true;
+                    }
+                    if ui.button("取消").clicked() {
+                        self.pending_delete_env_id = None;
+                    }
+                });
             });
-        });
-        ui.separator();
 
-        ui.add_space(10.0);
+        if confirmed {
+            self.delete_environment(conn, env_id);
+            self.pending_delete_env_id = None;
+        } else if !open {
+            self.pending_delete_env_id = None;
+        }
+    }
 
-        ui.horizontal(|ui| {
-            ui.label("环境名称：");
-            ui.text_edit_singleline(&mut self.env_form.name);
-        });
+    /// 渲染删除条目确认弹窗
+    fn render_delete_entry_confirm_dialog(
+        &mut self,
+        ui: &mut egui::Ui,
+        conn: &Connection,
+        env_id: i64,
+    ) {
+        let Some(entry_id) = self.pending_delete_entry_id else {
+            return;
+        };
 
-        ui.add_space(8.0);
+        let entry_info = self
+            .entries
+            .iter()
+            .find(|e| e.id == entry_id)
+            .map(|e| format!("{} → {}", e.ip_address, e.hostname))
+            .unwrap_or_else(|| "未知条目".to_string());
 
-        ui.horizontal(|ui| {
-            if ui.button("💾 保存").clicked() {
-                self.save_new_environment(conn);
-            }
-        });
+        let mut open = true;
+        let mut confirmed = false;
 
-        ui.add_space(8.0);
-        self.render_messages(ui);
+        egui::Window::new("确认删除条目")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ui.ctx(), |ui| {
+                ui.label(format!(
+                    "确定要删除条目 \"{}\" 吗？此操作不可撤销。",
+                    entry_info
+                ));
+                ui.add_space(12.0);
+
+                ui.horizontal(|ui| {
+                    if ui.button("🗑 确认删除").clicked() {
+                        confirmed = true;
+                    }
+                    if ui.button("取消").clicked() {
+                        self.pending_delete_entry_id = None;
+                    }
+                });
+            });
+
+        if confirmed {
+            self.delete_entry(conn, entry_id, env_id);
+            self.pending_delete_entry_id = None;
+        } else if !open {
+            self.pending_delete_entry_id = None;
+        }
+    }
+
+    /// 渲染新增环境弹窗
+    fn render_add_environment_dialog(&mut self, ui: &mut egui::Ui, conn: &Connection) {
+        if !self.add_env_dialog_open {
+            return;
+        }
+
+        let mut open = self.add_env_dialog_open;
+        let mut close_dialog = false;
+
+        egui::Window::new("➕ 新增环境")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(300.0)
+            .show(ui.ctx(), |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("环境名称：");
+                    ui.text_edit_singleline(&mut self.env_form.name);
+                });
+
+                ui.add_space(8.0);
+
+                if ui.button("💾 保存").clicked() {
+                    self.save_new_environment(conn);
+                    if self.error_msg.is_none() {
+                        close_dialog = true;
+                    }
+                }
+
+                ui.add_space(4.0);
+                self.render_messages(ui);
+            });
+
+        if close_dialog || !open {
+            self.add_env_dialog_open = false;
+        }
     }
 
     /// 保存新环境
@@ -316,7 +429,7 @@ impl HostsManagerUi {
         match store.add_environment(&self.env_form.name) {
             Ok(_) => {
                 self.set_success("环境创建成功".to_string());
-                self.state = UiState::EnvironmentList;
+                self.load_environments(conn);
             }
             Err(e) => {
                 self.set_error(format!("创建环境失败: {}", e));
@@ -392,6 +505,7 @@ impl HostsManagerUi {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("← 返回").clicked() {
                     self.state = UiState::EnvironmentList;
+                    self.pending_delete_entry_id = None;
                     self.clear_messages();
                 }
             });
@@ -401,7 +515,8 @@ impl HostsManagerUi {
         // 工具栏
         ui.horizontal(|ui| {
             if ui.button("➕ 新增条目").clicked() {
-                self.state = UiState::AddEntry(env_id);
+                self.add_entry_dialog_open = true;
+                self.selected_env = Some(env_id);
                 self.entry_form = HostsEntryForm::new();
                 self.clear_messages();
             }
@@ -474,7 +589,7 @@ impl HostsManagerUi {
                                 }
 
                                 if ui.button("🗑").clicked() {
-                                    self.delete_entry(conn, entry.id, env_id);
+                                    self.pending_delete_entry_id = Some(entry.id);
                                 }
                             });
 
@@ -493,6 +608,10 @@ impl HostsManagerUi {
                 active_count
             ));
         });
+
+        // 弹窗渲染
+        self.render_add_entry_dialog(ui, conn, env_id);
+        self.render_delete_entry_confirm_dialog(ui, conn, env_id);
     }
 
     /// 切换条目启用状态
@@ -530,30 +649,39 @@ impl HostsManagerUi {
         }
     }
 
-    /// 渲染新增条目界面
-    fn render_add_entry(&mut self, ui: &mut egui::Ui, conn: &Connection, env_id: i64) {
-        ui.horizontal(|ui| {
-            ui.heading("➕ 新增 Hosts 条目");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("← 返回").clicked() {
-                    self.state = UiState::EntryList(env_id);
-                    self.load_entries(conn, env_id);
-                    self.clear_messages();
-                }
-            });
-        });
-        ui.separator();
-
-        self.render_entry_form(ui);
-
-        ui.add_space(8.0);
-
-        if ui.button("💾 保存").clicked() {
-            self.save_new_entry(conn, env_id);
+    /// 渲染新增条目弹窗
+    fn render_add_entry_dialog(&mut self, ui: &mut egui::Ui, conn: &Connection, env_id: i64) {
+        if !self.add_entry_dialog_open {
+            return;
         }
 
-        ui.add_space(8.0);
-        self.render_messages(ui);
+        let mut open = self.add_entry_dialog_open;
+        let mut close_dialog = false;
+
+        egui::Window::new("➕ 新增 Hosts 条目")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(350.0)
+            .show(ui.ctx(), |ui| {
+                self.render_entry_form(ui);
+
+                ui.add_space(8.0);
+
+                if ui.button("💾 保存").clicked() {
+                    self.save_new_entry(conn, env_id);
+                    if self.error_msg.is_none() {
+                        close_dialog = true;
+                    }
+                }
+
+                ui.add_space(4.0);
+                self.render_messages(ui);
+            });
+
+        if close_dialog || !open {
+            self.add_entry_dialog_open = false;
+        }
     }
 
     /// 保存新条目

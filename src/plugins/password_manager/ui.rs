@@ -15,12 +15,8 @@ enum UiState {
     ChangeMasterPassword,
     /// 密码列表主界面
     MainList,
-    /// 新增密码条目
-    AddEntry,
     /// 编辑密码条目
     EditEntry(i64),
-    /// 密码生成器
-    Generator,
 }
 
 /// 导出格式选择弹窗状态
@@ -49,6 +45,12 @@ pub struct PasswordManagerUi {
     visible_passwords: std::collections::HashMap<i64, String>,
     /// 导出弹窗状态
     export_dialog: ExportDialogState,
+    /// 新增密码弹窗是否打开
+    add_dialog_open: bool,
+    /// 生成密码弹窗是否打开
+    generator_dialog_open: bool,
+    /// 待删除的密码条目 ID（用于确认弹窗）
+    pending_delete_id: Option<i64>,
 }
 
 impl PasswordManagerUi {
@@ -69,6 +71,9 @@ impl PasswordManagerUi {
             success_msg: None,
             visible_passwords: std::collections::HashMap::new(),
             export_dialog: ExportDialogState::Closed,
+            add_dialog_open: false,
+            generator_dialog_open: false,
+            pending_delete_id: None,
         }
     }
 
@@ -79,9 +84,7 @@ impl PasswordManagerUi {
             UiState::SetMasterPassword => self.render_set_password(ui, conn),
             UiState::ChangeMasterPassword => self.render_change_password(ui, conn),
             UiState::MainList => self.render_main_list(ui, conn),
-            UiState::AddEntry => self.render_add_entry(ui, conn),
             UiState::EditEntry(id) => self.render_edit_entry(ui, conn, id),
-            UiState::Generator => self.render_generator(ui),
         }
     }
 
@@ -99,6 +102,17 @@ impl PasswordManagerUi {
     fn clear_messages(&mut self) {
         self.error_msg = None;
         self.success_msg = None;
+    }
+
+    /// 构建密码生成配置
+    fn build_password_config(&self) -> crypto::PasswordConfig {
+        crypto::PasswordConfig {
+            length: self.generator_config.length,
+            use_uppercase: self.generator_config.use_uppercase,
+            use_lowercase: self.generator_config.use_lowercase,
+            use_digits: self.generator_config.use_digits,
+            use_symbols: self.generator_config.use_symbols,
+        }
     }
 
     /// 设置错误消息
@@ -431,13 +445,14 @@ impl PasswordManagerUi {
         // 工具栏
         ui.horizontal(|ui| {
             if ui.button("➕ 新增").clicked() {
-                self.state = UiState::AddEntry;
+                self.add_dialog_open = true;
                 self.form = PasswordForm::new();
                 self.clear_messages();
             }
 
             if ui.button("🔑 生成密码").clicked() {
-                self.state = UiState::Generator;
+                self.generator_dialog_open = true;
+                self.generated_password.clear();
                 self.clear_messages();
             }
 
@@ -466,7 +481,10 @@ impl PasswordManagerUi {
         });
 
         ui.add_space(8.0);
-        self.render_messages(ui);
+        // 弹窗打开时跳过主列表消息渲染，避免重复显示
+        if !self.add_dialog_open && !self.generator_dialog_open {
+            self.render_messages(ui);
+        }
         ui.add_space(4.0);
 
         // 密码列表表格
@@ -484,8 +502,57 @@ impl PasswordManagerUi {
             ui.label(format!("共 {} 条记录", self.entries.len()));
         });
 
-        // 导出格式选择弹窗
+        // 弹窗渲染
         self.render_export_dialog(ui, conn);
+        self.render_add_dialog(ui, conn);
+        self.render_generator_dialog(ui);
+        self.render_delete_confirm_dialog(ui, conn);
+    }
+
+    /// 渲染删除确认弹窗
+    fn render_delete_confirm_dialog(&mut self, ui: &mut egui::Ui, conn: &Connection) {
+        let Some(delete_id) = self.pending_delete_id else {
+            return;
+        };
+
+        let entry_info = self
+            .entries
+            .iter()
+            .find(|e| e.id == delete_id)
+            .map(|e| format!("「{}」(账号: {})", e.name, e.username))
+            .unwrap_or_else(|| "未知记录".to_string());
+
+        let mut open = true;
+        let mut confirmed = false;
+
+        egui::Window::new("确认删除")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ui.ctx(), |ui| {
+                ui.label(format!(
+                    "确定要删除密码记录 {} 吗？此操作不可撤销。",
+                    entry_info
+                ));
+                ui.add_space(12.0);
+
+                ui.horizontal(|ui| {
+                    if ui.button("🗑 确认删除").clicked() {
+                        confirmed = true;
+                    }
+                    if ui.button("取消").clicked() {
+                        self.pending_delete_id = None;
+                    }
+                });
+            });
+
+        if confirmed {
+            self.delete_entry(conn, delete_id);
+            self.pending_delete_id = None;
+        } else if !open {
+            self.pending_delete_id = None;
+        }
     }
 
     /// 渲染导出格式选择弹窗
@@ -603,7 +670,7 @@ impl PasswordManagerUi {
 
                         // 删除
                         if ui.button("🗑").clicked() {
-                            self.delete_entry(conn, entry.id);
+                            self.pending_delete_id = Some(entry.id);
                         }
                     });
 
@@ -647,43 +714,47 @@ impl PasswordManagerUi {
         }
     }
 
-    /// 渲染新增条目界面
-    fn render_add_entry(&mut self, ui: &mut egui::Ui, conn: &Connection) {
-        ui.horizontal(|ui| {
-            ui.heading("➕ 新增密码");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("← 返回").clicked() {
-                    self.state = UiState::MainList;
-                    self.clear_messages();
-                }
+    /// 渲染新增密码弹窗
+    fn render_add_dialog(&mut self, ui: &mut egui::Ui, conn: &Connection) {
+        if !self.add_dialog_open {
+            return;
+        }
+
+        let mut open = self.add_dialog_open;
+        let mut close_dialog = false;
+
+        egui::Window::new("➕ 新增密码")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(350.0)
+            .show(ui.ctx(), |ui| {
+                self.render_password_form(ui);
+
+                ui.add_space(8.0);
+
+                ui.horizontal(|ui| {
+                    if ui.button("💾 保存").clicked() {
+                        self.save_new_entry(conn);
+                        if self.error_msg.is_none() {
+                            close_dialog = true;
+                        }
+                    }
+
+                    if ui.button("🎲 生成密码").clicked() {
+                        let config = self.build_password_config();
+                        self.form.password = crypto::generate_password(&config);
+                        self.form.show_password = true;
+                    }
+                });
+
+                ui.add_space(4.0);
+                self.render_messages(ui);
             });
-        });
-        ui.separator();
 
-        self.render_password_form(ui);
-
-        ui.add_space(8.0);
-
-        ui.horizontal(|ui| {
-            if ui.button("💾 保存").clicked() {
-                self.save_new_entry(conn);
-            }
-
-            if ui.button("🎲 生成密码").clicked() {
-                let config = crypto::PasswordConfig {
-                    length: self.generator_config.length,
-                    use_uppercase: self.generator_config.use_uppercase,
-                    use_lowercase: self.generator_config.use_lowercase,
-                    use_digits: self.generator_config.use_digits,
-                    use_symbols: self.generator_config.use_symbols,
-                };
-                self.form.password = crypto::generate_password(&config);
-                self.form.show_password = true;
-            }
-        });
-
-        ui.add_space(8.0);
-        self.render_messages(ui);
+        if close_dialog || !open {
+            self.add_dialog_open = false;
+        }
     }
 
     /// 保存新条目
@@ -702,7 +773,6 @@ impl PasswordManagerUi {
             match store.add_entry(&entry, key) {
                 Ok(_) => {
                     self.set_success("保存成功".to_string());
-                    self.state = UiState::MainList;
                     self.load_entries(conn);
                 }
                 Err(e) => {
@@ -735,13 +805,7 @@ impl PasswordManagerUi {
             }
 
             if ui.button("🎲 生成密码").clicked() {
-                let config = crypto::PasswordConfig {
-                    length: self.generator_config.length,
-                    use_uppercase: self.generator_config.use_uppercase,
-                    use_lowercase: self.generator_config.use_lowercase,
-                    use_digits: self.generator_config.use_digits,
-                    use_symbols: self.generator_config.use_symbols,
-                };
+                let config = self.build_password_config();
                 self.form.password = crypto::generate_password(&config);
                 self.form.show_password = true;
             }
@@ -840,73 +904,74 @@ impl PasswordManagerUi {
             });
     }
 
-    /// 渲染密码生成器界面
-    fn render_generator(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.heading("🔑 密码生成器");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("← 返回").clicked() {
-                    self.state = UiState::MainList;
-                    self.clear_messages();
-                }
-            });
-        });
-        ui.separator();
-
-        ui.add_space(10.0);
-
-        // 配置选项
-        ui.horizontal(|ui| {
-            ui.label("密码长度：");
-            ui.add(egui::Slider::new(&mut self.generator_config.length, 4..=64));
-        });
-
-        ui.add_space(4.0);
-
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut self.generator_config.use_uppercase, "大写字母 (A-Z)");
-            ui.checkbox(&mut self.generator_config.use_lowercase, "小写字母 (a-z)");
-        });
-
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut self.generator_config.use_digits, "数字 (0-9)");
-            ui.checkbox(&mut self.generator_config.use_symbols, "特殊符号 (!@#$...)");
-        });
-
-        ui.add_space(8.0);
-
-        // 生成按钮
-        if ui.button("🎲 生成密码").clicked() {
-            let config = crypto::PasswordConfig {
-                length: self.generator_config.length,
-                use_uppercase: self.generator_config.use_uppercase,
-                use_lowercase: self.generator_config.use_lowercase,
-                use_digits: self.generator_config.use_digits,
-                use_symbols: self.generator_config.use_symbols,
-            };
-            self.generated_password = crypto::generate_password(&config);
+    /// 渲染密码生成器弹窗
+    fn render_generator_dialog(&mut self, ui: &mut egui::Ui) {
+        if !self.generator_dialog_open {
+            return;
         }
 
-        ui.add_space(8.0);
+        let mut open = self.generator_dialog_open;
 
-        // 显示生成的密码
-        if !self.generated_password.is_empty() {
-            ui.horizontal(|ui| {
-                ui.label("生成的密码：");
-                ui.monospace(&self.generated_password);
+        egui::Window::new("🔑 密码生成器")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(320.0)
+            .show(ui.ctx(), |ui| {
+                // 配置选项
+                ui.horizontal(|ui| {
+                    ui.label("密码长度：");
+                    ui.add(egui::Slider::new(&mut self.generator_config.length, 4..=64));
+                });
 
-                if ui.button("📋 复制").clicked() {
-                    self.copy_to_clipboard(&self.generated_password);
-                    self.set_success("已复制到剪贴板".to_string());
+                ui.add_space(4.0);
+
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.generator_config.use_uppercase, "大写字母 (A-Z)");
+                    ui.checkbox(&mut self.generator_config.use_lowercase, "小写字母 (a-z)");
+                });
+
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.generator_config.use_digits, "数字 (0-9)");
+                    ui.checkbox(&mut self.generator_config.use_symbols, "特殊符号 (!@#$...)");
+                });
+
+                ui.add_space(8.0);
+
+                // 生成按钮
+                if ui.button("🎲 生成密码").clicked() {
+                    let config = self.build_password_config();
+                    self.generated_password = crypto::generate_password(&config);
                 }
+
+                ui.add_space(8.0);
+
+                // 显示生成的密码
+                if !self.generated_password.is_empty() {
+                    ui.horizontal(|ui| {
+                        ui.label("生成的密码：");
+                        ui.monospace(&self.generated_password);
+                    });
+
+                    ui.add_space(4.0);
+
+                    ui.horizontal(|ui| {
+                        ui.label(format!("长度: {} 位", self.generated_password.len()));
+
+                        if ui.button("📋 复制").clicked() {
+                            self.copy_to_clipboard(&self.generated_password);
+                            self.set_success("已复制到剪贴板".to_string());
+                        }
+                    });
+                }
+
+                ui.add_space(4.0);
+                self.render_messages(ui);
             });
 
-            ui.add_space(4.0);
-            ui.label(format!("长度: {} 位", self.generated_password.len()));
+        if !open {
+            self.generator_dialog_open = false;
         }
-
-        ui.add_space(8.0);
-        self.render_messages(ui);
     }
 
     /// 导出密码数据到文件
@@ -1034,6 +1099,7 @@ impl PasswordManagerUi {
         self.entries.clear();
         self.visible_passwords.clear();
         self.search_query.clear();
+        self.pending_delete_id = None;
         self.state = UiState::RequireMasterPassword;
         self.clear_messages();
     }
