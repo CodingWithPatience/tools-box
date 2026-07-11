@@ -4222,6 +4222,7 @@ dependencies = [
  "pbkdf2",
  "pulldown-cmark",
  "rand",
+ "raw-window-handle",
  "reqwest",
  "rfd",
  "rusqlite",
@@ -4235,6 +4236,7 @@ dependencies = [
  "urlencoding",
  "uuid",
  "vt100",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]

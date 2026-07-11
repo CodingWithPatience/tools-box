@@ -7,6 +7,7 @@ edition = "2024"
 # GUI framework
 eframe = { version = "0.31", features = ["default"] }
 egui = "0.31"
+raw-window-handle = "0.6"
 
 # SQLite database
 rusqlite = { version = "0.35", features = ["bundled"] }
@@ -59,3 +60,10 @@ syntect = "5.3.0"
 # SSH client
 ssh2 = "0.9"
 vt100 = "0.15"
+# Windows API（托盘 + 全局热键）
+windows-sys = { version = "0.60", features = [
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+] }

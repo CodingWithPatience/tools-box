@@ -1,7 +1,13 @@
 use crate::plugin::Plugin;
 use crate::plugins;
 use crate::storage::Database;
+use crate::tray::{TrayEvent, TrayManager};
 use egui::FontFamily;
+use raw_window_handle::HasWindowHandle;
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    GetWindowLongW, SetForegroundWindow, SetWindowLongW, ShowWindow, GWL_EXSTYLE,
+    SW_HIDE, SW_RESTORE, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+};
 
 /// 默认字体大小
 const DEFAULT_FONT_SIZE: f32 = 14.0;
@@ -81,6 +87,10 @@ pub struct App {
     font_applied: bool,
     /// 侧边栏宽度（手动管理，防止自动扩展）
     sidebar_width: f32,
+    /// 系统托盘管理器（保持存活以维持托盘图标）
+    tray_manager: TrayManager,
+    /// 窗口是否可见
+    window_visible: bool,
 }
 
 /// 配置中文字体和 Emoji 字体
@@ -158,13 +168,20 @@ pub fn setup_chinese_fonts(ctx: &egui::Context) {
 }
 
 impl App {
-    pub fn new(db: Database) -> Self {
+    /// 创建应用实例
+    ///
+    /// # 参数
+    /// - `db`: SQLite 数据库连接
+    /// - `tray_manager`: 系统托盘管理器
+    pub fn new(db: Database, tray_manager: TrayManager, egui_ctx: egui::Context) -> Self {
         let mut plugins = plugins::register_all_plugins();
 
-        // 初始化所有插件
         for plugin in plugins.iter_mut() {
             plugin.init();
         }
+
+        // 将 egui Context 存入全局静态变量，供托盘事件处理器强制请求重绘
+        crate::tray::set_egui_ctx(egui_ctx);
 
         Self {
             plugins,
@@ -176,8 +193,87 @@ impl App {
             focus_search: false,
             font_size: DEFAULT_FONT_SIZE,
             font_applied: false,
-            sidebar_width: 200.0,  // 默认侧边栏宽度
+            sidebar_width: 200.0,
+            tray_manager,
+            window_visible: true,
         }
+    }
+
+    /// 处理托盘事件
+    ///
+    /// 通过 tray_manager 的 receiver 轮询 TrayIconEvent 和 MenuEvent
+    fn process_tray_events(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        for event in self.tray_manager.poll_events() {
+            match event {
+                TrayEvent::ToggleVisible => {
+                    log::info!("[托盘事件] 切换窗口可见性，当前={}", self.window_visible);
+                    if self.window_visible {
+                        self.hide_window(ctx, frame);
+                    } else {
+                        self.show_window(ctx, frame);
+                    }
+                }
+                TrayEvent::Quit => {
+                    log::info!("[托盘事件] 退出程序");
+                    std::process::exit(0);
+                }
+            }
+        }
+    }
+
+    /// 隐藏窗口到系统托盘
+    ///
+    /// 使用 WS_EX_TOOLWINDOW + Minimized 方案：
+    /// 1. 设置 WS_EX_TOOLWINDOW 移除任务栏按钮
+    /// 2. 最小化窗口（保持事件循环活跃）
+    fn hide_window(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.window_visible = false;
+        self.status_message = "已最小化到系统托盘".to_string();
+
+        if let Ok(handle) = frame.window_handle() {
+            if let raw_window_handle::RawWindowHandle::Win32(h) = handle.as_raw() {
+                let hwnd = h.hwnd.get() as _;
+                // SAFETY: hwnd 是有效的 Win32 窗口句柄
+                unsafe {
+                    // 设置 WS_EX_TOOLWINDOW，移除任务栏按钮
+                    let style = GetWindowLongW(hwnd, GWL_EXSTYLE);
+                    let new_style = (style & !(WS_EX_APPWINDOW as i32)) | (WS_EX_TOOLWINDOW as i32);
+                    SetWindowLongW(hwnd, GWL_EXSTYLE, new_style);
+                }
+                log::info!("已设置 WS_EX_TOOLWINDOW");
+            }
+        }
+
+        // 最小化（保持事件循环活跃，与 request_repaint_after 配合）
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        log::info!("窗口已最小化到托盘");
+    }
+
+    /// 从系统托盘恢复窗口
+    fn show_window(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.window_visible = true;
+        self.status_message = "窗口已恢复".to_string();
+
+        if let Ok(handle) = frame.window_handle() {
+            if let raw_window_handle::RawWindowHandle::Win32(h) = handle.as_raw() {
+                let hwnd = h.hwnd.get() as _;
+                // SAFETY: hwnd 是有效的 Win32 窗口句柄
+                unsafe {
+                    // 恢复 WS_EX_APPWINDOW，显示任务栏按钮
+                    let style = GetWindowLongW(hwnd, GWL_EXSTYLE);
+                    let new_style = (style & !(WS_EX_TOOLWINDOW as i32)) | (WS_EX_APPWINDOW as i32);
+                    SetWindowLongW(hwnd, GWL_EXSTYLE, new_style);
+
+                    // 恢复窗口
+                    ShowWindow(hwnd, SW_RESTORE);
+                    SetForegroundWindow(hwnd);
+                }
+                log::info!("窗口已恢复（WS_EX_APPWINDOW + SW_RESTORE）");
+            }
+        }
+
+        // 强制重绘，解决恢复后内容空白问题
+        ctx.request_repaint();
     }
 
     /// 渲染顶部标题栏
@@ -408,14 +504,36 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 首次运行时应用字体大小
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // 关键：每帧无条件请求 100ms 后重绘，确保事件循环不休眠
+        // 即使窗口最小化/隐藏，eframe 仍会持续调用 update()
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+
+        // 1. 首次运行时应用字体大小和主题
         if !self.font_applied {
             self.apply_font_size(ctx);
             self.font_applied = true;
         }
 
-        // 处理快捷键
+        // 2. 处理托盘事件（切换显示/隐藏、退出）
+        self.process_tray_events(ctx, frame);
+
+        // 4. 处理窗口关闭事件（用户点击 ✕）→ 取消关闭，改为隐藏到托盘
+        if ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.hide_window(ctx, frame);
+            return;
+        }
+
+        // 5. 窗口不可见时跳过渲染，但保持事件循环活跃
+        if !self.window_visible {
+            // request_repaint_after 通过 eframe 内部的 EventLoopProxy 唤醒 winit，
+            // 确保 update() 在窗口隐藏后仍被持续调用
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            return;
+        }
+
+        // 6. 处理窗口内快捷键
         self.handle_shortcuts(ctx);
 
         // 顶部面板
