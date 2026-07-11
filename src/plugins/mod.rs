@@ -4,6 +4,7 @@ pub mod hosts_manager;
 pub mod json_editor;
 pub mod note_taker;
 pub mod password_manager;
+pub mod settings;
 pub mod ssh_client;
 
 use crate::plugin::Plugin;

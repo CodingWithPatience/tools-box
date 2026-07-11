@@ -1,6 +1,7 @@
 use crate::hotkey::HotkeyManager;
 use crate::plugin::Plugin;
 use crate::plugins;
+use crate::plugins::settings::{AppSettings, SettingsPlugin};
 use crate::storage::Database;
 use crate::tray::{TrayEvent, TrayManager};
 use egui::FontFamily;
@@ -74,8 +75,6 @@ pub struct App {
     selected: usize,
     /// 侧边栏搜索关键词
     search_query: String,
-    /// 数据库连接（预留，后续插件使用）
-    _db: Database,
     /// 状态栏消息
     status_message: String,
     /// 当前主题
@@ -96,6 +95,14 @@ pub struct App {
     last_active_tool: usize,
     /// 窗口是否可见
     window_visible: bool,
+    /// 是否处于设置面板模式
+    settings_mode: bool,
+    /// 是否显示保存确认弹窗
+    show_save_confirm: bool,
+    /// 设置插件（不在侧边栏，通过右上角按钮访问）
+    settings_plugin: SettingsPlugin,
+    /// 数据库连接（用于保存设置）
+    db: Database,
 }
 
 /// 配置中文字体和 Emoji 字体
@@ -179,27 +186,46 @@ impl App {
     /// - `db`: SQLite 数据库连接
     /// - `tray_manager`: 系统托盘管理器
     pub fn new(db: Database, tray_manager: TrayManager, hotkey_manager: HotkeyManager) -> Self {
+        // 从数据库加载设置
+        let current_settings = AppSettings::load(db.conn()).unwrap_or_default();
+
         let mut plugins = plugins::register_all_plugins();
+
+        // 收集插件名称（用于设置面板的热键配置显示）
+        let plugin_names: Vec<String> = plugins.iter().map(|p| p.name().to_string()).collect();
+
+        // 创建设置插件（不在侧边栏，通过右上角按钮访问）
+        let settings_plugin = SettingsPlugin::new(current_settings.clone(), plugin_names);
 
         for plugin in plugins.iter_mut() {
             plugin.init();
         }
 
+        // 从设置中恢复主题
+        let theme = if current_settings.theme == "light" {
+            Theme::Light
+        } else {
+            Theme::Dark
+        };
+
         Self {
             plugins,
             selected: 0,
             search_query: String::new(),
-            _db: db,
+            db,
             status_message: "就绪".to_string(),
-            theme: Theme::default(),
+            theme,
             focus_search: false,
-            font_size: DEFAULT_FONT_SIZE,
+            font_size: current_settings.font_size,
             font_applied: false,
-            sidebar_width: 200.0,
+            sidebar_width: current_settings.sidebar_width,
             tray_manager,
             hotkey_manager,
             last_active_tool: 0,
             window_visible: true,
+            settings_mode: false,
+            show_save_confirm: false,
+            settings_plugin,
         }
     }
 
@@ -207,17 +233,20 @@ impl App {
     fn process_hotkey_events(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         for event in self.hotkey_manager.poll_events() {
             if event.plugin_index == usize::MAX {
-                // Ctrl+Alt+Space：恢复最近使用的工具
-                log::info!("[热键] 唤出最近工具，索引={}", self.last_active_tool);
-                self.selected = self.last_active_tool;
-                if !self.window_visible {
+                // Ctrl+Alt+Space：切换窗口显示/隐藏
+                if self.window_visible {
+                    log::info!("[热键] Ctrl+Alt+Space → 最小化到托盘");
+                    self.hide_window(ctx, frame);
+                } else {
+                    log::info!("[热键] Ctrl+Alt+Space → 恢复窗口，工具={}", self.last_active_tool);
+                    self.selected = self.last_active_tool;
                     self.show_window(ctx, frame);
+                    self.status_message = format!(
+                        "热键唤出：{}", self.plugins[self.last_active_tool].name()
+                    );
                 }
-                self.status_message = format!(
-                    "热键唤出：{}", self.plugins[self.last_active_tool].name()
-                );
             } else if event.plugin_index < self.plugins.len() {
-                // Ctrl+Alt+数字：跳转到指定插件
+                // Ctrl+Alt+数字：跳转到指定插件并显示窗口
                 log::info!("[热键] 唤出插件索引={}", event.plugin_index);
                 self.selected = event.plugin_index;
                 self.last_active_tool = event.plugin_index;
@@ -314,29 +343,17 @@ impl App {
             ui.heading("🛠 Tools Box");
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // 主题切换按钮
-                let theme_btn = ui.button(format!("{} {}", self.theme.icon(), self.theme.name()));
-                if theme_btn.clicked() {
-                    self.toggle_theme(ui.ctx());
+                if self.settings_mode {
+                    // 设置模式：显示返回按钮
+                    if ui.button("← 返回").clicked() {
+                        self.settings_mode = false;
+                    }
+                } else {
+                    // 正常模式：显示设置按钮
+                    if ui.button("⚙ 设置").clicked() {
+                        self.settings_mode = true;
+                    }
                 }
-                theme_btn.on_hover_text("切换主题");
-
-                ui.separator();
-
-                // 字体大小调节
-                ui.horizontal(|ui| {
-                    if ui.small_button("A-").clicked() && self.font_size > MIN_FONT_SIZE {
-                        self.font_size -= FONT_SIZE_STEP;
-                        self.apply_font_size(ui.ctx());
-                    }
-
-                    ui.label(format!("字体: {:.0}", self.font_size));
-
-                    if ui.small_button("A+").clicked() && self.font_size < MAX_FONT_SIZE {
-                        self.font_size += FONT_SIZE_STEP;
-                        self.apply_font_size(ui.ctx());
-                    }
-                });
 
                 ui.separator();
 
@@ -345,6 +362,60 @@ impl App {
             });
         });
         ui.separator();
+    }
+
+    /// 执行保存设置到数据库
+    fn do_save_settings(&mut self) {
+        match self.settings_plugin.settings().save(self.db.conn()) {
+            Ok(()) => {
+                self.settings_plugin.mark_saved();
+                self.status_message = "设置已保存".to_string();
+                log::info!("设置已保存到数据库");
+
+                // 更新热键绑定
+                let settings = self.settings_plugin.settings();
+                let new_bindings = self.build_hotkey_bindings(settings);
+                self.hotkey_manager.update_bindings(new_bindings);
+
+                // 更新侧边栏宽度
+                self.sidebar_width = settings.sidebar_width;
+            }
+            Err(e) => {
+                log::error!("保存设置失败: {}", e);
+                self.status_message = format!("保存失败: {}", e);
+            }
+        }
+    }
+
+    /// 根据设置构建热键绑定列表
+    fn build_hotkey_bindings(&self, settings: &AppSettings) -> Vec<crate::hotkey::HotkeyBinding> {
+        let mut bindings = Vec::new();
+
+        // 主窗口唤出: Ctrl+Alt+Space（固定）
+        bindings.push(crate::hotkey::HotkeyBinding {
+            id: 1,
+            modifiers: windows_sys::Win32::UI::Input::KeyboardAndMouse::MOD_CONTROL
+                | windows_sys::Win32::UI::Input::KeyboardAndMouse::MOD_ALT,
+            vk: windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_SPACE as u32,
+            plugin_index: usize::MAX, // usize::MAX 表示恢复最近工具
+        });
+
+        // 各工具的自定义热键
+        for (i, &ch) in settings.tool_hotkeys.iter().enumerate() {
+            if i >= self.plugins.len() {
+                break;
+            }
+            let vk = ch.to_ascii_uppercase() as u32;
+            bindings.push(crate::hotkey::HotkeyBinding {
+                id: 2 + i as i32,
+                modifiers: windows_sys::Win32::UI::Input::KeyboardAndMouse::MOD_CONTROL
+                    | windows_sys::Win32::UI::Input::KeyboardAndMouse::MOD_ALT,
+                vk,
+                plugin_index: i,
+            });
+        }
+
+        bindings
     }
 
     /// 应用字体大小设置
@@ -481,6 +552,66 @@ impl App {
 
     /// 渲染右侧插件内容区
     fn render_plugin_content(&mut self, ui: &mut egui::Ui) {
+        if self.settings_mode {
+            // 设置模式：渲染设置面板
+            let change = self.settings_plugin.render(ui);
+
+            // 处理主题变更（即时生效）
+            if change.theme_changed {
+                let theme = self.settings_plugin.settings().theme.clone();
+                if theme == "light" {
+                    ui.ctx().set_visuals(egui::Visuals::light());
+                } else {
+                    ui.ctx().set_visuals(egui::Visuals::dark());
+                }
+            }
+
+            // 处理字体大小变更（即时生效）
+            if change.font_size_changed {
+                self.font_size = self.settings_plugin.settings().font_size;
+                self.apply_font_size(ui.ctx());
+            }
+
+            // 处理侧边栏宽度变更（即时生效）
+            if change.sidebar_width_changed {
+                self.sidebar_width = self.settings_plugin.settings().sidebar_width;
+            }
+
+            // 处理保存请求（显示确认弹窗）
+            if change.save_requested {
+                self.show_save_confirm = true;
+            }
+
+            // 处理恢复默认（直接保存，无需确认）
+            if change.reset_requested {
+                self.do_save_settings();
+            }
+
+            // 渲染保存确认弹窗
+            if self.show_save_confirm {
+                egui::Window::new("确认保存")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .show(ui.ctx(), |ui| {
+                        ui.label("确定要保存当前设置吗？");
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("✅ 确定保存").clicked() {
+                                self.do_save_settings();
+                                self.show_save_confirm = false;
+                            }
+                            if ui.button("❌ 取消").clicked() {
+                                self.show_save_confirm = false;
+                            }
+                        });
+                    });
+            }
+
+            return;
+        }
+
+        // 正常模式：渲染选中的插件
         if self.plugins.is_empty() {
             ui.centered_and_justified(|ui| {
                 ui.label("暂无可用插件");
@@ -488,7 +619,6 @@ impl App {
             return;
         }
 
-        // 确保 selected 索引有效
         if self.selected >= self.plugins.len() {
             self.selected = 0;
         }
@@ -507,6 +637,11 @@ impl eframe::App for App {
         // 1. 首次运行时应用字体大小和主题
         if !self.font_applied {
             self.apply_font_size(ctx);
+            // 应用保存的主题
+            match self.theme {
+                Theme::Light => ctx.set_visuals(egui::Visuals::light()),
+                Theme::Dark => ctx.set_visuals(egui::Visuals::dark()),
+            }
             self.font_applied = true;
         }
 
@@ -549,10 +684,10 @@ impl eframe::App for App {
             });
         });
 
-        // 左侧边栏 - 使用 egui 内置的可调整宽度
+        // 左侧边栏 - 使用 exact_width 确保设置中的宽度变更即时生效
         egui::SidePanel::left("sidebar")
             .resizable(true)
-            .default_width(self.sidebar_width)
+            .exact_width(self.sidebar_width)
             .width_range(150.0..=400.0)
             .show(ctx, |ui| {
                 self.render_sidebar(ui);

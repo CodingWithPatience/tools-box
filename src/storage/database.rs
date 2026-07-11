@@ -183,6 +183,58 @@ impl Database {
             );",
         )?;
 
+        // 应用设置表（单行配置）
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS app_settings (
+                id              INTEGER PRIMARY KEY DEFAULT 1,
+                theme           TEXT NOT NULL DEFAULT 'dark',
+                font_size       REAL NOT NULL DEFAULT 14.0,
+                sidebar_width   REAL NOT NULL DEFAULT 200.0,
+                tool_hotkeys    TEXT NOT NULL DEFAULT '1234567',
+                auto_start      BOOLEAN NOT NULL DEFAULT 0,
+                updated_at      DATETIME DEFAULT CURRENT_TIMESTAMP
+            );",
+        )?;
+
+        // 迁移：确保 app_settings 表有 tool_hotkeys 和 auto_start 列
+        let has_tool_hotkeys = self
+            .conn
+            .prepare("PRAGMA table_info(app_settings)")
+            .context("查询 app_settings 表结构失败")?
+            .query_map([], |row| {
+                let col_name: String = row.get(1)?;
+                Ok(col_name)
+            })
+            .context("读取 app_settings 列信息失败")?
+            .filter_map(|r| r.ok())
+            .any(|col| col == "tool_hotkeys");
+
+        if !has_tool_hotkeys {
+            self.conn
+                .execute_batch("ALTER TABLE app_settings ADD COLUMN tool_hotkeys TEXT NOT NULL DEFAULT '1234567'")
+                .context("添加 tool_hotkeys 列失败")?;
+            log::info!("app_settings 表已迁移：添加 tool_hotkeys 列");
+        }
+
+        let has_auto_start = self
+            .conn
+            .prepare("PRAGMA table_info(app_settings)")
+            .context("查询 app_settings 表结构失败")?
+            .query_map([], |row| {
+                let col_name: String = row.get(1)?;
+                Ok(col_name)
+            })
+            .context("读取 app_settings 列信息失败")?
+            .filter_map(|r| r.ok())
+            .any(|col| col == "auto_start");
+
+        if !has_auto_start {
+            self.conn
+                .execute_batch("ALTER TABLE app_settings ADD COLUMN auto_start BOOLEAN NOT NULL DEFAULT 0")
+                .context("添加 auto_start 列失败")?;
+            log::info!("app_settings 表已迁移：添加 auto_start 列");
+        }
+
         log::info!("数据库表初始化完成");
         Ok(())
     }

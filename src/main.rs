@@ -9,6 +9,7 @@ mod tray;
 mod utils;
 
 use app::App;
+use plugins::settings::AppSettings;
 use storage::Database;
 
 fn main() -> eframe::Result<()> {
@@ -19,12 +20,15 @@ fn main() -> eframe::Result<()> {
 
     let db = Database::open().expect("数据库初始化失败");
 
+    // 从数据库加载设置
+    let settings = AppSettings::load(db.conn()).unwrap_or_default();
+
     // 创建系统托盘
     let tray_manager = tray::TrayManager::new();
 
-    // 创建全局热键管理器
+    // 根据设置构建热键绑定（而非使用默认值）
     let plugin_count = plugins::register_all_plugins().len();
-    let bindings = hotkey::default_bindings(plugin_count);
+    let bindings = build_hotkey_bindings(&settings, plugin_count);
     let hotkey_manager = hotkey::HotkeyManager::new(bindings);
 
     let options = eframe::NativeOptions {
@@ -52,4 +56,38 @@ fn main() -> eframe::Result<()> {
 
     log::info!("Tools Box 已退出");
     Ok(())
+}
+
+/// 根据设置构建热键绑定列表
+fn build_hotkey_bindings(
+    settings: &AppSettings,
+    plugin_count: usize,
+) -> Vec<hotkey::HotkeyBinding> {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
+
+    let mut bindings = Vec::new();
+
+    // 主窗口唤出: Ctrl+Alt+Space（固定）
+    bindings.push(hotkey::HotkeyBinding {
+        id: 1,
+        modifiers: MOD_CONTROL | MOD_ALT,
+        vk: VK_SPACE as u32,
+        plugin_index: usize::MAX,
+    });
+
+    // 各工具的自定义热键
+    for (i, &ch) in settings.tool_hotkeys.iter().enumerate() {
+        if i >= plugin_count {
+            break;
+        }
+        let vk = ch.to_ascii_uppercase() as u32;
+        bindings.push(hotkey::HotkeyBinding {
+            id: 2 + i as i32,
+            modifiers: MOD_CONTROL | MOD_ALT,
+            vk,
+            plugin_index: i,
+        });
+    }
+
+    bindings
 }

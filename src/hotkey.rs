@@ -65,12 +65,19 @@ pub fn default_bindings(plugin_count: usize) -> Vec<HotkeyBinding> {
 /// 使用 std::sync::OnceLock 确保线程安全
 static HOTKEY_EGUI_CTX: std::sync::OnceLock<egui::Context> = std::sync::OnceLock::new();
 
+/// 热键更新请求（发送给监听线程）
+struct HotkeyUpdateRequest {
+    bindings: Vec<HotkeyBinding>,
+}
+
 /// 全局热键管理器
 pub struct HotkeyManager {
     rx: mpsc::Receiver<HotkeyEvent>,
     bindings: Vec<HotkeyBinding>,
     /// 监听线程的 HWND（以 isize 存储，因为 HWND 不是 Send）
     listener_hwnd: isize,
+    /// 发送给监听线程的热键更新请求
+    update_tx: mpsc::Sender<Vec<HotkeyBinding>>,
     /// 监听线程句柄（用于 Drop 中等待线程退出）
     _handle: std::thread::JoinHandle<()>,
 }
@@ -80,6 +87,7 @@ impl HotkeyManager {
     pub fn new(bindings: Vec<HotkeyBinding>) -> Self {
         let (tx, rx) = mpsc::channel::<HotkeyEvent>();
         let (hwnd_tx, hwnd_rx) = mpsc::channel::<isize>();
+        let (update_tx, update_rx) = mpsc::channel::<Vec<HotkeyBinding>>();
 
         // 将绑定列表克隆到监听线程
         let bindings_clone = bindings.clone();
@@ -136,32 +144,54 @@ impl HotkeyManager {
                 }
             }
 
-            // 消息循环
+            // 消息循环（使用 PeekMessageW 非阻塞，以便检查更新请求）
+            let mut current_bindings = bindings_clone;
             let mut msg: MSG = unsafe { std::mem::zeroed() };
             loop {
-                // SAFETY: GetMessageW 会阻塞直到收到消息
-                let ret = unsafe { GetMessageW(&mut msg, hwnd, 0, 0) };
-                if ret == 0 || ret == -1 {
-                    break;
-                }
-                if msg.message == WM_HOTKEY {
-                    let hotkey_id = msg.wParam as i32;
-                    // 查找对应的绑定
-                    if let Some(binding) = bindings_clone.iter().find(|b| b.id == hotkey_id) {
-                        let event = HotkeyEvent {
-                            plugin_index: binding.plugin_index,
-                        };
-                        let _ = tx.send(event);
-                        // 唤醒 eframe 事件循环
-                        if let Some(ctx) = HOTKEY_EGUI_CTX.get() {
-                            ctx.request_repaint();
+                // 检查是否有热键更新请求
+                if let Ok(new_bindings) = update_rx.try_recv() {
+                    // 注销旧热键
+                    for binding in &current_bindings {
+                        unsafe { UnregisterHotKey(hwnd, binding.id); }
+                    }
+                    // 注册新热键
+                    for binding in &new_bindings {
+                        let ok = unsafe { RegisterHotKey(hwnd, binding.id, binding.modifiers, binding.vk) };
+                        if ok == 0 {
+                            log::warn!("更新热键失败: id={}, vk={:#x}", binding.id, binding.vk);
+                        } else {
+                            log::info!("更新热键成功: id={}, vk={:#x}", binding.id, binding.vk);
                         }
                     }
+                    current_bindings = new_bindings;
+                }
+
+                // 非阻塞获取消息
+                let ret = unsafe { PeekMessageW(&mut msg, hwnd, 0, 0, PM_REMOVE) };
+                if ret != 0 {
+                    if msg.message == WM_QUIT {
+                        break;
+                    }
+                    if msg.message == WM_HOTKEY {
+                        let hotkey_id = msg.wParam as i32;
+                        if let Some(binding) = current_bindings.iter().find(|b| b.id == hotkey_id) {
+                            let event = HotkeyEvent {
+                                plugin_index: binding.plugin_index,
+                            };
+                            let _ = tx.send(event);
+                            if let Some(ctx) = HOTKEY_EGUI_CTX.get() {
+                                ctx.request_repaint();
+                            }
+                        }
+                    }
+                } else {
+                    // 无消息时短暂休眠，避免空转
+                    std::thread::sleep(std::time::Duration::from_millis(50));
                 }
             }
 
             // 清理：注销所有热键并销毁窗口
-            for binding in &bindings_clone {
+            for binding in &current_bindings {
                 unsafe { UnregisterHotKey(hwnd, binding.id); }
             }
             unsafe { DestroyWindow(hwnd); }
@@ -180,6 +210,7 @@ impl HotkeyManager {
             rx,
             bindings,
             listener_hwnd,
+            update_tx,
             _handle: handle,
         }
     }
@@ -201,6 +232,18 @@ impl HotkeyManager {
     /// 获取当前绑定列表
     pub fn bindings(&self) -> &[HotkeyBinding] {
         &self.bindings
+    }
+
+    /// 动态更新热键绑定
+    ///
+    /// 注销旧热键，注册新热键，立即生效。
+    pub fn update_bindings(&mut self, new_bindings: Vec<HotkeyBinding>) {
+        if let Err(e) = self.update_tx.send(new_bindings.clone()) {
+            log::error!("发送热键更新请求失败: {}", e);
+        } else {
+            self.bindings = new_bindings;
+            log::info!("热键更新请求已发送");
+        }
     }
 }
 
