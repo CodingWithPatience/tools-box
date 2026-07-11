@@ -1,3 +1,4 @@
+use crate::hotkey::HotkeyManager;
 use crate::plugin::Plugin;
 use crate::plugins;
 use crate::storage::Database;
@@ -89,6 +90,10 @@ pub struct App {
     sidebar_width: f32,
     /// 系统托盘管理器（保持存活以维持托盘图标）
     tray_manager: TrayManager,
+    /// 全局热键管理器
+    hotkey_manager: HotkeyManager,
+    /// 最近使用的插件索引（用于全局热键唤出）
+    last_active_tool: usize,
     /// 窗口是否可见
     window_visible: bool,
 }
@@ -173,15 +178,12 @@ impl App {
     /// # 参数
     /// - `db`: SQLite 数据库连接
     /// - `tray_manager`: 系统托盘管理器
-    pub fn new(db: Database, tray_manager: TrayManager, egui_ctx: egui::Context) -> Self {
+    pub fn new(db: Database, tray_manager: TrayManager, hotkey_manager: HotkeyManager) -> Self {
         let mut plugins = plugins::register_all_plugins();
 
         for plugin in plugins.iter_mut() {
             plugin.init();
         }
-
-        // 将 egui Context 存入全局静态变量，供托盘事件处理器强制请求重绘
-        crate::tray::set_egui_ctx(egui_ctx);
 
         Self {
             plugins,
@@ -195,7 +197,37 @@ impl App {
             font_applied: false,
             sidebar_width: 200.0,
             tray_manager,
+            hotkey_manager,
+            last_active_tool: 0,
             window_visible: true,
+        }
+    }
+
+    /// 处理全局热键事件
+    fn process_hotkey_events(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        for event in self.hotkey_manager.poll_events() {
+            if event.plugin_index == usize::MAX {
+                // Ctrl+Alt+Space：恢复最近使用的工具
+                log::info!("[热键] 唤出最近工具，索引={}", self.last_active_tool);
+                self.selected = self.last_active_tool;
+                if !self.window_visible {
+                    self.show_window(ctx, frame);
+                }
+                self.status_message = format!(
+                    "热键唤出：{}", self.plugins[self.last_active_tool].name()
+                );
+            } else if event.plugin_index < self.plugins.len() {
+                // Ctrl+Alt+数字：跳转到指定插件
+                log::info!("[热键] 唤出插件索引={}", event.plugin_index);
+                self.selected = event.plugin_index;
+                self.last_active_tool = event.plugin_index;
+                if !self.window_visible {
+                    self.show_window(ctx, frame);
+                }
+                self.status_message = format!(
+                    "热键唤出：{}", self.plugins[event.plugin_index].name()
+                );
+            }
         }
     }
 
@@ -343,28 +375,6 @@ impl App {
     /// 处理快捷键
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         ctx.input(|i| {
-            // Ctrl+数字 切换插件 (1-9)
-            let num_keys = [
-                egui::Key::Num1,
-                egui::Key::Num2,
-                egui::Key::Num3,
-                egui::Key::Num4,
-                egui::Key::Num5,
-                egui::Key::Num6,
-                egui::Key::Num7,
-                egui::Key::Num8,
-                egui::Key::Num9,
-            ];
-
-            for (idx, key) in num_keys.iter().enumerate() {
-                if i.key_pressed(*key) && i.modifiers.ctrl {
-                    if idx < self.plugins.len() {
-                        self.selected = idx;
-                        self.status_message = format!("已切换到: {}", self.plugins[idx].name());
-                    }
-                }
-            }
-
             // Ctrl+F 聚焦搜索框
             if i.key_pressed(egui::Key::F) && i.modifiers.ctrl {
                 self.focus_search = true;
@@ -449,18 +459,7 @@ impl App {
                     let plugin = &self.plugins[idx];
                     let is_selected = self.selected == idx;
 
-                    // 显示快捷键提示
-                    let shortcut = if list_idx < 9 {
-                        format!("Ctrl+{}", list_idx + 1)
-                    } else {
-                        String::new()
-                    };
-
-                    let text = if shortcut.is_empty() {
-                        format!("{} {}", plugin.icon(), plugin.name())
-                    } else {
-                        format!("{} {} [{}]", plugin.icon(), plugin.name(), shortcut)
-                    };
+                    let text = format!("{} {}", plugin.icon(), plugin.name());
 
                     let response = ui.add_sized(
                         [ui.available_width(), 36.0],
@@ -469,16 +468,12 @@ impl App {
 
                     if response.clicked() {
                         self.selected = idx;
+                        self.last_active_tool = idx;
                     }
 
                     // 鼠标悬停时显示描述
                     if response.hovered() {
-                        let hover_text = if shortcut.is_empty() {
-                            plugin.description().to_string()
-                        } else {
-                            format!("{}\n快捷键: {}", plugin.description(), shortcut)
-                        };
-                        response.on_hover_text(hover_text);
+                        response.on_hover_text(plugin.description());
                     }
                 }
             });
@@ -515,7 +510,10 @@ impl eframe::App for App {
             self.font_applied = true;
         }
 
-        // 2. 处理托盘事件（切换显示/隐藏、退出）
+        // 2. 处理全局热键事件
+        self.process_hotkey_events(ctx, frame);
+
+        // 3. 处理托盘事件（切换显示/隐藏、退出）
         self.process_tray_events(ctx, frame);
 
         // 4. 处理窗口关闭事件（用户点击 ✕）→ 取消关闭，改为隐藏到托盘
@@ -545,7 +543,7 @@ impl eframe::App for App {
         egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(format!(
-                    "就绪 | 已注册插件: {} | Ctrl+F 搜索 | Ctrl+1-9 切换 | Esc 清空",
+                    "就绪 | 已注册插件: {} | Ctrl+F 搜索 | Ctrl+Alt+Space/1-9 全局唤出 | Esc 清空",
                     self.plugins.len()
                 ));
             });

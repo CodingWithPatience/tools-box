@@ -71,4 +71,8 @@ impl Plugin for SshClientPlugin {
     fn init(&mut self) {
         log::info!("SSH 客户端插件已初始化");
     }
+
+    fn hotkey_char(&self) -> Option<char> {
+        Some('7')
+    }
 }

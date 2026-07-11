@@ -69,4 +69,8 @@ impl Plugin for HostsManagerPlugin {
     fn cleanup(&mut self) {
         log::info!("Hosts 管理器插件已清理");
     }
+
+    fn hotkey_char(&self) -> Option<char> {
+        Some('3')
+    }
 }

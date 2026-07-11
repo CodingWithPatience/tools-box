@@ -4,7 +4,7 @@
 
 本文档描述 Tools Box 的三个核心功能增强：
 1. **系统托盘支持** — 关闭按钮最小化到托盘，托盘图标菜单控制显示/退出
-2. **全局热键唤出** — Win+Alt+<键> 组合键随时唤出窗口并跳转到指定工具
+2. **全局热键唤出** — Ctrl+Alt+<键> 组合键随时唤出窗口并跳转到指定工具
 3. **设置插件** — 统一管理快捷键自定义、字体大小、主题设置，持久化到 SQLite
 
 ---
@@ -25,9 +25,9 @@
 
 | 功能 | 说明 | 优先级 |
 |------|------|--------|
-| 唤出工具集 | Win+Alt+Space 显示窗口并跳转到最近使用的工具 | P0 |
-| 唤出指定工具 | Win+Alt+1~7 显示窗口并跳转到对应插件 | P0 |
-| 唤出设置 | Win+Alt+, 显示窗口并跳转到设置面板 | P0 |
+| 唤出工具集 | Ctrl+Alt+Space 显示窗口并跳转到最近使用的工具 | P0 |
+| 唤出指定工具 | Ctrl+Alt+1~7 显示窗口并跳转到对应插件 | P0 |
+| 唤出设置 | Ctrl+Alt+, 显示窗口并跳转到设置面板 | P0 |
 | 快捷键自定义 | 设置面板中可修改修饰键和字母键 | P1 |
 | 热键动态更新 | 设置变更后立即重新注册热键，无需重启 | P1 |
 
@@ -114,19 +114,19 @@
 
 | 功能 | 默认快捷键 | RegisterHotKey 参数 |
 |------|-----------|---------------------|
-| 唤出工具集（最近面板） | `Win+Alt+Space` | MOD_WIN \| MOD_ALT, VK_SPACE |
-| 唤出密码管理器 | `Win+Alt+1` | MOD_WIN \| MOD_ALT, '1' |
-| 唤出 JSON 编辑器 | `Win+Alt+2` | MOD_WIN \| MOD_ALT, '2' |
-| 唤出 Hosts 管理器 | `Win+Alt+3` | MOD_WIN \| MOD_ALT, '3' |
-| 唤出 Diff 对比 | `Win+Alt+4` | MOD_WIN \| MOD_ALT, '4' |
-| 唤出 API 调试 | `Win+Alt+5` | MOD_WIN \| MOD_ALT, '5' |
-| 唤出临时笔记 | `Win+Alt+6` | MOD_WIN \| MOD_ALT, '6' |
-| 唤出 SSH 客户端 | `Win+Alt+7` | MOD_WIN \| MOD_ALT, '7' |
-| 唤出设置 | `Win+Alt+,` | MOD_WIN \| MOD_ALT, VK_OEM_COMMA |
+| 唤出工具集（最近面板） | `Ctrl+Alt+Space` | MOD_WIN \| MOD_ALT, VK_SPACE |
+| 唤出密码管理器 | `Ctrl+Alt+1` | MOD_WIN \| MOD_ALT, '1' |
+| 唤出 JSON 编辑器 | `Ctrl+Alt+2` | MOD_WIN \| MOD_ALT, '2' |
+| 唤出 Hosts 管理器 | `Ctrl+Alt+3` | MOD_WIN \| MOD_ALT, '3' |
+| 唤出 Diff 对比 | `Ctrl+Alt+4` | MOD_WIN \| MOD_ALT, '4' |
+| 唤出 API 调试 | `Ctrl+Alt+5` | MOD_WIN \| MOD_ALT, '5' |
+| 唤出临时笔记 | `Ctrl+Alt+6` | MOD_WIN \| MOD_ALT, '6' |
+| 唤出 SSH 客户端 | `Ctrl+Alt+7` | MOD_WIN \| MOD_ALT, '7' |
+| 唤出设置 | `Ctrl+Alt+,` | MOD_WIN \| MOD_ALT, VK_OEM_COMMA |
 
 ### 3.2 Fn 键说明
 
-Windows 平台上，Fn 键由键盘固件处理，不向操作系统发送标准按键扫描码，无法通过 `RegisterHotKey` API 注册。因此使用 `Win+Alt` 作为默认修饰键组合。`Win+Alt+<key>` 组合在 Windows 系统中极少被占用，是实用的替代方案。
+Windows 平台上，Fn 键由键盘固件处理，不向操作系统发送标准按键扫描码，无法通过 `RegisterHotKey` API 注册。因此使用 `Ctrl+Alt` 作为默认修饰键组合。`Ctrl+Alt+<key>` 组合在 Windows 系统中极少被占用，是实用的替代方案。
 
 用户可在"设置"面板中自定义修饰键为其他组合（如 `Ctrl+Alt`、`Ctrl+Shift` 等）。
 
@@ -173,7 +173,7 @@ src/
 
 新增方法：
 ```rust
-/// 默认快捷键字母键（用于全局热键 Win+Alt+<key>）
+/// 默认快捷键字母键（用于全局热键 Ctrl+Alt+<key>）
 fn hotkey_char(&self) -> Option<char> {
     None
 }
@@ -204,8 +204,8 @@ fn hotkey_char(&self) -> Option<char> {
 │  ┌──────────────────┬──────────────────┬──────┐ │
 │  │ 功能              │ 快捷键            │ 操作  │ │
 │  ├──────────────────┼──────────────────┼──────┤ │
-│  │ 唤出工具集        │ Win+Alt+Space    │ 修改  │ │
-│  │ 密码管理器        │ Win+Alt+1        │ 修改  │ │
+│  │ 唤出工具集        │ Ctrl+Alt+Space    │ 修改  │ │
+│  │ 密码管理器        │ Ctrl+Alt+1        │ 修改  │ │
 │  │ ...              │ ...              │ ...  │ │
 │  └──────────────────┴──────────────────┴──────┘ │
 └───────────────────────────────────────────────┘
@@ -266,12 +266,12 @@ windows-sys = { version = "0.60", features = [
 
 | 步骤 | 任务 | 说明 | 状态 |
 |------|------|------|------|
-| 2.1 | 添加依赖 | `windows-sys` 已在阶段一添加 | ⏳ |
-| 2.2 | 实现 `hotkey.rs` 模块 | RegisterHotKey 封装 + 监听线程 | ⏳ |
-| 2.3 | 扩展 `Plugin` trait | 新增 `hotkey_char()` 方法 | ⏳ |
-| 2.4 | 各插件实现 `hotkey_char()` | 每个插件返回默认快捷键字母 | ⏳ |
-| 2.5 | 集成到 `main.rs` | 启动热键监听线程 | ⏳ |
-| 2.6 | 集成到 `app.rs` | 热键事件处理 + last_active_tool | ⏳ |
+| 2.1 | 添加依赖 | `windows-sys` 已在阶段一添加 | ✅ |
+| 2.2 | 实现 `hotkey.rs` 模块 | RegisterHotKey 封装 + 监听线程 + mpsc channel | ✅ |
+| 2.3 | 扩展 `Plugin` trait | 新增 `hotkey_char()` 方法 | ✅ |
+| 2.4 | 各插件实现 `hotkey_char()` | 每个插件返回默认快捷键字符 | ✅ |
+| 2.5 | 集成到 `main.rs` | 启动热键监听线程 | ✅ |
+| 2.6 | 集成到 `app.rs` | 热键事件处理 + last_active_tool + 侧边栏提示 | ✅ |
 
 **阶段二产出文件：**
 - `Cargo.toml` — 新增 `windows` 依赖
@@ -321,7 +321,7 @@ windows-sys = { version = "0.60", features = [
 4. **窗口焦点**：show_window() 中调用 SetForegroundWindow 带到前台
 5. **优雅退出**：托盘"退出"→ 注销热键 → 移除托盘 → 设置 is_quitting → 退出
 6. **设置兼容**：app_settings 表不存在时使用 AppSettings::default()
-7. **窗口内快捷键保留**：Ctrl+1~9 切换快捷键不受影响，与全局 Win+Alt+1~9 共存
+7. **窗口内快捷键保留**：Ctrl+1~9 切换快捷键不受影响，与全局 Ctrl+Alt+1~9 共存
 
 ---
 
@@ -333,8 +333,8 @@ windows-sys = { version = "0.60", features = [
    - 右键托盘 → 菜单显示、退出有效
 
 2. **全局热键**：
-   - 窗口隐藏后 Win+Alt+Space → 窗口显示
-   - 窗口隐藏后 Win+Alt+3 → 窗口显示并切换到 Hosts 管理器
+   - 窗口隐藏后 Ctrl+Alt+Space → 窗口显示
+   - 窗口隐藏后 Ctrl+Alt+3 → 窗口显示并切换到 Hosts 管理器
    - 其他应用前台时热键仍能唤出
 
 3. **设置插件**：

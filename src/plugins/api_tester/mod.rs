@@ -86,4 +86,8 @@ impl Plugin for ApiTesterPlugin {
     fn cleanup(&mut self) {
         log::info!("API 调试工具插件已清理");
     }
+
+    fn hotkey_char(&self) -> Option<char> {
+        Some('5')
+    }
 }
