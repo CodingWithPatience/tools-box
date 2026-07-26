@@ -36,6 +36,11 @@ impl SettingsPlugin {
         self.settings_ui.mark_saved();
     }
 
+    /// 提交尚未确认的侧边栏宽度输入。
+    pub fn commit_pending_sidebar_width(&mut self) -> bool {
+        self.settings_ui.commit_pending_sidebar_width()
+    }
+
     /// 渲染设置面板并返回变更信息
     pub fn render(&mut self, ui: &mut egui::Ui) -> SettingsChange {
         self.settings_ui.render(ui)

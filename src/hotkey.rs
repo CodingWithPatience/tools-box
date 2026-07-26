@@ -3,7 +3,11 @@
 //! 使用 Windows RegisterHotKey API 注册全局热键，
 //! 在独立线程中监听 WM_HOTKEY 消息，通过 mpsc channel 将事件转发给主线程。
 
-use std::sync::mpsc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
@@ -63,6 +67,29 @@ pub fn default_bindings(plugin_count: usize) -> Vec<HotkeyBinding> {
 /// 使用 std::sync::OnceLock 确保线程安全
 static HOTKEY_EGUI_CTX: std::sync::OnceLock<egui::Context> = std::sync::OnceLock::new();
 
+/// 转发全局热键事件，并在发送成功后唤醒主窗口。
+fn dispatch_hotkey_event(
+    tx: &mpsc::Sender<HotkeyEvent>,
+    event: HotkeyEvent,
+) -> Result<(), mpsc::SendError<HotkeyEvent>> {
+    dispatch_hotkey_event_with_wake(tx, event, crate::tray::wake_main_window)
+}
+
+fn dispatch_hotkey_event_with_wake(
+    tx: &mpsc::Sender<HotkeyEvent>,
+    event: HotkeyEvent,
+    wake_main_window: impl FnOnce(),
+) -> Result<(), mpsc::SendError<HotkeyEvent>> {
+    tx.send(event)?;
+    wake_main_window();
+
+    if let Some(ctx) = HOTKEY_EGUI_CTX.get() {
+        ctx.request_repaint();
+    }
+
+    Ok(())
+}
+
 /// 热键更新请求（发送给监听线程）
 struct HotkeyUpdateRequest {
     bindings: Vec<HotkeyBinding>,
@@ -76,8 +103,10 @@ pub struct HotkeyManager {
     listener_hwnd: isize,
     /// 发送给监听线程的热键更新请求
     update_tx: mpsc::Sender<Vec<HotkeyBinding>>,
-    /// 监听线程句柄（用于 Drop 中等待线程退出）
-    _handle: std::thread::JoinHandle<()>,
+    /// 通知监听线程停止。
+    shutdown: Arc<AtomicBool>,
+    /// 监听线程句柄（用于 Drop 中等待线程退出）。
+    handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl HotkeyManager {
@@ -86,6 +115,8 @@ impl HotkeyManager {
         let (tx, rx) = mpsc::channel::<HotkeyEvent>();
         let (hwnd_tx, hwnd_rx) = mpsc::channel::<isize>();
         let (update_tx, update_rx) = mpsc::channel::<Vec<HotkeyBinding>>();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let listener_shutdown = Arc::clone(&shutdown);
 
         // 将绑定列表克隆到监听线程
         let bindings_clone = bindings.clone();
@@ -149,7 +180,7 @@ impl HotkeyManager {
             // 消息循环（使用 PeekMessageW 非阻塞，以便检查更新请求）
             let mut current_bindings = bindings_clone;
             let mut msg: MSG = unsafe { std::mem::zeroed() };
-            loop {
+            while !listener_shutdown.load(Ordering::Acquire) {
                 // 检查是否有热键更新请求
                 if let Ok(new_bindings) = update_rx.try_recv() {
                     // 注销旧热键
@@ -184,15 +215,17 @@ impl HotkeyManager {
                             let event = HotkeyEvent {
                                 plugin_index: binding.plugin_index,
                             };
-                            let _ = tx.send(event);
-                            if let Some(ctx) = HOTKEY_EGUI_CTX.get() {
-                                ctx.request_repaint();
+                            match dispatch_hotkey_event(&tx, event) {
+                                Ok(()) => {}
+                                Err(error) => {
+                                    log::error!("发送全局热键事件失败: {}", error);
+                                }
                             }
                         }
                     }
                 } else {
-                    // 无消息时短暂休眠，避免空转
-                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    // 无消息时等待唤醒或超时，避免空转并允许析构立即停止监听。
+                    std::thread::park_timeout(std::time::Duration::from_millis(50));
                 }
             }
 
@@ -221,7 +254,8 @@ impl HotkeyManager {
             bindings,
             listener_hwnd,
             update_tx,
-            _handle: handle,
+            shutdown,
+            handle: Some(handle),
         }
     }
 
@@ -259,14 +293,16 @@ impl HotkeyManager {
 
 impl Drop for HotkeyManager {
     fn drop(&mut self) {
-        // 发送 WM_QUIT 退出监听线程的消息循环
-        if self.listener_hwnd != 0 {
-            // SAFETY: PostMessageW 参数正确
-            unsafe {
-                PostMessageW(self.listener_hwnd as HWND, WM_QUIT, 0, 0);
+        self.shutdown.store(true, Ordering::Release);
+
+        if let Some(handle) = self.handle.take() {
+            handle.thread().unpark();
+            if handle.join().is_err() {
+                log::error!("等待热键监听线程退出时发生 panic");
+            } else {
+                log::debug!("热键监听窗口已退出: hwnd={}", self.listener_hwnd);
             }
         }
-        // _handle 的 Drop 会自动 join 线程
     }
 }
 
@@ -284,13 +320,17 @@ unsafe extern "system" fn hotkey_wnd_proc(
             // 热键消息由 GetMessageW 循环处理，此处不需要额外逻辑
             0
         }
-        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        _ => {
+            // SAFETY: 未处理消息按 Win32 约定转发给默认窗口过程。
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
 
     #[test]
     fn test_default_bindings_count() {
@@ -313,5 +353,60 @@ mod tests {
         let bindings = default_bindings(1);
         // Ctrl+Alt
         assert_eq!(bindings[0].modifiers, MOD_CONTROL | MOD_ALT);
+    }
+
+    #[test]
+    fn test_hotkey_event_wakes_main_window_after_forwarding() {
+        let (tx, rx) = mpsc::channel();
+        let wake_called = Cell::new(false);
+
+        let result = dispatch_hotkey_event_with_wake(
+            &tx,
+            HotkeyEvent {
+                plugin_index: usize::MAX,
+            },
+            || wake_called.set(true),
+        );
+
+        assert!(result.is_ok(), "热键事件应成功转发");
+        assert!(wake_called.get(), "转发热键事件后必须唤醒主窗口");
+        match rx.try_recv() {
+            Ok(event) => assert_eq!(event.plugin_index, usize::MAX),
+            Err(error) => panic!("未收到热键事件: {error}"),
+        }
+    }
+
+    #[test]
+    fn test_failed_hotkey_forward_does_not_wake_main_window() {
+        let (tx, rx) = mpsc::channel();
+        drop(rx);
+        let wake_called = Cell::new(false);
+
+        let result = dispatch_hotkey_event_with_wake(
+            &tx,
+            HotkeyEvent {
+                plugin_index: usize::MAX,
+            },
+            || wake_called.set(true),
+        );
+
+        assert!(result.is_err(), "接收端关闭后事件转发应失败");
+        assert!(!wake_called.get(), "事件未转发时不应唤醒主窗口");
+    }
+
+    #[test]
+    fn test_hotkey_manager_drop_waits_for_listener_window_cleanup() {
+        let manager = HotkeyManager::new(Vec::new());
+        let listener_hwnd = manager.listener_hwnd;
+        assert_ne!(listener_hwnd, 0, "热键监听窗口应创建成功");
+
+        drop(manager);
+
+        // SAFETY: 仅查询已记录的窗口句柄是否仍有效，不解引用任何指针。
+        assert_eq!(
+            unsafe { IsWindow(listener_hwnd as HWND) },
+            0,
+            "HotkeyManager 析构完成后监听窗口应已销毁"
+        );
     }
 }

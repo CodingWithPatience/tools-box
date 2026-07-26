@@ -8,6 +8,12 @@ use super::models::AppSettings;
 const MIN_FONT_SIZE: f32 = 10.0;
 const MAX_FONT_SIZE: f32 = 24.0;
 const FONT_SIZE_STEP: f32 = 1.0;
+/// 侧边栏最小宽度。
+const MIN_SIDEBAR_WIDTH: u16 = 150;
+/// 侧边栏最大宽度。
+const MAX_SIDEBAR_WIDTH: u16 = 400;
+/// 侧边栏宽度输入框 ID。
+const SIDEBAR_WIDTH_INPUT_ID: &str = "settings_sidebar_width_input";
 
 /// 可用于热键的字符列表（大写字母 + 数字）
 const HOTKEY_CHARS: &[char] = &[
@@ -30,6 +36,8 @@ pub struct SettingsChange {
 pub struct SettingsUi {
     /// 当前设置（编辑中的副本）
     settings: AppSettings,
+    /// 侧边栏宽度输入内容，失焦前不写入设置。
+    sidebar_width_input: String,
     /// 是否有未保存的更改
     dirty: bool,
     /// 插件名称列表（用于热键配置显示）
@@ -38,8 +46,10 @@ pub struct SettingsUi {
 
 impl SettingsUi {
     pub fn new(settings: AppSettings, plugin_names: Vec<String>) -> Self {
+        let sidebar_width_input = format_sidebar_width(settings.sidebar_width);
         Self {
             settings,
+            sidebar_width_input,
             dirty: false,
             plugin_names,
         }
@@ -52,6 +62,7 @@ impl SettingsUi {
 
     /// 从外部更新设置
     pub fn update_settings(&mut self, settings: AppSettings) {
+        self.sidebar_width_input = format_sidebar_width(settings.sidebar_width);
         self.settings = settings;
         self.dirty = false;
     }
@@ -59,6 +70,15 @@ impl SettingsUi {
     /// 标记为已保存
     pub fn mark_saved(&mut self) {
         self.dirty = false;
+    }
+
+    /// 提交尚未确认的侧边栏宽度输入。
+    pub(super) fn commit_pending_sidebar_width(&mut self) -> bool {
+        let changed = commit_sidebar_width_input(&mut self.settings, &mut self.sidebar_width_input);
+        if changed {
+            self.dirty = true;
+        }
+        changed
     }
 
     /// 渲染设置面板
@@ -95,6 +115,7 @@ impl SettingsUi {
                 let theme_changed = self.settings.theme != default.theme;
                 let font_changed = self.settings.font_size != default.font_size;
                 let width_changed = self.settings.sidebar_width != default.sidebar_width;
+                self.sidebar_width_input = format_sidebar_width(default.sidebar_width);
                 self.settings = default;
                 self.dirty = true;
                 change.theme_changed = theme_changed;
@@ -162,14 +183,16 @@ impl SettingsUi {
             // 侧边栏宽度
             ui.horizontal(|ui| {
                 ui.label("侧边栏宽度：");
-                let old_width = self.settings.sidebar_width;
-                ui.add(
-                    egui::Slider::new(&mut self.settings.sidebar_width, 150.0..=400.0)
-                        .suffix(" px")
-                        .step_by(10.0),
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.sidebar_width_input)
+                        .id(egui::Id::new(SIDEBAR_WIDTH_INPUT_ID))
+                        .desired_width(64.0)
+                        .char_limit(3)
+                        .hint_text("150-400"),
                 );
-                if (self.settings.sidebar_width - old_width).abs() > f32::EPSILON {
-                    self.dirty = true;
+                ui.label("px（150-400）");
+
+                if response.lost_focus() && self.commit_pending_sidebar_width() {
                     change.sidebar_width_changed = true;
                 }
             });
@@ -253,6 +276,29 @@ impl SettingsUi {
     }
 }
 
+fn format_sidebar_width(width: f32) -> String {
+    format!("{width:.0}")
+}
+
+fn commit_sidebar_width_input(settings: &mut AppSettings, input: &mut String) -> bool {
+    let parsed_width = input.parse::<u16>().ok();
+    let Some(parsed_width) = parsed_width else {
+        *input = format_sidebar_width(settings.sidebar_width);
+        return false;
+    };
+
+    let normalized_width = parsed_width.clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
+    let normalized_width = f32::from(normalized_width);
+    *input = format_sidebar_width(normalized_width);
+
+    if (settings.sidebar_width - normalized_width).abs() <= f32::EPSILON {
+        return false;
+    }
+
+    settings.sidebar_width = normalized_width;
+    true
+}
+
 /// 应用跟随系统启动设置（通过 Windows 注册表）
 fn apply_auto_start(enable: bool) {
     let exe_path = std::env::current_exe().unwrap_or_default();
@@ -298,5 +344,136 @@ fn apply_auto_start(enable: bool) {
         } else {
             log::warn!("无法打开注册表键: {}", result);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AppSettings, MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH, SIDEBAR_WIDTH_INPUT_ID, SettingsChange,
+        SettingsUi, commit_sidebar_width_input, format_sidebar_width,
+    };
+
+    fn render_settings_frame(
+        ctx: &egui::Context,
+        settings_ui: &mut SettingsUi,
+        events: Vec<egui::Event>,
+    ) -> SettingsChange {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let mut change = SettingsChange::default();
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                change = settings_ui.render(ui);
+            });
+        });
+        change
+    }
+
+    #[test]
+    fn sidebar_width_text_edit_commits_only_after_enter() {
+        let ctx = egui::Context::default();
+        let mut settings_ui = SettingsUi::new(AppSettings::default(), Vec::new());
+        settings_ui.sidebar_width_input.clear();
+        ctx.memory_mut(|memory| {
+            memory.request_focus(egui::Id::new(SIDEBAR_WIDTH_INPUT_ID));
+        });
+
+        let editing_change = render_settings_frame(
+            &ctx,
+            &mut settings_ui,
+            vec![egui::Event::Text("320".to_string())],
+        );
+
+        assert_eq!(settings_ui.sidebar_width_input, "320");
+        assert_eq!(settings_ui.settings.sidebar_width, 200.0);
+        assert!(!editing_change.sidebar_width_changed);
+
+        let commit_change = render_settings_frame(
+            &ctx,
+            &mut settings_ui,
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: Some(egui::Key::Enter),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+
+        assert_eq!(settings_ui.settings.sidebar_width, 320.0);
+        assert!(commit_change.sidebar_width_changed);
+    }
+
+    #[test]
+    fn sidebar_width_input_does_not_change_setting_before_commit() {
+        let settings = AppSettings::default();
+        let mut ui = SettingsUi::new(settings, Vec::new());
+
+        ui.sidebar_width_input = "320".to_string();
+
+        assert_eq!(ui.settings.sidebar_width, 200.0);
+        assert_eq!(ui.sidebar_width_input, "320");
+        assert!(ui.commit_pending_sidebar_width());
+        assert_eq!(ui.settings.sidebar_width, 320.0);
+        assert!(ui.dirty);
+    }
+
+    #[test]
+    fn sidebar_width_input_commits_valid_value() {
+        let mut settings = AppSettings::default();
+        let mut input = "320".to_string();
+
+        assert!(commit_sidebar_width_input(&mut settings, &mut input));
+        assert_eq!(settings.sidebar_width, 320.0);
+        assert_eq!(input, "320");
+    }
+
+    #[test]
+    fn sidebar_width_input_is_limited_to_maximum() {
+        let mut settings = AppSettings::default();
+        let mut input = "999".to_string();
+
+        assert!(commit_sidebar_width_input(&mut settings, &mut input));
+        assert_eq!(settings.sidebar_width, f32::from(MAX_SIDEBAR_WIDTH));
+        assert_eq!(input, "400");
+    }
+
+    #[test]
+    fn sidebar_width_input_is_limited_to_minimum() {
+        let mut settings = AppSettings::default();
+        let mut input = "99".to_string();
+
+        assert!(commit_sidebar_width_input(&mut settings, &mut input));
+        assert_eq!(settings.sidebar_width, f32::from(MIN_SIDEBAR_WIDTH));
+        assert_eq!(input, "150");
+    }
+
+    #[test]
+    fn invalid_sidebar_width_input_restores_current_value() {
+        let mut settings = AppSettings::default();
+        settings.sidebar_width = 280.0;
+        let mut input = "abc".to_string();
+
+        assert!(!commit_sidebar_width_input(&mut settings, &mut input));
+        assert_eq!(settings.sidebar_width, 280.0);
+        assert_eq!(input, format_sidebar_width(settings.sidebar_width));
+    }
+
+    #[test]
+    fn empty_sidebar_width_input_restores_current_value() {
+        let mut settings = AppSettings::default();
+        settings.sidebar_width = 280.0;
+        let mut input = String::new();
+
+        assert!(!commit_sidebar_width_input(&mut settings, &mut input));
+        assert_eq!(settings.sidebar_width, 280.0);
+        assert_eq!(input, format_sidebar_width(settings.sidebar_width));
     }
 }

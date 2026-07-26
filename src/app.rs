@@ -20,6 +20,9 @@ const MAX_FONT_SIZE: f32 = 24.0;
 /// 字体大小步长
 const FONT_SIZE_STEP: f32 = 1.0;
 
+/// 侧边栏面板的持久化状态 ID。
+const SIDEBAR_PANEL_ID: &str = "sidebar";
+
 /// 设置原生 Windows 窗口的可见性。
 ///
 /// # Safety
@@ -41,6 +44,26 @@ unsafe fn set_native_window_visible(hwnd: HWND, visible: bool) {
     unsafe {
         ShowWindow(hwnd, command);
     }
+}
+
+/// 应用侧边栏宽度，并清除 egui 保存的旧面板尺寸。
+fn apply_sidebar_width(ctx: &egui::Context, current_width: &mut f32, new_width: f32) {
+    if (*current_width - new_width).abs() <= f32::EPSILON {
+        return;
+    }
+
+    *current_width = new_width;
+    ctx.data_mut(|data| {
+        data.remove::<egui::containers::panel::PanelState>(egui::Id::new(SIDEBAR_PANEL_ID));
+    });
+    ctx.request_repaint();
+}
+
+fn sidebar_panel(width: f32) -> egui::SidePanel {
+    egui::SidePanel::left(SIDEBAR_PANEL_ID)
+        .resizable(true)
+        .default_width(width)
+        .width_range(150.0..=400.0)
 }
 
 /// 主题模式
@@ -110,10 +133,10 @@ pub struct App {
     font_applied: bool,
     /// 侧边栏宽度（手动管理，防止自动扩展）
     sidebar_width: f32,
+    /// 全局热键管理器（先于托盘管理器析构，避免退出时继续访问主窗口句柄）
+    hotkey_manager: HotkeyManager,
     /// 系统托盘管理器（保持存活以维持托盘图标）
     tray_manager: TrayManager,
-    /// 全局热键管理器
-    hotkey_manager: HotkeyManager,
     /// 最近使用的插件索引（用于全局热键唤出）
     last_active_tool: usize,
     /// 窗口是否可见
@@ -244,8 +267,8 @@ impl App {
             font_size: current_settings.font_size,
             font_applied: false,
             sidebar_width: current_settings.sidebar_width,
-            tray_manager,
             hotkey_manager,
+            tray_manager,
             last_active_tool: 0,
             window_visible: true,
             settings_mode: false,
@@ -360,6 +383,13 @@ impl App {
                 if self.settings_mode {
                     // 设置模式：显示返回按钮
                     if ui.button("← 返回").clicked() {
+                        if self.settings_plugin.commit_pending_sidebar_width() {
+                            apply_sidebar_width(
+                                ui.ctx(),
+                                &mut self.sidebar_width,
+                                self.settings_plugin.settings().sidebar_width,
+                            );
+                        }
                         self.settings_mode = false;
                     }
                 } else {
@@ -604,7 +634,11 @@ impl App {
 
             // 处理侧边栏宽度变更（即时生效）
             if change.sidebar_width_changed {
-                self.sidebar_width = self.settings_plugin.settings().sidebar_width;
+                apply_sidebar_width(
+                    ui.ctx(),
+                    &mut self.sidebar_width,
+                    self.settings_plugin.settings().sidebar_width,
+                );
             }
 
             // 处理保存请求（显示确认弹窗）
@@ -714,14 +748,10 @@ impl eframe::App for App {
             });
         });
 
-        // 左侧边栏 - 使用 exact_width 确保设置中的宽度变更即时生效
-        egui::SidePanel::left("sidebar")
-            .resizable(true)
-            .exact_width(self.sidebar_width)
-            .width_range(150.0..=400.0)
-            .show(ctx, |ui| {
-                self.render_sidebar(ui);
-            });
+        // 左侧边栏 - 配置变更时清除旧状态，同时保留边缘拖拽调整能力
+        sidebar_panel(self.sidebar_width).show(ctx, |ui| {
+            self.render_sidebar(ui);
+        });
 
         // 中央内容区
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -732,7 +762,7 @@ impl eframe::App for App {
 
 #[cfg(test)]
 mod tests {
-    use super::set_native_window_visible;
+    use super::{SIDEBAR_PANEL_ID, apply_sidebar_width, set_native_window_visible, sidebar_panel};
     use windows_sys::Win32::Foundation::HWND;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DestroyWindow, IsIconic, IsWindowVisible, IsZoomed, SW_MAXIMIZE,
@@ -775,6 +805,74 @@ mod tests {
                 DestroyWindow(self.0);
             }
         }
+    }
+
+    #[test]
+    fn sidebar_width_change_clears_persisted_panel_state() {
+        let ctx = egui::Context::default();
+        let panel_id = egui::Id::new(SIDEBAR_PANEL_ID);
+        ctx.data_mut(|data| {
+            data.insert_persisted(
+                panel_id,
+                egui::containers::panel::PanelState {
+                    rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 600.0)),
+                },
+            );
+        });
+        assert!(
+            egui::containers::panel::PanelState::load(&ctx, panel_id).is_some(),
+            "测试前应存在旧的侧边栏面板状态"
+        );
+
+        let mut current_width = 200.0;
+        apply_sidebar_width(&ctx, &mut current_width, 320.0);
+
+        assert_eq!(current_width, 320.0);
+        assert!(
+            egui::containers::panel::PanelState::load(&ctx, panel_id).is_none(),
+            "宽度变化后必须清除 egui 保存的旧面板尺寸"
+        );
+    }
+
+    #[test]
+    fn sidebar_width_change_updates_rendered_panel_width() {
+        let ctx = egui::Context::default();
+        let panel_id = egui::Id::new(SIDEBAR_PANEL_ID);
+        ctx.data_mut(|data| {
+            data.insert_persisted(
+                panel_id,
+                egui::containers::panel::PanelState {
+                    rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 600.0)),
+                },
+            );
+        });
+
+        let mut current_width = 200.0;
+        apply_sidebar_width(&ctx, &mut current_width, 320.0);
+
+        let mut rendered_width = 0.0;
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            rendered_width = sidebar_panel(current_width)
+                .show(ctx, |ui| {
+                    ui.set_min_width(ui.available_width());
+                })
+                .response
+                .rect
+                .width();
+            egui::CentralPanel::default().show(ctx, |_ui| {});
+        });
+
+        assert!(
+            (rendered_width - 320.0).abs() <= 1.0,
+            "侧边栏应按新配置宽度重新布局，实际宽度={rendered_width}"
+        );
     }
 
     #[test]

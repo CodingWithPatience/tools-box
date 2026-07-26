@@ -2,6 +2,7 @@
 
 mod app;
 mod hotkey;
+mod instance;
 mod plugin;
 mod plugins;
 mod storage;
@@ -16,6 +17,24 @@ fn main() -> eframe::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     log::info!("Tools Box 启动中...");
+
+    let _instance_guard = match instance::acquire_single_instance_or_notify(|| {
+        log::info!("检测到 Tools Box 已运行，正在显示现有窗口");
+        let notified = tray::notify_existing_instance();
+        if !notified {
+            log::warn!("通知已有实例失败，正在重新检查主实例状态");
+        }
+        notified
+    }) {
+        Ok(instance::SingleInstanceState::Primary(guard)) => guard,
+        Ok(instance::SingleInstanceState::Existing) => {
+            return Ok(());
+        }
+        Err(error) => {
+            log::error!("单实例检测失败，取消启动: {}", error);
+            return Ok(());
+        }
+    };
 
     let db = Database::open().expect("数据库初始化失败");
 

@@ -20,6 +20,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 /// 自定义窗口消息 ID（托盘图标回调）
 const WM_TRAYICON: u32 = WM_APP + 1;
+/// 重复启动进程请求显示现有窗口的消息 ID。
+const WM_SHOW_EXISTING_INSTANCE: u32 = WM_APP + 2;
+/// 托盘消息窗口类名。
+const TRAY_WINDOW_CLASS_NAME: &str = "ToolsBoxTrayClass";
 
 /// 菜单项 ID
 const MENU_SHOW: usize = 1;
@@ -74,7 +78,7 @@ impl TrayManager {
         }
 
         // 注册隐藏窗口类
-        let class_name: Vec<u16> = "ToolsBoxTrayClass\0".encode_utf16().collect();
+        let class_name = tray_window_class_name();
         // SAFETY: class_name 在整个函数期间保持有效，wnd_class 字段已正确初始化
         let atom = unsafe {
             let mut wnd_class: WNDCLASSEXW = std::mem::zeroed();
@@ -221,11 +225,64 @@ unsafe extern "system" fn tray_wnd_proc(
             }
             0
         }
+        WM_SHOW_EXISTING_INSTANCE => {
+            log::info!("[单实例] 收到重复启动请求，显示现有窗口");
+            // SAFETY: 托盘消息窗口与全局事件发送器均由主线程创建并使用。
+            unsafe {
+                send_event(TrayEvent::ShowWindow);
+            }
+            0
+        }
         _ => {
             // SAFETY: 未处理消息按 Win32 约定转发给默认窗口过程。
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
     }
+}
+
+/// 通知已运行的 Tools Box 实例显示主窗口。
+///
+/// 首个进程可能仍在初始化，因此会在有限时间内等待托盘消息窗口创建。
+pub fn notify_existing_instance() -> bool {
+    let class_name = tray_window_class_name();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+
+    loop {
+        // SAFETY: class_name 以空字符结尾且调用期间有效，窗口标题传空表示只按类名查找。
+        let hwnd = unsafe { FindWindowW(class_name.as_ptr(), std::ptr::null()) };
+        if !hwnd.is_null() {
+            let mut process_id = 0;
+            // SAFETY: hwnd 由 FindWindowW 返回，process_id 指向有效可写内存。
+            unsafe {
+                GetWindowThreadProcessId(hwnd, &mut process_id);
+                if process_id != 0 {
+                    let allowed = AllowSetForegroundWindow(process_id);
+                    if allowed == 0 {
+                        log::debug!("未能授予现有进程前台激活权限，将继续发送显示请求");
+                    }
+                }
+            }
+
+            // SAFETY: hwnd 由 FindWindowW 返回；消息不携带指针，跨进程异步投递安全。
+            let posted = unsafe { PostMessageW(hwnd, WM_SHOW_EXISTING_INSTANCE, 0, 0) };
+            if posted != 0 {
+                log::info!("已通知现有 Tools Box 实例显示窗口");
+                return true;
+            }
+        }
+
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+fn tray_window_class_name() -> Vec<u16> {
+    TRAY_WINDOW_CLASS_NAME
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
 /// 通过全局 Sender 发送事件，并通过 egui Context 强制请求重绘
@@ -238,7 +295,7 @@ unsafe fn send_event(event: TrayEvent) {
             match tx.send(event) {
                 Ok(()) => {
                     log::debug!("[托盘] 事件发送成功");
-                    wake_main_window(event);
+                    wake_main_window();
 
                     // 原生窗口消息是主要唤醒手段，egui 重绘请求作为可见窗口的补充。
                     if let Some(ref ctx) = GLOBAL_EGUI_CTX {
@@ -262,20 +319,22 @@ pub fn set_main_window_handle(hwnd: HWND) {
 }
 
 /// 使用原生窗口操作唤醒隐藏状态下的主窗口事件循环。
-fn wake_main_window(event: TrayEvent) {
+///
+/// 托盘事件和全局热键事件均可调用此函数，不依赖 eframe 后续重绘。
+pub fn wake_main_window() {
     let hwnd = MAIN_WINDOW_HWND.load(Ordering::Acquire);
     if hwnd.is_null() {
         log::debug!("[托盘] 主窗口句柄尚未登记，使用 egui 重绘请求唤醒");
         return;
     }
 
-    match event {
-        TrayEvent::ToggleVisible | TrayEvent::ShowWindow => {
-            // SAFETY: hwnd 由主窗口在隐藏前登记，主窗口生命周期覆盖托盘管理器。
-            unsafe {
-                if IsWindowVisible(hwnd) == 0 {
-                    ShowWindow(hwnd, SW_SHOW);
-                }
+    // SAFETY: hwnd 由主窗口在隐藏前登记，主窗口生命周期覆盖托盘和热键管理器。
+    // ShowWindowAsync 在热键监听线程调用时不会同步等待主窗口线程。
+    unsafe {
+        if IsWindowVisible(hwnd) == 0 {
+            let shown = ShowWindowAsync(hwnd, SW_SHOW);
+            if shown == 0 {
+                log::error!("异步唤醒主窗口失败");
             }
         }
     }
@@ -460,6 +519,29 @@ mod tests {
         }
     }
 
+    fn wait_for_window_visible(hwnd: HWND) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            // SAFETY: 在创建测试窗口的线程中处理该窗口的消息，MSG 已正确初始化。
+            unsafe {
+                let mut message: MSG = std::mem::zeroed();
+                while PeekMessageW(&mut message, hwnd, 0, 0, PM_REMOVE) != 0 {
+                    TranslateMessage(&message);
+                    DispatchMessageW(&message);
+                }
+
+                if IsWindowVisible(hwnd) != 0 {
+                    return true;
+                }
+            }
+
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     struct TestMainWindow(HWND);
 
     impl TestMainWindow {
@@ -544,6 +626,47 @@ mod tests {
     }
 
     #[test]
+    fn test_existing_instance_message_requests_show_window() {
+        let _guard = lock_main_window_tests();
+        let manager = TrayManager::new();
+
+        // SAFETY: manager.hwnd 是 TrayManager 创建并在测试期间保持有效的消息窗口。
+        let result = unsafe {
+            tray_wnd_proc(
+                manager.hwnd,
+                WM_SHOW_EXISTING_INSTANCE,
+                WPARAM::default(),
+                LPARAM::default(),
+            )
+        };
+
+        assert_eq!(result, 0);
+        assert_eq!(manager.poll_events(), vec![TrayEvent::ShowWindow]);
+    }
+
+    #[test]
+    fn test_notify_existing_instance_finds_tray_window_and_posts_show_request() {
+        let _guard = lock_main_window_tests();
+        let manager = TrayManager::new();
+
+        assert!(
+            notify_existing_instance(),
+            "应能通过窗口类名找到已运行实例的托盘消息窗口"
+        );
+
+        // SAFETY: 在创建托盘消息窗口的线程中处理该窗口收到的异步消息。
+        unsafe {
+            let mut message: MSG = std::mem::zeroed();
+            while PeekMessageW(&mut message, manager.hwnd, 0, 0, PM_REMOVE) != 0 {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+
+        assert_eq!(manager.poll_events(), vec![TrayEvent::ShowWindow]);
+    }
+
+    #[test]
     fn test_show_event_wakes_hidden_main_window() {
         let _guard = lock_main_window_tests();
         let window = TestMainWindow::new();
@@ -560,12 +683,31 @@ mod tests {
             assert_eq!(IsWindowVisible(window.0), 0, "测试窗口应处于隐藏状态");
         }
 
-        wake_main_window(TrayEvent::ShowWindow);
+        wake_main_window();
+        assert!(
+            wait_for_window_visible(window.0),
+            "托盘事件应原生唤醒隐藏窗口"
+        );
+    }
+
+    #[test]
+    fn test_background_thread_wakes_hidden_main_window() {
+        let _guard = lock_main_window_tests();
+        let window = TestMainWindow::new();
 
         // SAFETY: 句柄在测试期间有效，并由 TestMainWindow 保持存活。
         unsafe {
-            assert_ne!(IsWindowVisible(window.0), 0, "托盘事件应原生唤醒隐藏窗口");
+            ShowWindow(window.0, SW_SHOW);
+            ShowWindow(window.0, SW_HIDE);
         }
+        set_main_window_handle(window.0);
+
+        let wake_thread = std::thread::spawn(wake_main_window);
+        assert!(wake_thread.join().is_ok(), "后台唤醒线程不应发生 panic");
+        assert!(
+            wait_for_window_visible(window.0),
+            "后台线程应在超时前恢复隐藏窗口"
+        );
     }
 
     #[test]
