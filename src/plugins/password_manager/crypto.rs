@@ -60,14 +60,6 @@ pub fn hash_master_password_with_key(password: &str, salt: &[u8]) -> ([u8; 32], 
     (key, hash.to_vec())
 }
 
-/// 计算主密码的验证哈希（兼容旧代码）
-///
-/// 用于验证用户输入的主密码是否正确
-pub fn hash_master_password(password: &str, salt: &[u8]) -> Vec<u8> {
-    let (_, hash) = hash_master_password_with_key(password, salt);
-    hash
-}
-
 /// 使用 AES-256-GCM 加密密码
 ///
 /// # 返回
@@ -202,13 +194,13 @@ mod tests {
     }
 
     #[test]
-    fn test_hash_master_password() {
+    fn test_hash_master_password_with_key() {
         let salt = generate_salt();
-        let hash1 = hash_master_password("correct_password", &salt);
-        let hash2 = hash_master_password("correct_password", &salt);
+        let (_, hash1) = hash_master_password_with_key("correct_password", &salt);
+        let (_, hash2) = hash_master_password_with_key("correct_password", &salt);
         assert_eq!(hash1, hash2);
 
-        let hash3 = hash_master_password("wrong_password", &salt);
+        let (_, hash3) = hash_master_password_with_key("wrong_password", &salt);
         assert_ne!(hash1, hash3);
     }
 
@@ -225,23 +217,6 @@ mod tests {
         assert!(
             duration.as_millis() < 5000,
             "derive_key 耗时过长: {:?}",
-            duration
-        );
-    }
-
-    #[test]
-    fn test_hash_master_password_performance() {
-        let salt = generate_salt();
-        let password = "test_password_123";
-
-        let start = Instant::now();
-        let _hash = hash_master_password(password, &salt);
-        let duration = start.elapsed();
-
-        println!("hash_master_password 耗时: {:?}", duration);
-        assert!(
-            duration.as_millis() < 5000,
-            "hash_master_password 耗时过长: {:?}",
             duration
         );
     }

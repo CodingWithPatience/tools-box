@@ -109,43 +109,7 @@ impl<'a> NoteStore<'a> {
         Ok(())
     }
 
-    /// 获取目录下的笔记数量
-    pub fn count_notes_in_folder(&self, folder_id: i64) -> Result<usize> {
-        let count: usize = self.conn.query_row(
-            "SELECT COUNT(*) FROM note_entries WHERE folder_id = ?1",
-            params![folder_id],
-            |row| row.get(0),
-        )?;
-        Ok(count)
-    }
-
     // ========== 笔记操作 ==========
-
-    /// 获取所有笔记
-    pub fn get_all_notes(&self) -> Result<Vec<NoteEntry>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, title, content, folder_id, is_favorite, tags, created_at, updated_at 
-             FROM note_entries ORDER BY updated_at DESC",
-        )?;
-
-        let notes = stmt
-            .query_map([], |row| {
-                let tags_str: String = row.get::<_, String>(5)?;
-                Ok(NoteEntry {
-                    id: row.get(0)?,
-                    title: row.get(1)?,
-                    content: row.get(2)?,
-                    folder_id: row.get(3)?,
-                    is_favorite: row.get(4)?,
-                    tags: Self::parse_tags_from_str(&tags_str),
-                    created_at: row.get(6)?,
-                    updated_at: row.get(7)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(notes)
-    }
 
     /// 根据目录获取笔记
     pub fn get_notes_by_folder(&self, folder_id: Option<i64>) -> Result<Vec<NoteEntry>> {
@@ -328,14 +292,6 @@ impl<'a> NoteStore<'a> {
             |row| row.get(0),
         )?;
         Ok(is_favorite)
-    }
-
-    /// 获取笔记总数
-    pub fn count_notes(&self) -> Result<usize> {
-        let count: usize = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM note_entries", [], |row| row.get(0))?;
-        Ok(count)
     }
 
     // ========== 辅助方法 ==========

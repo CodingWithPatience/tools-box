@@ -9,8 +9,6 @@ pub struct PasswordEntry {
     pub username: String,
     pub password: String,
     pub notes: Option<String>,
-    pub created_at: String,
-    pub updated_at: String,
 }
 
 /// 密码条目（加密存储，延迟解密）
@@ -23,8 +21,6 @@ pub struct EncryptedPasswordEntry {
     pub encrypted_password: Vec<u8>,
     pub iv: Vec<u8>,
     pub notes: Option<String>,
-    pub created_at: String,
-    pub updated_at: String,
 }
 
 impl EncryptedPasswordEntry {
@@ -42,8 +38,6 @@ impl EncryptedPasswordEntry {
             username: self.username.clone(),
             password: self.decrypt_password(key),
             notes: self.notes.clone(),
-            created_at: self.created_at.clone(),
-            updated_at: self.updated_at.clone(),
         }
     }
 }

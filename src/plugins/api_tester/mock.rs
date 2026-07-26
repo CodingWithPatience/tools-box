@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -8,19 +7,13 @@ use anyhow::Result;
 #[derive(Debug, Clone)]
 pub struct MockResponse {
     pub status: u16,
-    pub headers: HashMap<String, String>,
     pub body: String,
 }
 
 impl MockResponse {
     pub fn new(status: u16, body: impl Into<String>) -> Self {
-        let mut headers = HashMap::new();
-        headers.insert("Content-Type".to_string(), "application/json".to_string());
-        headers.insert("Access-Control-Allow-Origin".to_string(), "*".to_string());
-
         Self {
             status,
-            headers,
             body: body.into(),
         }
     }
@@ -28,11 +21,6 @@ impl MockResponse {
     /// 创建 JSON 响应
     pub fn json(status: u16, json_value: serde_json::Value) -> Self {
         Self::new(status, serde_json::to_string_pretty(&json_value).unwrap())
-    }
-
-    /// 创建成功响应
-    pub fn ok(body: impl Into<String>) -> Self {
-        Self::new(200, body)
     }
 
     /// 创建 JSON 成功响应
@@ -221,11 +209,6 @@ impl MockServer {
     /// 检查服务器是否运行
     pub fn is_running(&self) -> bool {
         *self.running.lock().unwrap()
-    }
-
-    /// 获取服务器地址
-    pub fn base_url(&self) -> String {
-        format!("http://localhost:{}", self.port)
     }
 
     /// 运行服务器（简化版本，使用 TCP 监听）

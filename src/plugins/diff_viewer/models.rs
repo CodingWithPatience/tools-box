@@ -80,15 +80,3 @@ pub struct DiffResult {
     pub similarity: f64,
 }
 
-impl DiffResult {
-    /// 创建空的差异结果
-    pub fn empty() -> Self {
-        Self {
-            unified_lines: Vec::new(),
-            split_lines: Vec::new(),
-            added_count: 0,
-            removed_count: 0,
-            similarity: 1.0,
-        }
-    }
-}

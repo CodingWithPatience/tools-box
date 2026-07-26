@@ -127,12 +127,6 @@ impl SftpClient {
                 Ok(SftpRequest::Download(remote_path, local_path)) => {
                     Self::handle_download(&sftp, &remote_path, &local_path, resp_tx);
                 }
-                Ok(SftpRequest::MkDir(path)) => {
-                    Self::handle_mkdir(&sftp, &path, resp_tx);
-                }
-                Ok(SftpRequest::Delete(path)) => {
-                    Self::handle_delete(&sftp, &path, resp_tx);
-                }
                 Ok(SftpRequest::Disconnect) => {
                     log::info!("SFTP: 收到断开请求");
                     break;
@@ -168,8 +162,7 @@ impl SftpClient {
                             size: stat.size.unwrap_or(0),
                             // SAFETY: mtime 是 Unix 时间戳，u64→i64 仅在 2262 年后溢出
                             modified: stat.mtime.map(|t| t.min(i64::MAX as u64) as i64),
-                            permissions: stat.perm,
-                        })
+                                })
                     })
                     .collect();
 
@@ -371,44 +364,6 @@ impl SftpClient {
         log::info!("SFTP 下载完成: {} → {}", remote_path, local_path);
     }
 
-    /// 创建远程目录
-    fn handle_mkdir(sftp: &Sftp, path: &str, resp_tx: &mpsc::SyncSender<SftpResponse>) {
-        match sftp.mkdir(Path::new(path), 0o755) {
-            Ok(()) => {
-                let _ = resp_tx.send(SftpResponse::OperationDone(format!("目录已创建: {}", path)));
-            }
-            Err(e) => {
-                let _ = resp_tx.send(SftpResponse::Error(format!(
-                    "创建目录失败 '{}': {}",
-                    path, e
-                )));
-            }
-        }
-    }
-
-    /// 删除远程文件或目录
-    fn handle_delete(sftp: &Sftp, path: &str, resp_tx: &mpsc::SyncSender<SftpResponse>) {
-        let p = Path::new(path);
-        // 先尝试作为文件删除
-        match sftp.unlink(p) {
-            Ok(()) => {
-                let _ = resp_tx.send(SftpResponse::OperationDone(format!("已删除: {}", path)));
-            }
-            Err(_) => {
-                // 尝试作为目录删除（仅空目录）
-                match sftp.rmdir(p) {
-                    Ok(()) => {
-                        let _ = resp_tx
-                            .send(SftpResponse::OperationDone(format!("目录已删除: {}", path)));
-                    }
-                    Err(e) => {
-                        let _ = resp_tx
-                            .send(SftpResponse::Error(format!("删除失败 '{}': {}", path, e)));
-                    }
-                }
-            }
-        }
-    }
 }
 
 /// 列出本地目录内容
@@ -436,7 +391,6 @@ pub fn list_local_dir(path: &str) -> Result<Vec<FileEntry>> {
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 // SAFETY: Unix 时间戳到 2262 年才会溢出 i64
                 .map(|d| d.as_secs().min(i64::MAX as u64) as i64),
-            permissions: None,
         });
     }
 
@@ -457,14 +411,3 @@ pub fn home_dir() -> String {
         .unwrap_or_else(|| "/".to_string())
 }
 
-/// 获取本地根目录（Windows 返回盘符列表，Unix 返回 "/"）
-pub fn root_dir() -> String {
-    #[cfg(target_os = "windows")]
-    {
-        "C:\\".to_string()
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        "/".to_string()
-    }
-}

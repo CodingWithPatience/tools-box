@@ -37,8 +37,4 @@ impl Plugin for JsonEditorPlugin {
     fn init(&mut self) {
         log::info!("JSON 编辑器插件已初始化");
     }
-
-    fn hotkey_char(&self) -> Option<char> {
-        Some('2')
-    }
 }

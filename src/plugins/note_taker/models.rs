@@ -53,38 +53,6 @@ impl NoteForm {
         }
     }
 
-    /// 解析标签字符串为 Vec
-    pub fn parse_tags(&self) -> Vec<String> {
-        self.tags
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect()
-    }
-}
-
-/// 排序方式
-#[derive(Debug, Clone, PartialEq)]
-pub enum SortBy {
-    CreatedAt,
-    UpdatedAt,
-    Title,
-}
-
-impl SortBy {
-    /// 获取所有排序方式
-    pub fn all() -> &'static [SortBy] {
-        &[SortBy::CreatedAt, SortBy::UpdatedAt, SortBy::Title]
-    }
-
-    /// 转换为显示文本
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            SortBy::CreatedAt => "创建时间",
-            SortBy::UpdatedAt => "更新时间",
-            SortBy::Title => "标题",
-        }
-    }
 }
 
 /// 视图模式

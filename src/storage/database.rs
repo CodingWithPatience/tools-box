@@ -245,8 +245,4 @@ impl Database {
         &self.conn
     }
 
-    /// 获取底层 Connection 的可变引用（供插件直接使用）
-    pub fn conn_mut(&mut self) -> &mut Connection {
-        &mut self.conn
-    }
 }

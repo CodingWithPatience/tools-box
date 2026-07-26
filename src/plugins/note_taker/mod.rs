@@ -79,12 +79,4 @@ impl Plugin for NoteTakerPlugin {
     fn init(&mut self) {
         log::info!("临时笔记插件已初始化");
     }
-
-    fn cleanup(&mut self) {
-        log::info!("临时笔记插件已清理");
-    }
-
-    fn hotkey_char(&self) -> Option<char> {
-        Some('6')
-    }
 }

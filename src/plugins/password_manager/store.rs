@@ -122,7 +122,7 @@ impl<'a> PasswordStore<'a> {
         let entries = {
             let mut stmt = tx
                 .prepare(
-                    "SELECT id, name, url, username, password, iv, notes, created_at, updated_at
+                    "SELECT id, name, url, username, password, iv, notes
                      FROM passwords ORDER BY name ASC",
                 )
                 .context("查询密码列表失败")?;
@@ -135,8 +135,6 @@ impl<'a> PasswordStore<'a> {
                 let encrypted_password: Vec<u8> = row.get(4)?;
                 let iv: Vec<u8> = row.get(5)?;
                 let notes: Option<String> = row.get(6)?;
-                let created_at: String = row.get(7)?;
-                let updated_at: String = row.get(8)?;
 
                 Ok(EncryptedPasswordEntry {
                     id,
@@ -146,8 +144,6 @@ impl<'a> PasswordStore<'a> {
                     encrypted_password,
                     iv,
                     notes,
-                    created_at,
-                    updated_at,
                 })
             })
             .context("读取密码列表失败")?
@@ -191,7 +187,7 @@ impl<'a> PasswordStore<'a> {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, name, url, username, password, iv, notes, created_at, updated_at
+                "SELECT id, name, url, username, password, iv, notes
                  FROM passwords ORDER BY name ASC",
             )
             .context("查询密码列表失败")?;
@@ -205,9 +201,6 @@ impl<'a> PasswordStore<'a> {
                 let encrypted_password: Vec<u8> = row.get(4)?;
                 let iv: Vec<u8> = row.get(5)?;
                 let notes: Option<String> = row.get(6)?;
-                let created_at: String = row.get(7)?;
-                let updated_at: String = row.get(8)?;
-
                 Ok(EncryptedPasswordEntry {
                     id,
                     name,
@@ -216,8 +209,6 @@ impl<'a> PasswordStore<'a> {
                     encrypted_password,
                     iv,
                     notes,
-                    created_at,
-                    updated_at,
                 })
             })
             .context("读取密码列表失败")?
@@ -242,7 +233,7 @@ impl<'a> PasswordStore<'a> {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, name, url, username, password, iv, notes, created_at, updated_at
+                "SELECT id, name, url, username, password, iv, notes
                  FROM passwords
                  WHERE name LIKE ?1 OR username LIKE ?1 OR url LIKE ?1
                  ORDER BY name ASC",
@@ -258,9 +249,6 @@ impl<'a> PasswordStore<'a> {
                 let encrypted_password: Vec<u8> = row.get(4)?;
                 let iv: Vec<u8> = row.get(5)?;
                 let notes: Option<String> = row.get(6)?;
-                let created_at: String = row.get(7)?;
-                let updated_at: String = row.get(8)?;
-
                 Ok(EncryptedPasswordEntry {
                     id,
                     name,
@@ -269,23 +257,11 @@ impl<'a> PasswordStore<'a> {
                     encrypted_password,
                     iv,
                     notes,
-                    created_at,
-                    updated_at,
                 })
             })
             .context("搜索密码失败")?
             .collect::<Result<Vec<_>, _>>()?;
 
-        Ok(entries)
-    }
-
-    /// 搜索密码条目（解密版本，兼容旧代码）
-    pub fn search_entries(&self, query: &str, key: &[u8; 32]) -> Result<Vec<PasswordEntry>> {
-        let encrypted_entries = self.search_entries_encrypted(query)?;
-        let entries: Vec<PasswordEntry> = encrypted_entries
-            .iter()
-            .map(|e| e.to_decrypted(key))
-            .collect();
         Ok(entries)
     }
 
@@ -319,15 +295,6 @@ impl<'a> PasswordStore<'a> {
             .execute("DELETE FROM passwords WHERE id = ?1", params![id])
             .context("删除密码失败")?;
         Ok(())
-    }
-
-    /// 获取密码条目数量
-    pub fn count_entries(&self) -> Result<usize> {
-        let count: usize = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM passwords", [], |row| row.get(0))
-            .context("查询密码数量失败")?;
-        Ok(count)
     }
 
     /// 导出所有密码条目
@@ -582,7 +549,7 @@ mod tests {
 
         // 清空数据
         store.conn.execute("DELETE FROM passwords", []).unwrap();
-        assert_eq!(store.count_entries().unwrap(), 0);
+        assert_eq!(store.get_all_entries(&key).unwrap().len(), 0);
 
         // 从 JSON 导入
         let count = store
@@ -628,7 +595,7 @@ mod tests {
 
         // 清空数据
         store.conn.execute("DELETE FROM passwords", []).unwrap();
-        assert_eq!(store.count_entries().unwrap(), 0);
+        assert_eq!(store.get_all_entries(&key).unwrap().len(), 0);
 
         // 从 CSV 导入
         let count = store

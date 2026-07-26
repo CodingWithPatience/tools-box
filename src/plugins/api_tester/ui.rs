@@ -44,8 +44,6 @@ pub struct ApiTesterUi {
     error: Option<String>,
     /// 历史记录
     history: Vec<RequestHistory>,
-    /// 是否显示历史面板
-    show_history: bool,
     /// 是否正在发送请求
     is_sending: bool,
     /// Mock 服务器（仅 debug 模式）
@@ -117,7 +115,6 @@ impl ApiTesterUi {
             client: None,
             error: None,
             history: Vec::new(),
-            show_history: false,
             is_sending: false,
             #[cfg(debug_assertions)]
             mock_server: None,

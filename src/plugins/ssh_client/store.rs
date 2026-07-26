@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 
-use super::crypto;
 use super::models::{AuthMethod, NewSession, SshSession};
 
 /// SSH 会话数据存储层
@@ -20,9 +19,9 @@ impl<'a> SshStore<'a> {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, name, host, port, username, auth_type, auth_data, sort_order, created_at, updated_at
+                "SELECT id, name, host, port, username, auth_type, auth_data
                  FROM ssh_sessions
-                 ORDER BY sort_order, id",
+                 ORDER BY id",
             )
             .context("准备查询语句失败")?;
 
@@ -34,35 +33,19 @@ impl<'a> SshStore<'a> {
             let username: String = row.get(4)?;
             let auth_type: String = row.get(5)?;
             let auth_data: String = row.get(6)?;
-            let sort_order: i32 = row.get(7)?;
-            let created_at: String = row.get(8)?;
-            let updated_at: String = row.get(9)?;
-            Ok((
-                id, name, host, port_i64, username, auth_type, auth_data, sort_order, created_at,
-                updated_at,
-            ))
+            Ok((id, name, host, port_i64, username, auth_type, auth_data))
         })?;
 
         let mut sessions = Vec::new();
         for row in rows {
-            let (
-                id,
-                name,
-                host,
-                port_i64,
-                username,
-                auth_type,
-                auth_data,
-                sort_order,
-                created_at,
-                updated_at,
-            ) = match row.context("读取会话记录失败") {
-                Ok(r) => r,
-                Err(e) => {
-                    log::warn!("跳过一条损坏的 SSH 连接记录: {}", e);
-                    continue;
-                }
-            };
+            let (id, name, host, port_i64, username, auth_type, auth_data) =
+                match row.context("读取会话记录失败") {
+                    Ok(r) => r,
+                    Err(e) => {
+                        log::warn!("跳过一条损坏的 SSH 连接记录: {}", e);
+                        continue;
+                    }
+                };
             let port = match u16::try_from(port_i64) {
                 Ok(p) => p,
                 Err(_) => {
@@ -95,9 +78,6 @@ impl<'a> SshStore<'a> {
                 port,
                 username,
                 auth_method,
-                sort_order,
-                created_at,
-                updated_at,
             });
         }
         Ok(sessions)
@@ -196,16 +176,6 @@ impl<'a> SshStore<'a> {
         Ok(())
     }
 
-    /// 获取会话数量
-    #[allow(dead_code)]
-    pub fn count_sessions(&self) -> Result<usize> {
-        let count: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM ssh_sessions", [], |row| row.get(0))
-            .context("查询连接数量失败")?;
-        usize::try_from(count).context("连接数量溢出")
-    }
-
     // ===================================================================
     // auth_data 序列化/反序列化
     // ===================================================================
@@ -293,41 +263,6 @@ impl<'a> SshStore<'a> {
                 })
             }
             _ => anyhow::bail!("未知的认证类型: {}", auth_type),
-        }
-    }
-}
-
-// ===================================================================
-// SshSession 便捷方法
-// ===================================================================
-
-impl SshSession {
-    /// 获取解密后的密码
-    pub fn decrypt_password(&self) -> Result<Option<String>> {
-        match &self.auth_method {
-            AuthMethod::Password {
-                encrypted_password,
-                iv,
-                salt,
-            } => {
-                let pw = crypto::decrypt_password(encrypted_password, iv, salt)?;
-                Ok(Some(pw))
-            }
-            _ => Ok(None),
-        }
-    }
-
-    /// 获取解密后的密钥文件密码短语
-    pub fn decrypt_passphrase(&self) -> Result<Option<String>> {
-        match &self.auth_method {
-            AuthMethod::KeyFile {
-                encrypted_passphrase: Some((ct, iv, salt)),
-                ..
-            } => {
-                let pp = crypto::decrypt_password(ct, iv, salt)?;
-                Ok(Some(pp))
-            }
-            _ => Ok(None),
         }
     }
 }

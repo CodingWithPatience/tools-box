@@ -33,36 +33,6 @@ pub struct HotkeyBinding {
     pub plugin_index: usize,
 }
 
-/// 构建默认热键绑定列表
-///
-/// 默认快捷键：Win+Alt+Space（主窗口），Win+Alt+1~9（各工具）
-pub fn default_bindings(plugin_count: usize) -> Vec<HotkeyBinding> {
-    let mut bindings = Vec::new();
-
-    // 主窗口唤出: Ctrl+Alt+Space（plugin_index = usize::MAX 表示恢复最近工具）
-    bindings.push(HotkeyBinding {
-        id: 1,
-        modifiers: MOD_CONTROL | MOD_ALT,
-        vk: VK_SPACE as u32,
-        plugin_index: usize::MAX,
-    });
-
-    // 各工具快捷键: Ctrl+Alt+1~9
-    let tool_keys = [0x31u32, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39]; // '1'~'9'
-    for (i, &vk) in tool_keys.iter().enumerate() {
-        if i < plugin_count {
-            bindings.push(HotkeyBinding {
-                id: 2 + i as i32,
-                modifiers: MOD_CONTROL | MOD_ALT,
-                vk,
-                plugin_index: i,
-            });
-        }
-    }
-
-    bindings
-}
-
 /// 全局 egui Context（用于唤醒事件循环）
 /// 使用 std::sync::OnceLock 确保线程安全
 static HOTKEY_EGUI_CTX: std::sync::OnceLock<egui::Context> = std::sync::OnceLock::new();
@@ -88,11 +58,6 @@ fn dispatch_hotkey_event_with_wake(
     }
 
     Ok(())
-}
-
-/// 热键更新请求（发送给监听线程）
-struct HotkeyUpdateRequest {
-    bindings: Vec<HotkeyBinding>,
 }
 
 /// 全局热键管理器
@@ -273,11 +238,6 @@ impl HotkeyManager {
         events
     }
 
-    /// 获取当前绑定列表
-    pub fn bindings(&self) -> &[HotkeyBinding] {
-        &self.bindings
-    }
-
     /// 动态更新热键绑定
     ///
     /// 注销旧热键，注册新热键，立即生效。
@@ -331,29 +291,6 @@ unsafe extern "system" fn hotkey_wnd_proc(
 mod tests {
     use super::*;
     use std::cell::Cell;
-
-    #[test]
-    fn test_default_bindings_count() {
-        let bindings = default_bindings(7);
-        // 1 个主窗口 + 7 个工具 = 8 个绑定
-        assert_eq!(bindings.len(), 8);
-    }
-
-    #[test]
-    fn test_default_bindings_ids() {
-        let bindings = default_bindings(3);
-        assert_eq!(bindings[0].id, 1); // Space
-        assert_eq!(bindings[1].id, 2); // '1'
-        assert_eq!(bindings[2].id, 3); // '2'
-        assert_eq!(bindings[3].id, 4); // '3'
-    }
-
-    #[test]
-    fn test_default_bindings_modifiers() {
-        let bindings = default_bindings(1);
-        // Ctrl+Alt
-        assert_eq!(bindings[0].modifiers, MOD_CONTROL | MOD_ALT);
-    }
 
     #[test]
     fn test_hotkey_event_wakes_main_window_after_forwarding() {

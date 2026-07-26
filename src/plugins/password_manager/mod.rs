@@ -66,12 +66,4 @@ impl Plugin for PasswordManagerPlugin {
     fn init(&mut self) {
         log::info!("密码管理器插件已初始化");
     }
-
-    fn cleanup(&mut self) {
-        log::info!("密码管理器插件已清理");
-    }
-
-    fn hotkey_char(&self) -> Option<char> {
-        Some('1')
-    }
 }

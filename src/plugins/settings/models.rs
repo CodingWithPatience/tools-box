@@ -82,10 +82,4 @@ impl AppSettings {
         Ok(())
     }
 
-    /// 恢复默认设置
-    pub fn reset(conn: &Connection) -> Result<Self> {
-        let default = Self::default();
-        default.save(conn)?;
-        Ok(default)
-    }
 }

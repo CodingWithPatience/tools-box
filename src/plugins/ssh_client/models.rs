@@ -63,12 +63,6 @@ pub struct SshSession {
     pub username: String,
     /// 认证方式
     pub auth_method: AuthMethod,
-    /// 排序顺序
-    pub sort_order: i32,
-    /// 创建时间
-    pub created_at: String,
-    /// 更新时间
-    pub updated_at: String,
 }
 
 /// 会话连接状态
@@ -205,8 +199,6 @@ pub struct FileEntry {
     pub size: u64,
     /// 修改时间戳（秒）
     pub modified: Option<i64>,
-    /// 文件权限（Unix 模式，仅远程文件有意义）
-    pub permissions: Option<u32>,
 }
 
 impl FileEntry {
@@ -319,10 +311,6 @@ pub enum SftpRequest {
     Upload(String, String),
     /// 下载文件 (远程路径, 本地路径)
     Download(String, String),
-    /// 创建远程目录
-    MkDir(String),
-    /// 删除远程文件
-    Delete(String),
     /// 断开 SFTP 连接
     Disconnect,
 }
@@ -440,11 +428,6 @@ impl SessionTab {
         }
     }
 
-    /// 是否有活跃连接（终端或 SFTP）
-    pub fn has_connection(&self) -> bool {
-        self.terminal.is_some() || self.sftp_connected || self.sftp_tx.is_some()
-    }
-
     /// 断开终端连接
     pub fn disconnect_terminal(&mut self) {
         if let Some(tx) = &self.input_tx {
@@ -491,7 +474,6 @@ mod tests {
             is_dir: true,
             size: 0,
             modified: None,
-            permissions: None,
         };
         assert_eq!(dir.size_display(), "<DIR>");
 
@@ -501,7 +483,6 @@ mod tests {
             is_dir: false,
             size: 500,
             modified: None,
-            permissions: None,
         };
         assert_eq!(small.size_display(), "500 B");
 
@@ -511,7 +492,6 @@ mod tests {
             is_dir: false,
             size: 2048,
             modified: None,
-            permissions: None,
         };
         assert_eq!(kb.size_display(), "2.0 KB");
 
@@ -521,7 +501,6 @@ mod tests {
             is_dir: false,
             size: 5 * 1024 * 1024,
             modified: None,
-            permissions: None,
         };
         assert_eq!(mb.size_display(), "5.0 MB");
 
@@ -531,7 +510,6 @@ mod tests {
             is_dir: false,
             size: 2 * 1024 * 1024 * 1024,
             modified: None,
-            permissions: None,
         };
         assert_eq!(gb.size_display(), "2.0 GB");
     }
@@ -610,7 +588,6 @@ mod tests {
             is_dir: false,
             size: 0,
             modified: None,
-            permissions: None,
         };
         assert_eq!(entry.modified_display(), "-");
     }

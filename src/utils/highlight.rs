@@ -20,24 +20,6 @@ impl SyntaxHighlighter {
         }
     }
 
-    /// 根据文件扩展名获取语法定义
-    pub fn get_syntax_for_extension(
-        &self,
-        extension: &str,
-    ) -> Option<&syntect::parsing::SyntaxReference> {
-        self.syntax_set.find_syntax_by_extension(extension)
-    }
-
-    /// 根据文件名获取语法定义
-    pub fn get_syntax_for_file(
-        &self,
-        filename: &str,
-    ) -> Option<&syntect::parsing::SyntaxReference> {
-        self.syntax_set
-            .find_syntax_by_extension(filename)
-            .or_else(|| self.syntax_set.find_syntax_by_first_line(filename))
-    }
-
     /// 根据亮/暗模式获取主题，若指定主题不存在则回退到第一个可用主题
     fn resolve_theme(&self, is_dark_mode: bool) -> Option<&syntect::highlighting::Theme> {
         let theme_name = if is_dark_mode {
@@ -114,7 +96,7 @@ impl SyntaxHighlighter {
         &self,
         line: &str,
         syntax_name: Option<&str>,
-        font_size: f32,
+        _font_size: f32,
         is_dark_mode: bool,
     ) -> Vec<(Color32, String)> {
         let syntax = syntax_name
@@ -144,15 +126,6 @@ impl SyntaxHighlighter {
         }
 
         result
-    }
-
-    /// 获取支持的语言列表
-    pub fn get_supported_languages(&self) -> Vec<String> {
-        self.syntax_set
-            .syntaxes()
-            .iter()
-            .map(|s| s.name.clone())
-            .collect()
     }
 
     /// 根据语言名称获取语法定义（模糊匹配）

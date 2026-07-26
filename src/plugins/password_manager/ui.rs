@@ -594,7 +594,7 @@ impl PasswordManagerUi {
     }
 
     /// 渲染密码表格（延迟解密版本）
-    fn render_password_table(&mut self, ui: &mut egui::Ui, conn: &Connection) {
+    fn render_password_table(&mut self, ui: &mut egui::Ui, _conn: &Connection) {
         let entries = self.entries.clone();
         let key = self.derived_key;
 
@@ -844,8 +844,6 @@ impl PasswordManagerUi {
                 } else {
                     Some(self.form.notes.clone())
                 },
-                created_at: String::new(), // 不更新
-                updated_at: String::new(), // 数据库会自动更新
             };
 
             match store.update_entry(&entry, key) {

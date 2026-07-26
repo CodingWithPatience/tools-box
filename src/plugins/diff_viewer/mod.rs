@@ -38,8 +38,4 @@ impl Plugin for DiffViewerPlugin {
     fn init(&mut self) {
         log::info!("文本对比工具插件已初始化");
     }
-
-    fn hotkey_char(&self) -> Option<char> {
-        Some('4')
-    }
 }

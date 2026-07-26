@@ -11,15 +11,6 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     IsIconic, SW_HIDE, SW_RESTORE, SW_SHOW, SetForegroundWindow, ShowWindow,
 };
 
-/// 默认字体大小
-const DEFAULT_FONT_SIZE: f32 = 14.0;
-/// 最小字体大小
-const MIN_FONT_SIZE: f32 = 10.0;
-/// 最大字体大小
-const MAX_FONT_SIZE: f32 = 24.0;
-/// 字体大小步长
-const FONT_SIZE_STEP: f32 = 1.0;
-
 /// 侧边栏面板的持久化状态 ID。
 const SIDEBAR_PANEL_ID: &str = "sidebar";
 
@@ -71,46 +62,6 @@ fn sidebar_panel(width: f32) -> egui::SidePanel {
 pub enum Theme {
     Light,
     Dark,
-}
-
-impl Theme {
-    /// 切换主题
-    pub fn toggle(&self) -> Self {
-        match self {
-            Theme::Light => Theme::Dark,
-            Theme::Dark => Theme::Light,
-        }
-    }
-
-    /// 获取主题图标（显示切换后的主题图标，与文字一致）
-    pub fn icon(&self) -> &str {
-        match self {
-            Theme::Light => "🌙", // 当前亮色，切换到暗色，显示月亮
-            Theme::Dark => "☀",   // 当前暗色，切换到亮色，显示太阳
-        }
-    }
-
-    /// 获取主题名称（显示切换后的主题名称，用于按钮文字）
-    pub fn name(&self) -> &str {
-        match self {
-            Theme::Light => "暗色", // 当前亮色，点击后切换到暗色
-            Theme::Dark => "亮色",  // 当前暗色，点击后切换到亮色
-        }
-    }
-
-    /// 获取当前主题的实际名称（用于提示信息）
-    pub fn current_name(&self) -> &str {
-        match self {
-            Theme::Light => "亮色",
-            Theme::Dark => "暗色",
-        }
-    }
-}
-
-impl Default for Theme {
-    fn default() -> Self {
-        Theme::Dark
-    }
 }
 
 /// 主应用状态
@@ -492,16 +443,6 @@ impl App {
         log::info!("字体大小已设置为: {}", self.font_size);
     }
 
-    /// 切换主题
-    fn toggle_theme(&mut self, ctx: &egui::Context) {
-        self.theme = self.theme.toggle();
-        match self.theme {
-            Theme::Light => ctx.set_visuals(egui::Visuals::light()),
-            Theme::Dark => ctx.set_visuals(egui::Visuals::dark()),
-        }
-        self.status_message = format!("已切换到{}主题", self.theme.current_name());
-    }
-
     /// 处理快捷键
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         ctx.input(|i| {
@@ -586,7 +527,7 @@ impl App {
         egui::ScrollArea::vertical()
             .id_salt("sidebar_plugin_list")
             .show(ui, |ui| {
-                for (list_idx, &idx) in filtered.iter().enumerate() {
+                for (_list_idx, &idx) in filtered.iter().enumerate() {
                     let plugin = &self.plugins[idx];
                     let is_selected = self.selected == idx;
 

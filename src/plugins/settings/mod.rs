@@ -26,11 +26,6 @@ impl SettingsPlugin {
         self.settings_ui.settings()
     }
 
-    /// 从外部更新设置
-    pub fn update_settings(&mut self, settings: AppSettings) {
-        self.settings_ui.update_settings(settings);
-    }
-
     /// 标记为已保存
     pub fn mark_saved(&mut self) {
         self.settings_ui.mark_saved();

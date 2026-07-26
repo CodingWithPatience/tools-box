@@ -1,7 +1,7 @@
 use egui::{Color32, RichText, Ui};
 
 use super::markdown::MarkdownRenderer;
-use super::models::{NoteEntry, NoteFolder, NoteForm, NoteViewMode, SortBy};
+use super::models::{NoteEntry, NoteFolder, NoteForm, NoteViewMode};
 use super::store::NoteStore;
 
 /// UI 操作枚举（用于延迟执行）
@@ -9,8 +9,6 @@ enum UiAction {
     CreateNote,
     ReloadNotes,
     SelectNote(i64),
-    DeleteNote(i64),
-    ToggleFavorite(i64),
 }
 
 /// 临时笔记 UI
@@ -41,8 +39,6 @@ pub struct NoteTakerUi {
     folder_form_parent_id: Option<i64>,
     /// 编辑中的目录 ID
     editing_folder_id: Option<i64>,
-    /// 排序方式
-    sort_by: SortBy,
     /// 错误信息
     error: Option<String>,
     /// Markdown 渲染器
@@ -67,7 +63,6 @@ impl NoteTakerUi {
             folder_form_name: String::new(),
             folder_form_parent_id: None,
             editing_folder_id: None,
-            sort_by: SortBy::UpdatedAt,
             error: None,
             markdown_renderer: MarkdownRenderer::new(),
             left_panel_width: 200.0, // 默认宽度
@@ -113,18 +108,8 @@ impl NoteTakerUi {
 
         match result {
             Ok(mut notes) => {
-                // 排序
-                match self.sort_by {
-                    SortBy::CreatedAt => {
-                        notes.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-                    }
-                    SortBy::UpdatedAt => {
-                        notes.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-                    }
-                    SortBy::Title => {
-                        notes.sort_by(|a, b| a.title.cmp(&b.title));
-                    }
-                }
+                // 按更新时间排序
+                notes.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
                 self.notes = notes;
             }
             Err(e) => {

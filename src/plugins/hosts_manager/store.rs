@@ -7,20 +7,16 @@ pub struct Environment {
     pub id: i64,
     pub name: String,
     pub is_active: bool,
-    pub created_at: String,
-    pub updated_at: String,
 }
 
 /// Hosts 条目（数据库）
 #[derive(Debug, Clone)]
 pub struct DbHostsEntry {
     pub id: i64,
-    pub environment_id: i64,
     pub ip_address: String,
     pub hostname: String,
     pub comment: Option<String>,
     pub is_enabled: bool,
-    pub sort_order: i32,
 }
 
 /// 新增条目表单
@@ -114,7 +110,7 @@ impl<'a> HostsStore<'a> {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, name, is_active, created_at, updated_at
+                "SELECT id, name, is_active
                  FROM hosts_environments ORDER BY name ASC",
             )
             .context("查询环境列表失败")?;
@@ -125,8 +121,6 @@ impl<'a> HostsStore<'a> {
                     id: row.get(0)?,
                     name: row.get(1)?,
                     is_active: row.get(2)?,
-                    created_at: row.get(3)?,
-                    updated_at: row.get(4)?,
                 })
             })
             .context("读取环境列表失败")?
@@ -140,7 +134,7 @@ impl<'a> HostsStore<'a> {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, name, is_active, created_at, updated_at
+                "SELECT id, name, is_active
                  FROM hosts_environments WHERE is_active = TRUE LIMIT 1",
             )
             .context("查询激活环境失败")?;
@@ -151,8 +145,6 @@ impl<'a> HostsStore<'a> {
                     id: row.get(0)?,
                     name: row.get(1)?,
                     is_active: row.get(2)?,
-                    created_at: row.get(3)?,
-                    updated_at: row.get(4)?,
                 })
             })
             .optional()
@@ -222,10 +214,10 @@ impl<'a> HostsStore<'a> {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, environment_id, ip_address, hostname, comment, is_enabled, sort_order
+                "SELECT id, ip_address, hostname, comment, is_enabled
                  FROM hosts_entries
                  WHERE environment_id = ?1
-                 ORDER BY sort_order ASC, hostname ASC",
+                 ORDER BY hostname ASC",
             )
             .context("查询条目列表失败")?;
 
@@ -233,12 +225,10 @@ impl<'a> HostsStore<'a> {
             .query_map(params![env_id], |row| {
                 Ok(DbHostsEntry {
                     id: row.get(0)?,
-                    environment_id: row.get(1)?,
-                    ip_address: row.get(2)?,
-                    hostname: row.get(3)?,
-                    comment: row.get(4)?,
-                    is_enabled: row.get(5)?,
-                    sort_order: row.get(6)?,
+                    ip_address: row.get(1)?,
+                    hostname: row.get(2)?,
+                    comment: row.get(3)?,
+                    is_enabled: row.get(4)?,
                 })
             })
             .context("读取条目列表失败")?
@@ -295,18 +285,6 @@ impl<'a> HostsStore<'a> {
         Ok(())
     }
 
-    /// 获取环境下的条目数量
-    pub fn count_entries(&self, env_id: i64) -> Result<usize> {
-        let count: usize = self
-            .conn
-            .query_row(
-                "SELECT COUNT(*) FROM hosts_entries WHERE environment_id = ?1",
-                params![env_id],
-                |row| row.get(0),
-            )
-            .context("查询条目数量失败")?;
-        Ok(count)
-    }
 }
 
 /// rusqlite 扩展 trait

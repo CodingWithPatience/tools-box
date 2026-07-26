@@ -251,13 +251,6 @@ impl<'a> ApiStore<'a> {
         Ok(())
     }
 
-    /// 获取历史记录数量
-    pub fn count_history(&self) -> Result<usize> {
-        let count: usize = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM api_history", [], |row| row.get(0))?;
-        Ok(count)
-    }
 
     // ========== 集合操作 ==========
 
@@ -340,20 +333,6 @@ impl<'a> ApiStore<'a> {
         Ok(requests)
     }
 
-    /// 根据 ID 获取保存的请求
-    pub fn get_saved_request_by_id(&self, id: i64) -> Result<Option<SavedApiRequest>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, collection_id, name, method, url, headers, params, body_type, body, created_at, updated_at
-             FROM api_saved_requests WHERE id = ?1",
-        )?;
-
-        let result = stmt
-            .query_row(params![id], |row| Self::map_saved_request(row))
-            .optional()?;
-
-        Ok(result)
-    }
-
     /// 保存请求到集合
     pub fn save_request(
         &self,
@@ -372,27 +351,6 @@ impl<'a> ApiStore<'a> {
             params![collection_id, name, method, url, headers, params, body_type, body],
         )?;
         Ok(self.conn.last_insert_rowid())
-    }
-
-    /// 更新保存的请求
-    pub fn update_saved_request(
-        &self,
-        id: i64,
-        name: &str,
-        method: &str,
-        url: &str,
-        headers: &str,
-        params: &str,
-        body_type: &str,
-        body: &str,
-    ) -> Result<()> {
-        self.conn.execute(
-            "UPDATE api_saved_requests
-             SET name = ?1, method = ?2, url = ?3, headers = ?4, params = ?5, body_type = ?6, body = ?7, updated_at = CURRENT_TIMESTAMP
-             WHERE id = ?8",
-            params![name, method, url, headers, params, body_type, body, id],
-        )?;
-        Ok(())
     }
 
     /// 删除保存的请求
@@ -453,27 +411,6 @@ impl<'a> ApiStore<'a> {
         Ok(environments)
     }
 
-    /// 获取当前激活的环境
-    pub fn get_active_environment(&self) -> Result<Option<Environment>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, name, is_default, is_active, created_at FROM api_environments WHERE is_active = 1 LIMIT 1",
-        )?;
-
-        let result = stmt
-            .query_row([], |row| {
-                Ok(Environment {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    is_default: row.get(2)?,
-                    is_active: row.get(3)?,
-                    created_at: row.get(4)?,
-                })
-            })
-            .optional()?;
-
-        Ok(result)
-    }
-
     /// 创建环境
     pub fn create_environment(&self, name: &str) -> Result<i64> {
         self.conn.execute(
@@ -515,31 +452,6 @@ impl<'a> ApiStore<'a> {
     }
 
     // ========== 环境变量操作 ==========
-
-    /// 获取环境的所有变量
-    pub fn get_environment_variables(
-        &self,
-        environment_id: i64,
-    ) -> Result<Vec<EnvironmentVariable>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, environment_id, key, value, enabled
-             FROM api_environment_variables WHERE environment_id = ?1 ORDER BY key",
-        )?;
-
-        let variables = stmt
-            .query_map(params![environment_id], |row| {
-                Ok(EnvironmentVariable {
-                    id: row.get(0)?,
-                    environment_id: row.get(1)?,
-                    key: row.get(2)?,
-                    value: row.get(3)?,
-                    enabled: row.get(4)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(variables)
-    }
 
     /// 获取所有环境变量（包括全局和当前环境）
     pub fn get_all_active_variables(&self) -> Result<Vec<EnvironmentVariable>> {

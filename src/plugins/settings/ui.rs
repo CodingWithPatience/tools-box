@@ -60,13 +60,6 @@ impl SettingsUi {
         &self.settings
     }
 
-    /// 从外部更新设置
-    pub fn update_settings(&mut self, settings: AppSettings) {
-        self.sidebar_width_input = format_sidebar_width(settings.sidebar_width);
-        self.settings = settings;
-        self.dirty = false;
-    }
-
     /// 标记为已保存
     pub fn mark_saved(&mut self) {
         self.dirty = false;
