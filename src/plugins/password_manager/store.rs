@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 
 use super::crypto;
 use super::models::{
@@ -156,20 +156,15 @@ impl<'a> PasswordStore<'a> {
 
         // 4. 生成新密钥和配置
         let salt = crypto::generate_salt();
-        let (new_key, verify_hash) =
-            crypto::hash_master_password_with_key(new_password, &salt);
+        let (new_key, verify_hash) = crypto::hash_master_password_with_key(new_password, &salt);
 
         // 5. 用新密钥重新加密所有条目
         for entry in &entries {
-            let plaintext = crypto::decrypt_password(
-                &old_key,
-                &entry.encrypted_password,
-                &entry.iv,
-            )
-            .context(format!("解密条目 '{}' 失败", entry.name))?;
+            let plaintext =
+                crypto::decrypt_password(&old_key, &entry.encrypted_password, &entry.iv)
+                    .context(format!("解密条目 '{}' 失败", entry.name))?;
 
-            let (new_encrypted, new_iv) =
-                crypto::encrypt_password(&new_key, &plaintext)?;
+            let (new_encrypted, new_iv) = crypto::encrypt_password(&new_key, &plaintext)?;
 
             tx.execute(
                 "UPDATE passwords SET password = ?1, iv = ?2 WHERE id = ?3",
@@ -372,14 +367,22 @@ impl<'a> PasswordStore<'a> {
     /// 根据 `format` 参数解析 JSON 或 CSV 格式的数据。
     /// JSON 格式兼容旧版 `website` 字段和新版 `name` 字段。
     /// CSV 格式兼容 Chrome 密码导出文件。
-    pub fn import_entries(&self, content: &str, key: &[u8; 32], format: ExportFormat) -> Result<usize> {
+    pub fn import_entries(
+        &self,
+        content: &str,
+        key: &[u8; 32],
+        format: ExportFormat,
+    ) -> Result<usize> {
         let new_entries = match format {
             ExportFormat::Json => self.parse_json_import(content)?,
             ExportFormat::Csv => self.parse_csv_import(content)?,
         };
 
         // 使用事务保证导入的原子性（RAII，Drop 时自动回滚）
-        let tx = self.conn.unchecked_transaction().context("开启导入事务失败")?;
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .context("开启导入事务失败")?;
 
         let mut imported = 0;
         for entry in &new_entries {
@@ -406,7 +409,11 @@ impl<'a> PasswordStore<'a> {
             anyhow::bail!("不支持的导出数据版本: {}", export_data.version);
         }
 
-        Ok(export_data.entries.iter().map(|e| e.to_new_entry()).collect())
+        Ok(export_data
+            .entries
+            .iter()
+            .map(|e| e.to_new_entry())
+            .collect())
     }
 
     /// 解析 CSV 格式的导入数据
@@ -578,7 +585,9 @@ mod tests {
         assert_eq!(store.count_entries().unwrap(), 0);
 
         // 从 JSON 导入
-        let count = store.import_entries(&json, &key, ExportFormat::Json).unwrap();
+        let count = store
+            .import_entries(&json, &key, ExportFormat::Json)
+            .unwrap();
         assert_eq!(count, 2);
 
         // 验证导入的数据
@@ -774,9 +783,11 @@ GitHub,https://github.com,dev_user,chrome_pass2,
 
         let result = store.change_master_password("same_password", "same_password");
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("新密码不能与旧密码相同"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("新密码不能与旧密码相同")
+        );
     }
 }

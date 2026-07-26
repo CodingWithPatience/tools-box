@@ -1,9 +1,16 @@
 //! 系统托盘管理模块（直接使用 Windows API）
 //!
 //! 通过 Shell_NotifyIconW 创建托盘图标，CreatePopupMenuW / TrackPopupMenu 管理右键菜单。
-//! 消息处理通过 eframe 的 winit 消息泵自动完成（WM_TRAYICON / WM_COMMAND）。
+//! 消息处理通过 eframe 的 winit 消息泵接收 WM_TRAYICON，
+//! 右键菜单通过 TPM_RETURNCMD 在模态循环结束后再分发业务事件。
 
-use std::sync::mpsc;
+use std::ffi::c_void;
+use std::sync::{
+    atomic::{AtomicPtr, Ordering},
+    mpsc,
+};
+#[cfg(test)]
+use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Shell::{
@@ -22,9 +29,15 @@ const MENU_QUIT: usize = 2;
 const MENU_PROP: [u16; 3] = [b'T' as u16, b'M' as u16, 0];
 
 /// 托盘事件类型
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayEvent {
     ToggleVisible,
+    ShowWindow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrayMenuAction {
+    ShowWindow,
     Quit,
 }
 
@@ -34,10 +47,16 @@ static mut GLOBAL_TX: Option<mpsc::Sender<TrayEvent>> = None;
 /// 全局 egui Context（用于在 send_event 中强制请求重绘，唤醒事件循环）
 static mut GLOBAL_EGUI_CTX: Option<egui::Context> = None;
 
+/// 主窗口句柄，用于在窗口隐藏时通过原生消息唤醒 eframe 事件循环。
+static MAIN_WINDOW_HWND: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+
 /// 系统托盘管理器
 pub struct TrayManager {
     hwnd: HWND,
     nid: NOTIFYICONDATAW,
+    icon_registered: bool,
+    #[cfg(test)]
+    registration_error: u32,
     hmenu: HMENU,
     icon: HICON,
     rx: mpsc::Receiver<TrayEvent>,
@@ -107,9 +126,7 @@ impl TrayManager {
 
         // 注册托盘图标
         let icon = create_hicon();
-        let mut nid: NOTIFYICONDATAW = unsafe { std::mem::zeroed() };
-        nid.hWnd = hwnd;
-        nid.uID = 1;
+        let mut nid = notify_icon_data(hwnd);
         nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
         nid.uCallbackMessage = WM_TRAYICON;
         nid.hIcon = icon;
@@ -119,7 +136,15 @@ impl TrayManager {
 
         // SAFETY: nid 结构体字段已正确初始化，Shell_NotifyIconW 会验证参数
         let ok = unsafe { Shell_NotifyIconW(NIM_ADD, &nid) };
-        if ok == 1 {
+        let icon_registered = ok != 0;
+        #[cfg(test)]
+        let registration_error = if icon_registered {
+            0
+        } else {
+            // SAFETY: 紧接失败的 Win32 调用读取当前线程的错误码。
+            unsafe { GetLastError() }
+        };
+        if icon_registered {
             log::info!("系统托盘图标已创建");
         } else {
             log::error!("创建系统托盘图标失败");
@@ -128,6 +153,9 @@ impl TrayManager {
         Self {
             hwnd,
             nid,
+            icon_registered,
+            #[cfg(test)]
+            registration_error,
             hmenu,
             icon,
             rx,
@@ -146,9 +174,13 @@ impl TrayManager {
 
 impl Drop for TrayManager {
     fn drop(&mut self) {
+        MAIN_WINDOW_HWND.store(std::ptr::null_mut(), Ordering::Release);
+
         // SAFETY: 按正确顺序清理资源
         unsafe {
-            Shell_NotifyIconW(NIM_DELETE, &self.nid);
+            if self.icon_registered {
+                Shell_NotifyIconW(NIM_DELETE, &self.nid);
+            }
             DestroyIcon(self.icon);
             DestroyMenu(self.hmenu);
             DestroyWindow(self.hwnd);
@@ -173,32 +205,26 @@ unsafe extern "system" fn tray_wnd_proc(
             match mouse_msg {
                 WM_LBUTTONUP => {
                     log::info!("[托盘] 左键点击 → 切换窗口");
-                    send_event(TrayEvent::ToggleVisible);
+                    // SAFETY: 托盘回调与全局事件发送器均在主线程中使用。
+                    unsafe {
+                        send_event(TrayEvent::ToggleVisible);
+                    }
                 }
                 WM_RBUTTONUP => {
                     log::info!("[托盘] 右键点击 → 显示菜单");
-                    show_menu(hwnd);
+                    // SAFETY: hwnd 是 Windows 传入的有效托盘消息窗口句柄。
+                    unsafe {
+                        show_menu(hwnd);
+                    }
                 }
                 _ => {}
             }
             0
         }
-        WM_COMMAND => {
-            let menu_id = wparam & 0xFFFF;
-            match menu_id as usize {
-                MENU_SHOW => {
-                    log::info!("[托盘菜单] 显示窗口");
-                    send_event(TrayEvent::ToggleVisible);
-                }
-                MENU_QUIT => {
-                    log::info!("[托盘菜单] 退出");
-                    send_event(TrayEvent::Quit);
-                }
-                _ => {}
-            }
-            0
+        _ => {
+            // SAFETY: 未处理消息按 Win32 约定转发给默认窗口过程。
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
-        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
 }
 
@@ -206,21 +232,52 @@ unsafe extern "system" fn tray_wnd_proc(
 ///
 /// SAFETY: GLOBAL_TX 和 GLOBAL_EGUI_CTX 在 App 初始化时设置，在 Drop 中清除。
 unsafe fn send_event(event: TrayEvent) {
-    if let Some(ref tx) = GLOBAL_TX {
-        match tx.send(event) {
-            Ok(()) => {
-                log::debug!("[托盘] 事件发送成功");
-                // 通过 egui Context 强制请求重绘
-                // TrackPopupMenu 的模态循环会干扰 winit，导致 update() 停止调用
-                // request_repaint 通过 EventLoopProxy 唤醒 winit 事件循环
-                if let Some(ref ctx) = GLOBAL_EGUI_CTX {
-                    ctx.request_repaint();
+    // SAFETY: 全局发送器和 egui Context 仅在主线程初始化、读取和清理。
+    unsafe {
+        if let Some(ref tx) = GLOBAL_TX {
+            match tx.send(event) {
+                Ok(()) => {
+                    log::debug!("[托盘] 事件发送成功");
+                    wake_main_window(event);
+
+                    // 原生窗口消息是主要唤醒手段，egui 重绘请求作为可见窗口的补充。
+                    if let Some(ref ctx) = GLOBAL_EGUI_CTX {
+                        ctx.request_repaint();
+                    }
+                }
+                Err(e) => log::error!("[托盘] 事件发送失败: {:?}", e),
+            }
+        } else {
+            log::error!("[托盘] GLOBAL_TX 未初始化！");
+        }
+    }
+}
+
+/// 登记 eframe 主窗口句柄，供托盘回调在主窗口隐藏时唤醒事件循环。
+pub fn set_main_window_handle(hwnd: HWND) {
+    let previous = MAIN_WINDOW_HWND.swap(hwnd, Ordering::AcqRel);
+    if previous != hwnd {
+        log::info!("已登记主窗口句柄，用于托盘事件唤醒");
+    }
+}
+
+/// 使用原生窗口操作唤醒隐藏状态下的主窗口事件循环。
+fn wake_main_window(event: TrayEvent) {
+    let hwnd = MAIN_WINDOW_HWND.load(Ordering::Acquire);
+    if hwnd.is_null() {
+        log::debug!("[托盘] 主窗口句柄尚未登记，使用 egui 重绘请求唤醒");
+        return;
+    }
+
+    match event {
+        TrayEvent::ToggleVisible | TrayEvent::ShowWindow => {
+            // SAFETY: hwnd 由主窗口在隐藏前登记，主窗口生命周期覆盖托盘管理器。
+            unsafe {
+                if IsWindowVisible(hwnd) == 0 {
+                    ShowWindow(hwnd, SW_SHOW);
                 }
             }
-            Err(e) => log::error!("[托盘] 事件发送失败: {:?}", e),
         }
-    } else {
-        log::error!("[托盘] GLOBAL_TX 未初始化！");
     }
 }
 
@@ -237,22 +294,84 @@ pub fn set_egui_ctx(ctx: egui::Context) {
 ///
 /// SAFETY: hwnd 为有效窗口句柄，hmenu 通过窗口属性存储且生命周期与窗口一致。
 unsafe fn show_menu(hwnd: HWND) {
-    let mut point: POINT = std::mem::zeroed();
-    GetCursorPos(&mut point);
-    SetForegroundWindow(hwnd);
-    let hmenu = GetPropW(hwnd, MENU_PROP.as_ptr()) as HMENU;
-    if !hmenu.is_null() {
-        TrackPopupMenu(
-            hmenu,
-            TPM_BOTTOMALIGN | TPM_LEFTALIGN,
-            point.x,
-            point.y,
-            0,
-            hwnd,
-            std::ptr::null(),
-        );
-        PostMessageW(hwnd, WM_NULL, 0, 0);
+    // SAFETY: hwnd 和窗口属性中的菜单句柄由 TrayManager 创建并在调用期间保持有效。
+    unsafe {
+        let mut point: POINT = std::mem::zeroed();
+        GetCursorPos(&mut point);
+        SetForegroundWindow(hwnd);
+        let hmenu = GetPropW(hwnd, MENU_PROP.as_ptr()) as HMENU;
+        if !hmenu.is_null() {
+            let command = TrackPopupMenu(
+                hmenu,
+                TPM_BOTTOMALIGN | TPM_LEFTALIGN | TPM_NONOTIFY | TPM_RETURNCMD,
+                point.x,
+                point.y,
+                0,
+                hwnd,
+                std::ptr::null(),
+            );
+            PostMessageW(hwnd, WM_NULL, 0, 0);
+
+            if let Some(action) = menu_action(command) {
+                match action {
+                    TrayMenuAction::ShowWindow => {
+                        log::info!("[托盘菜单] 显示窗口");
+                        send_event(TrayEvent::ShowWindow);
+                    }
+                    TrayMenuAction::Quit => {
+                        log::info!("[托盘菜单] 直接清理托盘图标并退出程序");
+                        quit_from_tray(hwnd);
+                    }
+                }
+            }
+        }
     }
+}
+
+/// 将右键菜单命令转换为菜单操作。
+fn menu_action(command: i32) -> Option<TrayMenuAction> {
+    match usize::try_from(command).ok()? {
+        MENU_SHOW => Some(TrayMenuAction::ShowWindow),
+        MENU_QUIT => Some(TrayMenuAction::Quit),
+        _ => None,
+    }
+}
+
+/// 创建具有正确大小和标识的托盘图标数据。
+fn notify_icon_data(hwnd: HWND) -> NOTIFYICONDATAW {
+    // SAFETY: NOTIFYICONDATAW 是 Win32 POD 结构体，零初始化后再填充必需字段。
+    let mut nid: NOTIFYICONDATAW = unsafe { std::mem::zeroed() };
+    nid.cbSize = u32::try_from(std::mem::size_of::<NOTIFYICONDATAW>()).unwrap_or(0);
+    nid.hWnd = hwnd;
+    nid.uID = 1;
+    nid
+}
+
+/// 从 Windows 通知区域删除托盘图标。
+///
+/// # Safety
+/// `hwnd` 必须是创建该托盘图标时使用的有效消息窗口句柄。
+unsafe fn remove_tray_icon(hwnd: HWND) -> bool {
+    let nid = notify_icon_data(hwnd);
+
+    // SAFETY: nid 包含托盘图标注册时使用的窗口句柄、ID 和正确的结构体大小。
+    unsafe { Shell_NotifyIconW(NIM_DELETE, &nid) != 0 }
+}
+
+/// 不依赖 eframe 更新循环，直接清理托盘图标并终止进程。
+///
+/// # Safety
+/// `hwnd` 必须是 TrayManager 创建且仍然有效的托盘消息窗口句柄。
+unsafe fn quit_from_tray(hwnd: HWND) -> ! {
+    // SAFETY: 调用方保证 hwnd 是有效的托盘消息窗口句柄。
+    let removed = unsafe { remove_tray_icon(hwnd) };
+    if removed {
+        log::info!("系统托盘图标已在退出前主动删除");
+    } else {
+        log::error!("退出前删除系统托盘图标失败");
+    }
+
+    std::process::exit(0);
 }
 
 /// 创建程序化 HICON（蓝色工具箱图标，16x16）
@@ -330,6 +449,61 @@ fn is_icon_border(x: u32, y: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    static MAIN_WINDOW_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_main_window_tests() -> MutexGuard<'static, ()> {
+        match MAIN_WINDOW_TEST_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    struct TestMainWindow(HWND);
+
+    impl TestMainWindow {
+        fn new() -> Self {
+            let class_name: Vec<u16> = "STATIC\0".encode_utf16().collect();
+            let window_name: Vec<u16> = "Tools Box 托盘唤醒测试\0".encode_utf16().collect();
+
+            // SAFETY: 使用系统内置 STATIC 窗口类，字符串均以空字符结尾且在调用期间有效。
+            let hwnd = unsafe {
+                CreateWindowExW(
+                    0,
+                    class_name.as_ptr(),
+                    window_name.as_ptr(),
+                    WS_OVERLAPPED,
+                    0,
+                    0,
+                    100,
+                    100,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                )
+            };
+            assert!(!hwnd.is_null(), "测试窗口创建失败");
+            Self(hwnd)
+        }
+    }
+
+    impl Drop for TestMainWindow {
+        fn drop(&mut self) {
+            let _ = MAIN_WINDOW_HWND.compare_exchange(
+                self.0,
+                std::ptr::null_mut(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+
+            // SAFETY: 句柄由 CreateWindowExW 创建，且仅在此处销毁一次。
+            unsafe {
+                DestroyWindow(self.0);
+            }
+        }
+    }
 
     #[test]
     fn test_is_icon_corner() {
@@ -359,5 +533,70 @@ mod tests {
         unsafe {
             DestroyIcon(icon);
         }
+    }
+
+    #[test]
+    fn test_menu_action_mapping() {
+        assert_eq!(menu_action(1), Some(TrayMenuAction::ShowWindow));
+        assert_eq!(menu_action(2), Some(TrayMenuAction::Quit));
+        assert_eq!(menu_action(0), None);
+        assert_eq!(menu_action(-1), None);
+    }
+
+    #[test]
+    fn test_show_event_wakes_hidden_main_window() {
+        let _guard = lock_main_window_tests();
+        let window = TestMainWindow::new();
+
+        // SAFETY: 句柄在测试期间有效，并由 TestMainWindow 保持存活。
+        unsafe {
+            ShowWindow(window.0, SW_SHOW);
+        }
+        set_main_window_handle(window.0);
+
+        // SAFETY: 句柄在测试期间有效，并由 TestMainWindow 保持存活。
+        unsafe {
+            ShowWindow(window.0, SW_HIDE);
+            assert_eq!(IsWindowVisible(window.0), 0, "测试窗口应处于隐藏状态");
+        }
+
+        wake_main_window(TrayEvent::ShowWindow);
+
+        // SAFETY: 句柄在测试期间有效，并由 TestMainWindow 保持存活。
+        unsafe {
+            assert_ne!(IsWindowVisible(window.0), 0, "托盘事件应原生唤醒隐藏窗口");
+        }
+    }
+
+    #[test]
+    fn test_notify_icon_data_contains_required_fields() {
+        let _guard = lock_main_window_tests();
+        let window = TestMainWindow::new();
+        let nid = notify_icon_data(window.0);
+
+        assert_eq!(
+            nid.cbSize,
+            u32::try_from(std::mem::size_of::<NOTIFYICONDATAW>()).unwrap_or(0),
+            "托盘数据必须设置正确的结构体大小"
+        );
+        assert_eq!(nid.hWnd, window.0);
+        assert_eq!(nid.uID, 1);
+    }
+
+    #[test]
+    #[ignore = "需要可访问 Explorer 通知区域的交互式 Windows 会话"]
+    fn test_registered_tray_icon_can_be_removed_immediately() {
+        let _guard = lock_main_window_tests();
+        let manager = TrayManager::new();
+        assert!(!manager.hwnd.is_null(), "托盘消息窗口创建失败");
+        assert!(
+            manager.icon_registered,
+            "NIM_ADD 未能注册托盘图标，无法验证删除行为，GetLastError={}",
+            manager.registration_error
+        );
+
+        // SAFETY: manager.hwnd 是注册托盘图标时使用且仍然有效的消息窗口句柄。
+        let removed = unsafe { remove_tray_icon(manager.hwnd) };
+        assert!(removed, "NIM_DELETE 应立即成功删除已注册的托盘图标");
     }
 }

@@ -5,8 +5,8 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use egui::{Color32, RichText, text::LayoutJob};
 
 use super::differ;
-use crate::utils::highlight::SyntaxHighlighter;
 use super::models::{DiffResult, DiffType, SplitLine, TextSegment, ViewMode};
+use crate::utils::highlight::SyntaxHighlighter;
 
 const SUPPORTED_LANGUAGES: &[(&str, &str)] = &[
     ("自动检测", ""),
@@ -170,8 +170,14 @@ impl DiffViewerUi {
                             let mut left_layouter =
                                 |ui: &egui::Ui, string: &str, _wrap_width: f32| {
                                     Self::highlight_text_with_cache(
-                                        highlighter, cache, string, &syntax_name,
-                                        is_dark_mode, font_size, f32::INFINITY, ui,
+                                        highlighter,
+                                        cache,
+                                        string,
+                                        &syntax_name,
+                                        is_dark_mode,
+                                        font_size,
+                                        f32::INFINITY,
+                                        ui,
                                     )
                                 };
                             egui::TextEdit::multiline(&mut self.left_text)
@@ -187,9 +193,16 @@ impl DiffViewerUi {
                         .map(|s| s.offset.y)
                         .unwrap_or(0.0);
                     Self::render_gutter(
-                        ui, gutter_origin, gutter_width, available_height,
-                        line_count, line_num_digits, line_height, offset_y,
-                        font_size, text_edit_margin_top,
+                        ui,
+                        gutter_origin,
+                        gutter_width,
+                        available_height,
+                        line_count,
+                        line_num_digits,
+                        line_height,
+                        offset_y,
+                        font_size,
+                        text_edit_margin_top,
                     );
                 });
             });
@@ -223,8 +236,14 @@ impl DiffViewerUi {
                             let mut right_layouter =
                                 |ui: &egui::Ui, string: &str, _wrap_width: f32| {
                                     Self::highlight_text_with_cache(
-                                        highlighter, cache, string, &syntax_name,
-                                        is_dark_mode, font_size, f32::INFINITY, ui,
+                                        highlighter,
+                                        cache,
+                                        string,
+                                        &syntax_name,
+                                        is_dark_mode,
+                                        font_size,
+                                        f32::INFINITY,
+                                        ui,
                                     )
                                 };
                             egui::TextEdit::multiline(&mut self.right_text)
@@ -240,9 +259,16 @@ impl DiffViewerUi {
                         .map(|s| s.offset.y)
                         .unwrap_or(0.0);
                     Self::render_gutter(
-                        ui, gutter_origin, gutter_width, available_height,
-                        line_count, line_num_digits, line_height, offset_y,
-                        font_size, text_edit_margin_top,
+                        ui,
+                        gutter_origin,
+                        gutter_width,
+                        available_height,
+                        line_count,
+                        line_num_digits,
+                        line_height,
+                        offset_y,
+                        font_size,
+                        text_edit_margin_top,
                     );
                 });
             });
@@ -356,8 +382,18 @@ impl DiffViewerUi {
             let text_color = ui.visuals().text_color();
 
             // 行号位数
-            let max_left_num = result.split_lines.iter().filter_map(|l| l.left_line_number).max().unwrap_or(1);
-            let max_right_num = result.split_lines.iter().filter_map(|l| l.right_line_number).max().unwrap_or(1);
+            let max_left_num = result
+                .split_lines
+                .iter()
+                .filter_map(|l| l.left_line_number)
+                .max()
+                .unwrap_or(1);
+            let max_right_num = result
+                .split_lines
+                .iter()
+                .filter_map(|l| l.right_line_number)
+                .max()
+                .unwrap_or(1);
             let num_digits = format!("{}", max_left_num.max(max_right_num)).len().max(3);
             let gutter_w = ((num_digits + 3) as f32 * font_size * 0.6).max(40.0);
 
@@ -408,17 +444,26 @@ impl DiffViewerUi {
                                     let mut gutter_scroll = egui::ScrollArea::vertical()
                                         .id_salt("split_left_gutter")
                                         .auto_shrink([false, false])
-                                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden);
-                                    gutter_scroll = gutter_scroll.vertical_scroll_offset(gutter_offset_y);
+                                        .scroll_bar_visibility(
+                                            egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                                        );
+                                    gutter_scroll =
+                                        gutter_scroll.vertical_scroll_offset(gutter_offset_y);
                                     gutter_scroll.show(ui, |ui| {
                                         ui.spacing_mut().item_spacing.y = 0.0;
                                         for line in &result.split_lines {
                                             let gutter_bg = match line.left_type {
-                                                DiffType::Removed => if is_dark_mode {
-                                                    Color32::from_rgba_unmultiplied(80, 40, 45, 200)
-                                                } else {
-                                                    Color32::from_rgba_unmultiplied(255, 180, 185, 240)
-                                                },
+                                                DiffType::Removed => {
+                                                    if is_dark_mode {
+                                                        Color32::from_rgba_unmultiplied(
+                                                            80, 40, 45, 200,
+                                                        )
+                                                    } else {
+                                                        Color32::from_rgba_unmultiplied(
+                                                            255, 180, 185, 240,
+                                                        )
+                                                    }
+                                                }
                                                 _ => Color32::TRANSPARENT,
                                             };
                                             let symbol = match line.left_type {
@@ -431,18 +476,24 @@ impl DiffViewerUi {
                                                 |ui| {
                                                     if gutter_bg != Color32::TRANSPARENT {
                                                         let rect = ui.max_rect();
-                                                        ui.painter().rect_filled(rect, 0.0, gutter_bg);
+                                                        ui.painter()
+                                                            .rect_filled(rect, 0.0, gutter_bg);
                                                     }
                                                     let num_text = match line.left_line_number {
-                                                        Some(n) => format!("{:>w$}", n, w = num_digits),
+                                                        Some(n) => {
+                                                            format!("{:>w$}", n, w = num_digits)
+                                                        }
                                                         None => " ".repeat(num_digits),
                                                     };
                                                     ui.add_sized(
                                                         [gutter_w, row_height],
                                                         egui::Label::new(
-                                                            RichText::new(format!("{} {} ", num_text, symbol))
-                                                                .monospace()
-                                                                .color(dim_color),
+                                                            RichText::new(format!(
+                                                                "{} {} ",
+                                                                num_text, symbol
+                                                            ))
+                                                            .monospace()
+                                                            .color(dim_color),
                                                         ),
                                                     );
                                                 },
@@ -463,23 +514,33 @@ impl DiffViewerUi {
                                         .auto_shrink([false, false]);
                                     // 应用上一帧右面板的同步偏移量（纵向）
                                     if let Some(offset_y) = sync_left {
-                                        content_scroll = content_scroll.vertical_scroll_offset(offset_y);
+                                        content_scroll =
+                                            content_scroll.vertical_scroll_offset(offset_y);
                                         left_sync_applied.set(true);
                                     }
                                     // 应用上一帧右面板的同步偏移量（横向）
                                     if let Some(offset_x) = sync_left_x {
-                                        content_scroll = content_scroll.horizontal_scroll_offset(offset_x);
+                                        content_scroll =
+                                            content_scroll.horizontal_scroll_offset(offset_x);
                                         left_sync_applied_x.set(true);
                                     }
                                     let output = content_scroll.show(ui, |ui| {
                                         ui.spacing_mut().item_spacing.y = 0.0;
-                                        for (line_index, line) in result.split_lines.iter().enumerate() {
+                                        for (line_index, line) in
+                                            result.split_lines.iter().enumerate()
+                                        {
                                             let line_bg = match line.left_type {
-                                                DiffType::Removed => if is_dark_mode {
-                                                    Color32::from_rgba_unmultiplied(61, 31, 35, 180)
-                                                } else {
-                                                    Color32::from_rgba_unmultiplied(255, 210, 215, 230)
-                                                },
+                                                DiffType::Removed => {
+                                                    if is_dark_mode {
+                                                        Color32::from_rgba_unmultiplied(
+                                                            61, 31, 35, 180,
+                                                        )
+                                                    } else {
+                                                        Color32::from_rgba_unmultiplied(
+                                                            255, 210, 215, 230,
+                                                        )
+                                                    }
+                                                }
                                                 _ => Color32::TRANSPARENT,
                                             };
                                             ui.allocate_ui_with_layout(
@@ -489,11 +550,19 @@ impl DiffViewerUi {
                                                     if line_bg != Color32::TRANSPARENT {
                                                         let mut rect = ui.max_rect();
                                                         rect.set_width(rect.width().max(2000.0));
-                                                        ui.painter().rect_filled(rect, 0.0, line_bg);
+                                                        ui.painter()
+                                                            .rect_filled(rect, 0.0, line_bg);
                                                     }
                                                     self.render_cell(
-                                                        ui, line, true, row_height, font_size,
-                                                        &syntax_name, is_dark_mode, text_color, line_index,
+                                                        ui,
+                                                        line,
+                                                        true,
+                                                        row_height,
+                                                        font_size,
+                                                        &syntax_name,
+                                                        is_dark_mode,
+                                                        text_color,
+                                                        line_index,
                                                     );
                                                 },
                                             );
@@ -501,16 +570,21 @@ impl DiffViewerUi {
                                     });
                                     left_current_offset.set(output.state.offset.y);
                                     left_current_offset_x.set(output.state.offset.x);
-                                    left_scrollable.set(output.content_size.y > output.inner_rect.height());
+                                    left_scrollable
+                                        .set(output.content_size.y > output.inner_rect.height());
                                     // 检测纵向滚动变化
                                     let left_changed = !left_sync_applied.get()
-                                        && (output.state.offset.y - self.last_left_offset.get()).abs() > 0.5;
+                                        && (output.state.offset.y - self.last_left_offset.get())
+                                            .abs()
+                                            > 0.5;
                                     if left_changed {
                                         self.pending_sync_right.set(Some(output.state.offset.y));
                                     }
                                     // 检测横向滚动变化
                                     let left_changed_x = !left_sync_applied_x.get()
-                                        && (output.state.offset.x - self.last_left_offset_x.get()).abs() > 0.5;
+                                        && (output.state.offset.x - self.last_left_offset_x.get())
+                                            .abs()
+                                            > 0.5;
                                     if left_changed_x {
                                         self.pending_sync_right_x.set(Some(output.state.offset.x));
                                     }
@@ -541,17 +615,26 @@ impl DiffViewerUi {
                                     let mut gutter_scroll = egui::ScrollArea::vertical()
                                         .id_salt("split_right_gutter")
                                         .auto_shrink([false, false])
-                                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden);
-                                    gutter_scroll = gutter_scroll.vertical_scroll_offset(gutter_offset_y);
+                                        .scroll_bar_visibility(
+                                            egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                                        );
+                                    gutter_scroll =
+                                        gutter_scroll.vertical_scroll_offset(gutter_offset_y);
                                     gutter_scroll.show(ui, |ui| {
                                         ui.spacing_mut().item_spacing.y = 0.0;
                                         for line in &result.split_lines {
                                             let gutter_bg = match line.right_type {
-                                                DiffType::Added => if is_dark_mode {
-                                                    Color32::from_rgba_unmultiplied(40, 80, 50, 200)
-                                                } else {
-                                                    Color32::from_rgba_unmultiplied(150, 230, 170, 240)
-                                                },
+                                                DiffType::Added => {
+                                                    if is_dark_mode {
+                                                        Color32::from_rgba_unmultiplied(
+                                                            40, 80, 50, 200,
+                                                        )
+                                                    } else {
+                                                        Color32::from_rgba_unmultiplied(
+                                                            150, 230, 170, 240,
+                                                        )
+                                                    }
+                                                }
                                                 _ => Color32::TRANSPARENT,
                                             };
                                             let symbol = match line.right_type {
@@ -564,18 +647,24 @@ impl DiffViewerUi {
                                                 |ui| {
                                                     if gutter_bg != Color32::TRANSPARENT {
                                                         let rect = ui.max_rect();
-                                                        ui.painter().rect_filled(rect, 0.0, gutter_bg);
+                                                        ui.painter()
+                                                            .rect_filled(rect, 0.0, gutter_bg);
                                                     }
                                                     let num_text = match line.right_line_number {
-                                                        Some(n) => format!("{:>w$}", n, w = num_digits),
+                                                        Some(n) => {
+                                                            format!("{:>w$}", n, w = num_digits)
+                                                        }
                                                         None => " ".repeat(num_digits),
                                                     };
                                                     ui.add_sized(
                                                         [gutter_w, row_height],
                                                         egui::Label::new(
-                                                            RichText::new(format!("{} {} ", num_text, symbol))
-                                                                .monospace()
-                                                                .color(dim_color),
+                                                            RichText::new(format!(
+                                                                "{} {} ",
+                                                                num_text, symbol
+                                                            ))
+                                                            .monospace()
+                                                            .color(dim_color),
                                                         ),
                                                     );
                                                 },
@@ -596,21 +685,31 @@ impl DiffViewerUi {
                                         .auto_shrink([false, false]);
                                     // 应用上一帧左面板的同步偏移量（纵向）
                                     if let Some(offset_y) = sync_right {
-                                        content_scroll = content_scroll.vertical_scroll_offset(offset_y);
+                                        content_scroll =
+                                            content_scroll.vertical_scroll_offset(offset_y);
                                     }
                                     // 应用上一帧左面板的同步偏移量（横向）
                                     if let Some(offset_x) = sync_right_x {
-                                        content_scroll = content_scroll.horizontal_scroll_offset(offset_x);
+                                        content_scroll =
+                                            content_scroll.horizontal_scroll_offset(offset_x);
                                     }
                                     let output = content_scroll.show(ui, |ui| {
                                         ui.spacing_mut().item_spacing.y = 0.0;
-                                        for (line_index, line) in result.split_lines.iter().enumerate() {
+                                        for (line_index, line) in
+                                            result.split_lines.iter().enumerate()
+                                        {
                                             let line_bg = match line.right_type {
-                                                DiffType::Added => if is_dark_mode {
-                                                    Color32::from_rgba_unmultiplied(31, 61, 38, 180)
-                                                } else {
-                                                    Color32::from_rgba_unmultiplied(180, 240, 195, 230)
-                                                },
+                                                DiffType::Added => {
+                                                    if is_dark_mode {
+                                                        Color32::from_rgba_unmultiplied(
+                                                            31, 61, 38, 180,
+                                                        )
+                                                    } else {
+                                                        Color32::from_rgba_unmultiplied(
+                                                            180, 240, 195, 230,
+                                                        )
+                                                    }
+                                                }
                                                 _ => Color32::TRANSPARENT,
                                             };
                                             ui.allocate_ui_with_layout(
@@ -620,11 +719,19 @@ impl DiffViewerUi {
                                                     if line_bg != Color32::TRANSPARENT {
                                                         let mut rect = ui.max_rect();
                                                         rect.set_width(rect.width().max(2000.0));
-                                                        ui.painter().rect_filled(rect, 0.0, line_bg);
+                                                        ui.painter()
+                                                            .rect_filled(rect, 0.0, line_bg);
                                                     }
                                                     self.render_cell(
-                                                        ui, line, false, row_height, font_size,
-                                                        &syntax_name, is_dark_mode, text_color, line_index,
+                                                        ui,
+                                                        line,
+                                                        false,
+                                                        row_height,
+                                                        font_size,
+                                                        &syntax_name,
+                                                        is_dark_mode,
+                                                        text_color,
+                                                        line_index,
                                                     );
                                                 },
                                             );
@@ -632,16 +739,21 @@ impl DiffViewerUi {
                                     });
                                     right_current_offset.set(output.state.offset.y);
                                     right_current_offset_x.set(output.state.offset.x);
-                                    right_scrollable.set(output.content_size.y > output.inner_rect.height());
+                                    right_scrollable
+                                        .set(output.content_size.y > output.inner_rect.height());
                                     // 检测纵向滚动变化
                                     let right_changed = sync_right.is_none()
-                                        && (output.state.offset.y - self.last_right_offset.get()).abs() > 0.5;
+                                        && (output.state.offset.y - self.last_right_offset.get())
+                                            .abs()
+                                            > 0.5;
                                     if right_changed {
                                         self.pending_sync_left.set(Some(output.state.offset.y));
                                     }
                                     // 检测横向滚动变化
                                     let right_changed_x = sync_right_x.is_none()
-                                        && (output.state.offset.x - self.last_right_offset_x.get()).abs() > 0.5;
+                                        && (output.state.offset.x - self.last_right_offset_x.get())
+                                            .abs()
+                                            > 0.5;
                                     if right_changed_x {
                                         self.pending_sync_left_x.set(Some(output.state.offset.x));
                                     }
@@ -701,8 +813,8 @@ impl DiffViewerUi {
         };
 
         // 判断是否是整行删除/新增（只有一侧有内容，另一侧为空）
-        let is_whole_line_change = (is_left && line.right_content.is_none())
-            || (!is_left && line.left_content.is_none());
+        let is_whole_line_change =
+            (is_left && line.right_content.is_none()) || (!is_left && line.left_content.is_none());
 
         if let Some(text) = content {
             if *diff_type == DiffType::Equal && syntax_name.is_some() {
@@ -743,7 +855,8 @@ impl DiffViewerUi {
                     let mut job = LayoutJob::default();
                     job.wrap.max_width = f32::INFINITY;
                     job.append(
-                        text.as_str(), 0.0,
+                        text.as_str(),
+                        0.0,
                         egui::TextFormat {
                             font_id: egui::FontId::monospace(font_size),
                             color: text_color,
@@ -805,9 +918,9 @@ impl DiffViewerUi {
         removed_bg: Color32,
     ) {
         if syntax_name.is_some() {
-            let highlighted = self.highlighter.highlight_line(
-                full_text, syntax_name, font_size, is_dark_mode,
-            );
+            let highlighted =
+                self.highlighter
+                    .highlight_line(full_text, syntax_name, font_size, is_dark_mode);
 
             let mut char_colors: Vec<Color32> = Vec::new();
             for (color, text) in &highlighted {
@@ -838,7 +951,8 @@ impl DiffViewerUi {
                     if Some(color) != current_color {
                         if !seg_text.is_empty() {
                             job.append(
-                                &seg_text, 0.0,
+                                &seg_text,
+                                0.0,
                                 egui::TextFormat {
                                     font_id: egui::FontId::monospace(font_size),
                                     color: current_color.unwrap_or(text_color),
@@ -855,7 +969,8 @@ impl DiffViewerUi {
 
                 if !seg_text.is_empty() {
                     job.append(
-                        &seg_text, 0.0,
+                        &seg_text,
+                        0.0,
                         egui::TextFormat {
                             font_id: egui::FontId::monospace(font_size),
                             color: current_color.unwrap_or(text_color),
@@ -880,7 +995,8 @@ impl DiffViewerUi {
                     DiffType::Equal => Color32::TRANSPARENT,
                 };
                 job.append(
-                    &segment.text, 0.0,
+                    &segment.text,
+                    0.0,
                     egui::TextFormat {
                         font_id: egui::FontId::monospace(font_size),
                         color,
@@ -949,8 +1065,18 @@ impl DiffViewerUi {
             let row_height = ui.fonts(|f| f.row_height(&font_id)) + 4.0;
             let syntax_name = self.get_syntax_name();
 
-            let max_left_num = result.unified_lines.iter().filter_map(|l| l.line_number_left).max().unwrap_or(1);
-            let max_right_num = result.unified_lines.iter().filter_map(|l| l.line_number_right).max().unwrap_or(1);
+            let max_left_num = result
+                .unified_lines
+                .iter()
+                .filter_map(|l| l.line_number_left)
+                .max()
+                .unwrap_or(1);
+            let max_right_num = result
+                .unified_lines
+                .iter()
+                .filter_map(|l| l.line_number_right)
+                .max()
+                .unwrap_or(1);
             let num_digits = format!("{}", max_left_num.max(max_right_num)).len().max(3);
             // 双行号 + 分隔符的宽度
             let gutter_w = ((num_digits * 2 + 4) as f32 * font_size * 0.6).max(80.0);
@@ -972,9 +1098,12 @@ impl DiffViewerUi {
                         let mut gutter_scroll = egui::ScrollArea::vertical()
                             .id_salt("unified_gutter")
                             .auto_shrink([false, false])
-                            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden);
+                            .scroll_bar_visibility(
+                                egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                            );
                         // 使用内容区域的偏移量同步行号
-                        gutter_scroll = gutter_scroll.vertical_scroll_offset(content_offset_y.get());
+                        gutter_scroll =
+                            gutter_scroll.vertical_scroll_offset(content_offset_y.get());
                         gutter_scroll.show(ui, |ui| {
                             ui.spacing_mut().item_spacing.y = 0.0;
                             for line in &result.unified_lines {
@@ -1016,9 +1145,12 @@ impl DiffViewerUi {
                                         ui.add_sized(
                                             [gutter_w, row_height],
                                             egui::Label::new(
-                                                RichText::new(format!("{} {} {} ", left_num, right_num, symbol))
-                                                    .monospace()
-                                                    .color(dim_color),
+                                                RichText::new(format!(
+                                                    "{} {} {} ",
+                                                    left_num, right_num, symbol
+                                                ))
+                                                .monospace()
+                                                .color(dim_color),
                                             ),
                                         );
                                     },
@@ -1028,104 +1160,122 @@ impl DiffViewerUi {
                     },
                 );
 
-            // 内容区域（可横向和纵向滚动）
-            ui.allocate_ui_with_layout(
-                egui::vec2(content_width, available_height),
-                egui::Layout::top_down(egui::Align::LEFT),
-                |ui| {
-                    let output = egui::ScrollArea::both()
-                        .auto_shrink([false, false])
-                        .id_salt("unified_content")
-                        .show(ui, |ui| {
-                            ui.spacing_mut().item_spacing.y = 0.0;
+                // 内容区域（可横向和纵向滚动）
+                ui.allocate_ui_with_layout(
+                    egui::vec2(content_width, available_height),
+                    egui::Layout::top_down(egui::Align::LEFT),
+                    |ui| {
+                        let output = egui::ScrollArea::both()
+                            .auto_shrink([false, false])
+                            .id_salt("unified_content")
+                            .show(ui, |ui| {
+                                ui.spacing_mut().item_spacing.y = 0.0;
 
-                            for line in &result.unified_lines {
-                                let line_bg = match line.diff_type {
-                                    DiffType::Removed => if is_dark_mode {
-                                        Color32::from_rgba_unmultiplied(61, 31, 35, 180)
-                                    } else {
-                                        Color32::from_rgba_unmultiplied(255, 210, 215, 230)
-                                    },
-                                    DiffType::Added => if is_dark_mode {
-                                        Color32::from_rgba_unmultiplied(31, 61, 38, 180)
-                                    } else {
-                                        Color32::from_rgba_unmultiplied(180, 240, 195, 230)
-                                    },
-                                    DiffType::Equal => Color32::TRANSPARENT,
-                                };
-
-                                let is_whole_line_change = line.segments.is_empty()
-                                    || (line.diff_type != DiffType::Equal
-                                        && line.segments.iter().all(|s| s.diff_type != DiffType::Equal));
-
-                                ui.allocate_ui_with_layout(
-                                    egui::vec2(content_width, row_height),
-                                    egui::Layout::left_to_right(egui::Align::Center),
-                                    |ui| {
-                                        if line_bg != Color32::TRANSPARENT {
-                                            let mut bg_rect = ui.max_rect();
-                                            bg_rect.set_width(bg_rect.width().max(2000.0));
-                                            ui.painter().rect_filled(bg_rect, 0.0, line_bg);
+                                for line in &result.unified_lines {
+                                    let line_bg = match line.diff_type {
+                                        DiffType::Removed => {
+                                            if is_dark_mode {
+                                                Color32::from_rgba_unmultiplied(61, 31, 35, 180)
+                                            } else {
+                                                Color32::from_rgba_unmultiplied(255, 210, 215, 230)
+                                            }
                                         }
-
-                                    if line.diff_type == DiffType::Equal && syntax_name.is_some() {
-                                        let mut job = self.get_line_highlight_job(
-                                            &line.content,
-                                            syntax_name.as_deref(),
-                                            font_size,
-                                            is_dark_mode,
-                                        );
-                                        job.wrap.max_width = f32::INFINITY;
-                                        ui.label(job);
-                                    } else if !is_whole_line_change && !line.segments.is_empty() {
-                                        // 修改行：使用缓存的 LayoutJob
-                                        let job = self.get_diff_line_job(
-                                            &line.content,
-                                            &line.segments,
-                                            syntax_name.as_deref(),
-                                            font_size,
-                                            is_dark_mode,
-                                            text_color,
-                                        );
-                                        ui.label(job);
-                                    } else {
-                                        if syntax_name.is_some() {
-                                            let mut job = self.get_line_highlight_job(
-                                                &line.content,
-                                                syntax_name.as_deref(),
-                                                font_size,
-                                                is_dark_mode,
-                                            );
-                                            job.wrap.max_width = f32::INFINITY;
-                                            ui.label(job);
-                                        } else {
-                                            let color = match line.diff_type {
-                                                DiffType::Added => Color32::from_rgb(0, 150, 0),
-                                                DiffType::Removed => Color32::from_rgb(180, 0, 0),
-                                                _ => text_color,
-                                            };
-                                            let mut job = LayoutJob::default();
-                                            job.wrap.max_width = f32::INFINITY;
-                                            job.append(
-                                                &line.content, 0.0,
-                                                egui::TextFormat {
-                                                    font_id: egui::FontId::monospace(font_size),
-                                                    color,
-                                                    ..Default::default()
-                                                },
-                                            );
-                                            ui.label(job);
+                                        DiffType::Added => {
+                                            if is_dark_mode {
+                                                Color32::from_rgba_unmultiplied(31, 61, 38, 180)
+                                            } else {
+                                                Color32::from_rgba_unmultiplied(180, 240, 195, 230)
+                                            }
                                         }
-                                    }
-                                },
-                            );
-                        }
-                    });
-                    // 更新 Unified 视图的纵向偏移量，用于下一帧同步行号
-                    self.last_unified_offset.set(output.state.offset.y);
-                },
-            );
-        });
+                                        DiffType::Equal => Color32::TRANSPARENT,
+                                    };
+
+                                    let is_whole_line_change = line.segments.is_empty()
+                                        || (line.diff_type != DiffType::Equal
+                                            && line
+                                                .segments
+                                                .iter()
+                                                .all(|s| s.diff_type != DiffType::Equal));
+
+                                    ui.allocate_ui_with_layout(
+                                        egui::vec2(content_width, row_height),
+                                        egui::Layout::left_to_right(egui::Align::Center),
+                                        |ui| {
+                                            if line_bg != Color32::TRANSPARENT {
+                                                let mut bg_rect = ui.max_rect();
+                                                bg_rect.set_width(bg_rect.width().max(2000.0));
+                                                ui.painter().rect_filled(bg_rect, 0.0, line_bg);
+                                            }
+
+                                            if line.diff_type == DiffType::Equal
+                                                && syntax_name.is_some()
+                                            {
+                                                let mut job = self.get_line_highlight_job(
+                                                    &line.content,
+                                                    syntax_name.as_deref(),
+                                                    font_size,
+                                                    is_dark_mode,
+                                                );
+                                                job.wrap.max_width = f32::INFINITY;
+                                                ui.label(job);
+                                            } else if !is_whole_line_change
+                                                && !line.segments.is_empty()
+                                            {
+                                                // 修改行：使用缓存的 LayoutJob
+                                                let job = self.get_diff_line_job(
+                                                    &line.content,
+                                                    &line.segments,
+                                                    syntax_name.as_deref(),
+                                                    font_size,
+                                                    is_dark_mode,
+                                                    text_color,
+                                                );
+                                                ui.label(job);
+                                            } else {
+                                                if syntax_name.is_some() {
+                                                    let mut job = self.get_line_highlight_job(
+                                                        &line.content,
+                                                        syntax_name.as_deref(),
+                                                        font_size,
+                                                        is_dark_mode,
+                                                    );
+                                                    job.wrap.max_width = f32::INFINITY;
+                                                    ui.label(job);
+                                                } else {
+                                                    let color = match line.diff_type {
+                                                        DiffType::Added => {
+                                                            Color32::from_rgb(0, 150, 0)
+                                                        }
+                                                        DiffType::Removed => {
+                                                            Color32::from_rgb(180, 0, 0)
+                                                        }
+                                                        _ => text_color,
+                                                    };
+                                                    let mut job = LayoutJob::default();
+                                                    job.wrap.max_width = f32::INFINITY;
+                                                    job.append(
+                                                        &line.content,
+                                                        0.0,
+                                                        egui::TextFormat {
+                                                            font_id: egui::FontId::monospace(
+                                                                font_size,
+                                                            ),
+                                                            color,
+                                                            ..Default::default()
+                                                        },
+                                                    );
+                                                    ui.label(job);
+                                                }
+                                            }
+                                        },
+                                    );
+                                }
+                            });
+                        // 更新 Unified 视图的纵向偏移量，用于下一帧同步行号
+                        self.last_unified_offset.set(output.state.offset.y);
+                    },
+                );
+            });
         });
     }
 
@@ -1150,7 +1300,9 @@ impl DiffViewerUi {
         let painter = ui.painter().with_clip_rect(gutter_rect);
         let text_color = Color32::from_rgb(128, 128, 128);
         let font_id = egui::FontId::monospace(font_size);
-        let first_visible = ((scroll_offset_y - margin_top) / line_height).floor().max(0.0) as usize;
+        let first_visible = ((scroll_offset_y - margin_top) / line_height)
+            .floor()
+            .max(0.0) as usize;
         let visible_count = ((height - margin_top) / line_height).ceil().max(0.0) as usize + 1;
         let last_visible = (first_visible + visible_count).min(line_count);
         let frac_offset = scroll_offset_y - first_visible as f32 * line_height;
@@ -1251,10 +1403,14 @@ impl DiffViewerUi {
             match std::fs::read_to_string(&path) {
                 Ok(content) => {
                     self.right_text = content;
-                    self.right_file_name = path.file_name().map(|n| n.to_string_lossy().to_string());
+                    self.right_file_name =
+                        path.file_name().map(|n| n.to_string_lossy().to_string());
                     self.error = None;
                     if let Some(ext) = path.extension() {
-                        if let Some(name) = self.highlighter.get_syntax_name_for_extension(&ext.to_string_lossy()) {
+                        if let Some(name) = self
+                            .highlighter
+                            .get_syntax_name_for_extension(&ext.to_string_lossy())
+                        {
                             self.selected_language = name;
                         }
                     }
@@ -1317,8 +1473,12 @@ impl DiffViewerUi {
                 return ui.fonts(|f| f.layout_job(job));
             }
         }
-        let mut job =
-            highlighter.highlight_to_layout_job(text, syntax_name.as_deref(), font_size, is_dark_mode);
+        let mut job = highlighter.highlight_to_layout_job(
+            text,
+            syntax_name.as_deref(),
+            font_size,
+            is_dark_mode,
+        );
         job.wrap.max_width = wrap_width;
         let galley = ui.fonts(|f| f.layout_job(job.clone()));
         *cache_ref = Some((hash, job));
@@ -1335,14 +1495,21 @@ impl DiffViewerUi {
         font_size: f32,
         is_dark_mode: bool,
     ) -> LayoutJob {
-        let hash = Self::compute_highlight_hash(text, &syntax_name.map(|s| s.to_string()), is_dark_mode, font_size);
+        let hash = Self::compute_highlight_hash(
+            text,
+            &syntax_name.map(|s| s.to_string()),
+            is_dark_mode,
+            font_size,
+        );
         let mut cache = self.unified_line_cache.borrow_mut();
 
         if let Some(job) = cache.get(&hash) {
             return job.clone();
         }
 
-        let job = self.highlighter.highlight_to_layout_job(text, syntax_name, font_size, is_dark_mode);
+        let job =
+            self.highlighter
+                .highlight_to_layout_job(text, syntax_name, font_size, is_dark_mode);
         cache.insert(hash, job.clone());
         job
     }

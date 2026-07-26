@@ -30,8 +30,7 @@ pub struct EncryptedPasswordEntry {
 impl EncryptedPasswordEntry {
     /// 解密密码字段
     pub fn decrypt_password(&self, key: &[u8; 32]) -> String {
-        super::crypto::decrypt_password(key, &self.encrypted_password, &self.iv)
-            .unwrap_or_default()
+        super::crypto::decrypt_password(key, &self.encrypted_password, &self.iv).unwrap_or_default()
     }
 
     /// 转换为 PasswordEntry（解密）

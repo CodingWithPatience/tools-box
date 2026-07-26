@@ -140,7 +140,9 @@ impl SessionForm {
             },
             password: String::new(),
             private_key_path: match &session.auth_method {
-                AuthMethod::KeyFile { private_key_path, .. } => private_key_path.clone(),
+                AuthMethod::KeyFile {
+                    private_key_path, ..
+                } => private_key_path.clone(),
                 _ => String::new(),
             },
             passphrase: String::new(),

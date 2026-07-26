@@ -334,9 +334,7 @@ impl<'a> NoteStore<'a> {
     pub fn count_notes(&self) -> Result<usize> {
         let count: usize = self
             .conn
-            .query_row("SELECT COUNT(*) FROM note_entries", [], |row| {
-                row.get(0)
-            })?;
+            .query_row("SELECT COUNT(*) FROM note_entries", [], |row| row.get(0))?;
         Ok(count)
     }
 

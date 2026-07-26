@@ -124,10 +124,14 @@ impl MockServer {
         self.add_route(
             "POST",
             "/api/users",
-            MockResponse::new(201, serde_json::json!({
-                "id": 4,
-                "message": "用户创建成功"
-            }).to_string()),
+            MockResponse::new(
+                201,
+                serde_json::json!({
+                    "id": 4,
+                    "message": "用户创建成功"
+                })
+                .to_string(),
+            ),
         );
 
         // 更新用户接口
@@ -161,11 +165,7 @@ impl MockServer {
         );
 
         // 404 测试接口
-        self.add_route(
-            "GET",
-            "/api/404",
-            MockResponse::error(404, "资源不存在"),
-        );
+        self.add_route("GET", "/api/404", MockResponse::error(404, "资源不存在"));
 
         // 500 测试接口
         self.add_route(
@@ -274,9 +274,9 @@ impl MockServer {
 
                             // 查找匹配的路由
                             let routes = routes.lock().unwrap();
-                            let matched = routes.iter().find(|r| {
-                                r.method.eq_ignore_ascii_case(method) && r.path == path
-                            });
+                            let matched = routes
+                                .iter()
+                                .find(|r| r.method.eq_ignore_ascii_case(method) && r.path == path);
 
                             let response = if let Some(route) = matched {
                                 format!(

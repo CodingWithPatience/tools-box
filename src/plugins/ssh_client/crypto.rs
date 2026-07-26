@@ -50,8 +50,7 @@ mod tests {
     fn test_encrypt_decrypt_password() {
         let plaintext = "my_secret_password123";
         let (ciphertext, iv, salt) = encrypt_password(plaintext).expect("加密应成功");
-        let decrypted =
-            decrypt_password(&ciphertext, &iv, &salt).expect("解密应成功");
+        let decrypted = decrypt_password(&ciphertext, &iv, &salt).expect("解密应成功");
         assert_eq!(decrypted, plaintext);
     }
 
@@ -100,8 +99,7 @@ mod tests {
     fn test_unicode_password() {
         let plaintext = "密码🔑测试";
         let (ct, iv, salt) = encrypt_password(plaintext).expect("加密应成功");
-        let decrypted =
-            decrypt_password(&ct, &iv, &salt).expect("解密应成功");
+        let decrypted = decrypt_password(&ct, &iv, &salt).expect("解密应成功");
         assert_eq!(decrypted, plaintext);
     }
 

@@ -111,11 +111,7 @@ impl TerminalEmulator {
                 // 光标在宽字符的后半部分，需要获取前一个字符
                 if col > 0 {
                     if let Some(prev_cell) = screen.cell(row, col - 1) {
-                        if prev_cell.is_wide() {
-                            2
-                        } else {
-                            1
-                        }
+                        if prev_cell.is_wide() { 2 } else { 1 }
                     } else {
                         1
                     }
@@ -169,11 +165,7 @@ impl TerminalEmulator {
 
                         let contents = c.contents();
                         // 空单元格（如 TAB 跳过的位置）用空格填充
-                        let text = if contents.is_empty() {
-                            " "
-                        } else {
-                            &contents
-                        };
+                        let text = if contents.is_empty() { " " } else { &contents };
                         let fg = ansi_color_to_egui(c.fgcolor(), default_fg);
                         let bg_color = ansi_color_to_egui(c.bgcolor(), default_bg);
 

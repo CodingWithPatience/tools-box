@@ -187,10 +187,7 @@ impl HostsManagerUi {
                                 format!("☐ {}", env.name)
                             };
 
-                            if ui
-                                .selectable_label(env.is_active, &radio_text)
-                                .clicked()
-                            {
+                            if ui.selectable_label(env.is_active, &radio_text).clicked() {
                                 self.toggle_environment(conn, env.id);
                             }
 
@@ -622,12 +619,14 @@ impl HostsManagerUi {
                 if let Some(env_id) = self.selected_env {
                     self.load_entries(conn, env_id);
                 }
-                self.set_success(if enabled {
-                    "条目已启用"
-                } else {
-                    "条目已禁用"
-                }
-                .to_string());
+                self.set_success(
+                    if enabled {
+                        "条目已启用"
+                    } else {
+                        "条目已禁用"
+                    }
+                    .to_string(),
+                );
             }
             Err(e) => {
                 self.set_error(format!("切换状态失败: {}", e));

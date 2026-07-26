@@ -63,7 +63,11 @@ impl AppSettings {
         let hotkeys_str: String = self.tool_hotkeys.iter().collect();
         log::info!(
             "保存设置: theme={}, font_size={}, sidebar_width={}, hotkeys={}, auto_start={}",
-            self.theme, self.font_size, self.sidebar_width, hotkeys_str, self.auto_start
+            self.theme,
+            self.font_size,
+            self.sidebar_width,
+            hotkeys_str,
+            self.auto_start
         );
         conn.execute(
             "INSERT OR REPLACE INTO app_settings (id, theme, font_size, sidebar_width, tool_hotkeys, auto_start, updated_at)

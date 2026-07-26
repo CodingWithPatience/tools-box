@@ -1,5 +1,5 @@
 use egui::{Color32, RichText, Ui};
-use pulldown_cmark::{Options, Parser, Event, Tag, TagEnd};
+use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 
 /// Markdown 渲染器
 ///
@@ -25,9 +25,8 @@ impl MarkdownRenderer {
 
     /// 渲染 Markdown 内容到 egui UI
     pub fn render(&mut self, ui: &mut Ui, markdown: &str) {
-        let options = Options::ENABLE_STRIKETHROUGH
-            | Options::ENABLE_TABLES
-            | Options::ENABLE_TASKLISTS;
+        let options =
+            Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS;
 
         let parser = Parser::new_ext(markdown, options);
         let mut current_text = String::new();
@@ -118,7 +117,13 @@ impl MarkdownRenderer {
                         TagEnd::Strong => {
                             // 先渲染带样式的文本，再重置状态
                             if !current_text.is_empty() {
-                                self.render_text(ui, &current_text, in_emphasis, true, in_blockquote);
+                                self.render_text(
+                                    ui,
+                                    &current_text,
+                                    in_emphasis,
+                                    true,
+                                    in_blockquote,
+                                );
                                 current_text.clear();
                             }
                             in_strong = false;
@@ -126,7 +131,13 @@ impl MarkdownRenderer {
                         TagEnd::Strikethrough => {
                             // 先渲染带样式的文本，再重置状态
                             if !current_text.is_empty() {
-                                self.render_text(ui, &current_text, in_emphasis, in_strong, in_blockquote);
+                                self.render_text(
+                                    ui,
+                                    &current_text,
+                                    in_emphasis,
+                                    in_strong,
+                                    in_blockquote,
+                                );
                                 current_text.clear();
                             }
                             self.in_strikethrough = false;
@@ -145,7 +156,13 @@ impl MarkdownRenderer {
                         }
                         TagEnd::Paragraph => {
                             if !current_text.is_empty() {
-                                self.render_text(ui, &current_text, in_emphasis, in_strong, in_blockquote);
+                                self.render_text(
+                                    ui,
+                                    &current_text,
+                                    in_emphasis,
+                                    in_strong,
+                                    in_blockquote,
+                                );
                                 current_text.clear();
                             }
                         }
@@ -164,7 +181,11 @@ impl MarkdownRenderer {
                         self.render_text(ui, &current_text, false, false, in_blockquote);
                         current_text.clear();
                     }
-                    ui.label(RichText::new(code.to_string()).monospace().background_color(Color32::from_rgb(240, 240, 240)));
+                    ui.label(
+                        RichText::new(code.to_string())
+                            .monospace()
+                            .background_color(Color32::from_rgb(240, 240, 240)),
+                    );
                 }
                 Event::Rule => {
                     if !current_text.is_empty() {
@@ -201,14 +222,7 @@ impl MarkdownRenderer {
     }
 
     /// 渲染普通文本
-    fn render_text(
-        &self,
-        ui: &mut Ui,
-        text: &str,
-        emphasis: bool,
-        strong: bool,
-        blockquote: bool,
-    ) {
+    fn render_text(&self, ui: &mut Ui, text: &str, emphasis: bool, strong: bool, blockquote: bool) {
         let mut rich_text = RichText::new(text.to_string());
 
         if strong {

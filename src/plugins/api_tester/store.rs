@@ -117,10 +117,10 @@ impl<'a> ApiStore<'a> {
         )?;
 
         // 添加 params 列（如果不存在）
-        match self.conn.execute(
-            "ALTER TABLE api_history ADD COLUMN params TEXT",
-            [],
-        ) {
+        match self
+            .conn
+            .execute("ALTER TABLE api_history ADD COLUMN params TEXT", [])
+        {
             Ok(_) => {}
             Err(rusqlite::Error::SqliteFailure(e, _))
                 if e.extended_code == rusqlite::ffi::SQLITE_ERROR =>
@@ -215,10 +215,13 @@ impl<'a> ApiStore<'a> {
     }
 
     /// 根据 ID 获取历史记录详情
-    pub fn get_history_by_id(&self, id: i64) -> Result<Option<(String, String, String, String, String)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT method, url, headers, params, body FROM api_history WHERE id = ?1",
-        )?;
+    pub fn get_history_by_id(
+        &self,
+        id: i64,
+    ) -> Result<Option<(String, String, String, String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT method, url, headers, params, body FROM api_history WHERE id = ?1")?;
 
         let result = stmt
             .query_row(params![id], |row| {
@@ -250,11 +253,9 @@ impl<'a> ApiStore<'a> {
 
     /// 获取历史记录数量
     pub fn count_history(&self) -> Result<usize> {
-        let count: usize = self.conn.query_row(
-            "SELECT COUNT(*) FROM api_history",
-            [],
-            |row| row.get(0),
-        )?;
+        let count: usize = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM api_history", [], |row| row.get(0))?;
         Ok(count)
     }
 
@@ -311,7 +312,10 @@ impl<'a> ApiStore<'a> {
     // ========== 保存的请求操作 ==========
 
     /// 获取集合下的请求
-    pub fn get_requests_by_collection(&self, collection_id: Option<i64>) -> Result<Vec<SavedApiRequest>> {
+    pub fn get_requests_by_collection(
+        &self,
+        collection_id: Option<i64>,
+    ) -> Result<Vec<SavedApiRequest>> {
         let sql = match collection_id {
             Some(_) => {
                 "SELECT id, collection_id, name, method, url, headers, params, body_type, body, created_at, updated_at
@@ -326,15 +330,11 @@ impl<'a> ApiStore<'a> {
         let mut stmt = self.conn.prepare(sql)?;
 
         let requests = if let Some(cid) = collection_id {
-            stmt.query_map(params![cid], |row| {
-                Self::map_saved_request(row)
-            })?
-            .collect::<Result<Vec<_>, _>>()?
+            stmt.query_map(params![cid], |row| Self::map_saved_request(row))?
+                .collect::<Result<Vec<_>, _>>()?
         } else {
-            stmt.query_map([], |row| {
-                Self::map_saved_request(row)
-            })?
-            .collect::<Result<Vec<_>, _>>()?
+            stmt.query_map([], |row| Self::map_saved_request(row))?
+                .collect::<Result<Vec<_>, _>>()?
         };
 
         Ok(requests)
@@ -504,10 +504,8 @@ impl<'a> ApiStore<'a> {
     /// 激活环境
     pub fn activate_environment(&self, id: i64) -> Result<()> {
         // 先取消所有激活状态
-        self.conn.execute(
-            "UPDATE api_environments SET is_active = 0",
-            [],
-        )?;
+        self.conn
+            .execute("UPDATE api_environments SET is_active = 0", [])?;
         // 激活指定环境
         self.conn.execute(
             "UPDATE api_environments SET is_active = 1 WHERE id = ?1",
@@ -519,7 +517,10 @@ impl<'a> ApiStore<'a> {
     // ========== 环境变量操作 ==========
 
     /// 获取环境的所有变量
-    pub fn get_environment_variables(&self, environment_id: i64) -> Result<Vec<EnvironmentVariable>> {
+    pub fn get_environment_variables(
+        &self,
+        environment_id: i64,
+    ) -> Result<Vec<EnvironmentVariable>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, environment_id, key, value, enabled
              FROM api_environment_variables WHERE environment_id = ?1 ORDER BY key",

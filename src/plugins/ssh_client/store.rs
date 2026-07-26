@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 
 use super::crypto;
 use super::models::{AuthMethod, NewSession, SshSession};
@@ -37,30 +37,54 @@ impl<'a> SshStore<'a> {
             let sort_order: i32 = row.get(7)?;
             let created_at: String = row.get(8)?;
             let updated_at: String = row.get(9)?;
-            Ok((id, name, host, port_i64, username, auth_type, auth_data, sort_order, created_at, updated_at))
+            Ok((
+                id, name, host, port_i64, username, auth_type, auth_data, sort_order, created_at,
+                updated_at,
+            ))
         })?;
 
         let mut sessions = Vec::new();
         for row in rows {
-            let (id, name, host, port_i64, username, auth_type, auth_data, sort_order, created_at, updated_at) =
-                match row.context("读取会话记录失败") {
-                    Ok(r) => r,
-                    Err(e) => {
-                        log::warn!("跳过一条损坏的 SSH 连接记录: {}", e);
-                        continue;
-                    }
-                };
+            let (
+                id,
+                name,
+                host,
+                port_i64,
+                username,
+                auth_type,
+                auth_data,
+                sort_order,
+                created_at,
+                updated_at,
+            ) = match row.context("读取会话记录失败") {
+                Ok(r) => r,
+                Err(e) => {
+                    log::warn!("跳过一条损坏的 SSH 连接记录: {}", e);
+                    continue;
+                }
+            };
             let port = match u16::try_from(port_i64) {
                 Ok(p) => p,
                 Err(_) => {
-                    log::warn!("SSH 连接 '{}' (id={}) 端口值 {} 无效，跳过", name, id, port_i64);
+                    log::warn!(
+                        "SSH 连接 '{}' (id={}) 端口值 {} 无效，跳过",
+                        name,
+                        id,
+                        port_i64
+                    );
                     continue;
                 }
             };
             let auth_method = match Self::parse_auth(&auth_type, &auth_data) {
                 Ok(m) => m,
                 Err(e) => {
-                    log::warn!("SSH 连接 '{}' (id={}) {} 解析失败，跳过: {}", name, id, auth_type, e);
+                    log::warn!(
+                        "SSH 连接 '{}' (id={}) {} 解析失败，跳过: {}",
+                        name,
+                        id,
+                        auth_type,
+                        e
+                    );
                     continue;
                 }
             };
@@ -253,9 +277,7 @@ impl<'a> SshStore<'a> {
                     .ok_or_else(|| anyhow::anyhow!("auth_data 缺少 private_key_path 字段"))?
                     .to_string();
                 let passphrase = if let Some(obj) = data["passphrase"].as_object() {
-                    let ct = obj["encrypted_passphrase"]
-                        .as_str()
-                        .and_then(base64_decode);
+                    let ct = obj["encrypted_passphrase"].as_str().and_then(base64_decode);
                     let iv = obj["iv"].as_str().and_then(base64_decode);
                     let salt = obj["salt"].as_str().and_then(base64_decode);
                     match (ct, iv, salt) {

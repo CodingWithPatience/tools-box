@@ -62,9 +62,8 @@ pub fn escape_json(input: &str) -> ProcessResult {
     }
 
     // 合法 JSON，转义为字符串形式
-    let escaped = serde_json::to_string(input).unwrap_or_else(|_| {
-        format!("\"{}\"", input.replace('\\', "\\\\").replace('"', "\\\""))
-    });
+    let escaped = serde_json::to_string(input)
+        .unwrap_or_else(|_| format!("\"{}\"", input.replace('\\', "\\\\").replace('"', "\\\"")));
     ProcessResult::success(escaped)
 }
 

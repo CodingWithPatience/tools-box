@@ -1,8 +1,8 @@
 use std::cell::RefCell;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
-use egui::text::LayoutJob;
 use egui::TextStyle;
+use egui::text::LayoutJob;
 
 use super::processor;
 use crate::utils::highlight::SyntaxHighlighter;
@@ -90,11 +90,7 @@ impl JsonEditorUi {
     }
 
     /// 计算高亮哈希值（用于缓存判断）
-    fn compute_highlight_hash(
-        text: &str,
-        is_dark_mode: bool,
-        font_size: f32,
-    ) -> u64 {
+    fn compute_highlight_hash(text: &str, is_dark_mode: bool, font_size: f32) -> u64 {
         let mut hasher = DefaultHasher::new();
         text.hash(&mut hasher);
         is_dark_mode.hash(&mut hasher);
@@ -103,12 +99,7 @@ impl JsonEditorUi {
     }
 
     /// 获取或计算输出文本的语法高亮 LayoutJob（带缓存）
-    fn get_highlighted_job(
-        &self,
-        text: &str,
-        is_dark_mode: bool,
-        font_size: f32,
-    ) -> LayoutJob {
+    fn get_highlighted_job(&self, text: &str, is_dark_mode: bool, font_size: f32) -> LayoutJob {
         let hash = Self::compute_highlight_hash(text, is_dark_mode, font_size);
         let mut cache = self.output_highlight_cache.borrow_mut();
         if let Some((cached_hash, cached_job)) = cache.as_ref() {
@@ -116,12 +107,9 @@ impl JsonEditorUi {
                 return cached_job.clone();
             }
         }
-        let mut job = self.highlighter.highlight_to_layout_job(
-            text,
-            Some("JSON"),
-            font_size,
-            is_dark_mode,
-        );
+        let mut job =
+            self.highlighter
+                .highlight_to_layout_job(text, Some("JSON"), font_size, is_dark_mode);
         job.wrap.max_width = f32::INFINITY;
         *cache = Some((hash, job.clone()));
         job
@@ -257,11 +245,7 @@ impl JsonEditorUi {
                 .max_height(height)
                 .show(ui, |ui| {
                     if is_valid_json {
-                        let job = self.get_highlighted_job(
-                            &self.output,
-                            is_dark_mode,
-                            font_size,
-                        );
+                        let job = self.get_highlighted_job(&self.output, is_dark_mode, font_size);
                         ui.label(job);
                     } else {
                         // 非 JSON 输出（如转义字符串、错误信息）用等宽字体纯文本显示
@@ -314,7 +298,10 @@ impl JsonEditorUi {
                 } else {
                     "✗ JSON 无效"
                 };
-                ui.label(format!("{}  |  大小: {} bytes  |  行数: {}", valid_str, self.bytes, self.lines));
+                ui.label(format!(
+                    "{}  |  大小: {} bytes  |  行数: {}",
+                    valid_str, self.bytes, self.lines
+                ));
             });
         });
     }
@@ -386,18 +373,10 @@ mod tests {
         // 首次调用
         let _job1 = ui.get_highlighted_job(json, false, 14.0);
         assert!(ui.output_highlight_cache.borrow().is_some());
-        let hash_before = ui
-            .output_highlight_cache
-            .borrow()
-            .as_ref()
-            .map(|(h, _)| *h);
+        let hash_before = ui.output_highlight_cache.borrow().as_ref().map(|(h, _)| *h);
         // 第二次调用，缓存应命中
         let _job2 = ui.get_highlighted_job(json, false, 14.0);
-        let hash_after = ui
-            .output_highlight_cache
-            .borrow()
-            .as_ref()
-            .map(|(h, _)| *h);
+        let hash_after = ui.output_highlight_cache.borrow().as_ref().map(|(h, _)| *h);
         // 哈希值不变说明未重新计算
         assert_eq!(hash_before, hash_after);
     }
@@ -407,17 +386,9 @@ mod tests {
     fn test_highlight_cache_miss_different_text() {
         let ui = JsonEditorUi::new();
         let _job1 = ui.get_highlighted_job(r#"{"a":1}"#, false, 14.0);
-        let hash1 = ui
-            .output_highlight_cache
-            .borrow()
-            .as_ref()
-            .map(|(h, _)| *h);
+        let hash1 = ui.output_highlight_cache.borrow().as_ref().map(|(h, _)| *h);
         let _job2 = ui.get_highlighted_job(r#"{"b":2}"#, false, 14.0);
-        let hash2 = ui
-            .output_highlight_cache
-            .borrow()
-            .as_ref()
-            .map(|(h, _)| *h);
+        let hash2 = ui.output_highlight_cache.borrow().as_ref().map(|(h, _)| *h);
         assert_ne!(hash1, hash2, "不同文本应产生不同哈希");
     }
 
@@ -427,17 +398,9 @@ mod tests {
         let ui = JsonEditorUi::new();
         let json = r#"{"a":1}"#;
         let _job1 = ui.get_highlighted_job(json, false, 14.0);
-        let hash1 = ui
-            .output_highlight_cache
-            .borrow()
-            .as_ref()
-            .map(|(h, _)| *h);
+        let hash1 = ui.output_highlight_cache.borrow().as_ref().map(|(h, _)| *h);
         let _job2 = ui.get_highlighted_job(json, true, 14.0);
-        let hash2 = ui
-            .output_highlight_cache
-            .borrow()
-            .as_ref()
-            .map(|(h, _)| *h);
+        let hash2 = ui.output_highlight_cache.borrow().as_ref().map(|(h, _)| *h);
         assert_ne!(hash1, hash2, "不同主题应产生不同哈希");
     }
 
@@ -447,17 +410,9 @@ mod tests {
         let ui = JsonEditorUi::new();
         let json = r#"{"a":1}"#;
         let _job1 = ui.get_highlighted_job(json, false, 14.0);
-        let hash1 = ui
-            .output_highlight_cache
-            .borrow()
-            .as_ref()
-            .map(|(h, _)| *h);
+        let hash1 = ui.output_highlight_cache.borrow().as_ref().map(|(h, _)| *h);
         let _job2 = ui.get_highlighted_job(json, false, 18.0);
-        let hash2 = ui
-            .output_highlight_cache
-            .borrow()
-            .as_ref()
-            .map(|(h, _)| *h);
+        let hash2 = ui.output_highlight_cache.borrow().as_ref().map(|(h, _)| *h);
         assert_ne!(hash1, hash2, "不同字体大小应产生不同哈希");
     }
 

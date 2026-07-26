@@ -275,7 +275,10 @@ fn build_split_lines<'a>(diff: &TextDiff<'a, 'a, '_, str>) -> Vec<SplitLine> {
                             (
                                 if has_left {
                                     vec![TextSegment {
-                                        text: left_data.as_ref().map(|(_, c)| c.clone()).unwrap_or_default(),
+                                        text: left_data
+                                            .as_ref()
+                                            .map(|(_, c)| c.clone())
+                                            .unwrap_or_default(),
                                         diff_type: DiffType::Removed,
                                     }]
                                 } else {
@@ -283,7 +286,10 @@ fn build_split_lines<'a>(diff: &TextDiff<'a, 'a, '_, str>) -> Vec<SplitLine> {
                                 },
                                 if has_right {
                                     vec![TextSegment {
-                                        text: right_data.as_ref().map(|(_, c)| c.clone()).unwrap_or_default(),
+                                        text: right_data
+                                            .as_ref()
+                                            .map(|(_, c)| c.clone())
+                                            .unwrap_or_default(),
                                         diff_type: DiffType::Added,
                                     }]
                                 } else {

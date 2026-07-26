@@ -6,9 +6,9 @@ use crate::storage::Database;
 use crate::tray::{TrayEvent, TrayManager};
 use egui::FontFamily;
 use raw_window_handle::HasWindowHandle;
+use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetWindowLongW, SetForegroundWindow, SetWindowLongW, ShowWindow, GWL_EXSTYLE,
-    SW_HIDE, SW_RESTORE, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+    IsIconic, SW_HIDE, SW_RESTORE, SW_SHOW, SetForegroundWindow, ShowWindow,
 };
 
 /// 默认字体大小
@@ -19,6 +19,29 @@ const MIN_FONT_SIZE: f32 = 10.0;
 const MAX_FONT_SIZE: f32 = 24.0;
 /// 字体大小步长
 const FONT_SIZE_STEP: f32 = 1.0;
+
+/// 设置原生 Windows 窗口的可见性。
+///
+/// # Safety
+/// `hwnd` 必须是当前进程持有的有效窗口句柄。
+unsafe fn set_native_window_visible(hwnd: HWND, visible: bool) {
+    let is_minimized = if visible {
+        // SAFETY: 调用方保证 hwnd 是当前进程持有的有效窗口句柄。
+        unsafe { IsIconic(hwnd) != 0 }
+    } else {
+        false
+    };
+    let command = match (visible, is_minimized) {
+        (false, _) => SW_HIDE,
+        (true, true) => SW_RESTORE,
+        (true, false) => SW_SHOW,
+    };
+
+    // SAFETY: 调用方保证 hwnd 是当前进程持有的有效窗口句柄。
+    unsafe {
+        ShowWindow(hwnd, command);
+    }
+}
 
 /// 主题模式
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -39,7 +62,7 @@ impl Theme {
     /// 获取主题图标（显示切换后的主题图标，与文字一致）
     pub fn icon(&self) -> &str {
         match self {
-            Theme::Light => "🌙",  // 当前亮色，切换到暗色，显示月亮
+            Theme::Light => "🌙", // 当前亮色，切换到暗色，显示月亮
             Theme::Dark => "☀",   // 当前暗色，切换到亮色，显示太阳
         }
     }
@@ -47,8 +70,8 @@ impl Theme {
     /// 获取主题名称（显示切换后的主题名称，用于按钮文字）
     pub fn name(&self) -> &str {
         match self {
-            Theme::Light => "暗色",  // 当前亮色，点击后切换到暗色
-            Theme::Dark => "亮色",   // 当前暗色，点击后切换到亮色
+            Theme::Light => "暗色", // 当前亮色，点击后切换到暗色
+            Theme::Dark => "亮色",  // 当前暗色，点击后切换到亮色
         }
     }
 
@@ -123,9 +146,10 @@ pub fn setup_chinese_fonts(ctx: &egui::Context) {
     let mut chinese_loaded = false;
     for path in &chinese_font_paths {
         if let Ok(font_data) = std::fs::read(path) {
-            fonts
-                .font_data
-                .insert("chinese".to_owned(), egui::FontData::from_owned(font_data).into());
+            fonts.font_data.insert(
+                "chinese".to_owned(),
+                egui::FontData::from_owned(font_data).into(),
+            );
 
             // 将中文字体设为 Proportional 和 Monospace 的首选 fallback
             if let Some(family) = fonts.families.get_mut(&FontFamily::Proportional) {
@@ -147,16 +171,17 @@ pub fn setup_chinese_fonts(ctx: &egui::Context) {
 
     // 尝试加载 Emoji 字体（支持 Unicode 表情符号）
     let emoji_font_paths = [
-        r"C:\Windows\Fonts\seguiemj.ttf",  // Segoe UI Emoji
-        r"C:\Windows\Fonts\seguisym.ttf",  // Segoe UI Symbol
+        r"C:\Windows\Fonts\seguiemj.ttf", // Segoe UI Emoji
+        r"C:\Windows\Fonts\seguisym.ttf", // Segoe UI Symbol
     ];
 
     let mut emoji_loaded = false;
     for path in &emoji_font_paths {
         if let Ok(font_data) = std::fs::read(path) {
-            fonts
-                .font_data
-                .insert("emoji".to_owned(), egui::FontData::from_owned(font_data).into());
+            fonts.font_data.insert(
+                "emoji".to_owned(),
+                egui::FontData::from_owned(font_data).into(),
+            );
 
             // 将 Emoji 字体添加为 fallback
             if let Some(family) = fonts.families.get_mut(&FontFamily::Proportional) {
@@ -236,14 +261,16 @@ impl App {
                 // Ctrl+Alt+Space：切换窗口显示/隐藏
                 if self.window_visible {
                     log::info!("[热键] Ctrl+Alt+Space → 最小化到托盘");
-                    self.hide_window(ctx, frame);
+                    self.hide_window(frame);
                 } else {
-                    log::info!("[热键] Ctrl+Alt+Space → 恢复窗口，工具={}", self.last_active_tool);
+                    log::info!(
+                        "[热键] Ctrl+Alt+Space → 恢复窗口，工具={}",
+                        self.last_active_tool
+                    );
                     self.selected = self.last_active_tool;
                     self.show_window(ctx, frame);
-                    self.status_message = format!(
-                        "热键唤出：{}", self.plugins[self.last_active_tool].name()
-                    );
+                    self.status_message =
+                        format!("热键唤出：{}", self.plugins[self.last_active_tool].name());
                 }
             } else if event.plugin_index < self.plugins.len() {
                 // Ctrl+Alt+数字：跳转到指定插件并显示窗口
@@ -253,9 +280,8 @@ impl App {
                 if !self.window_visible {
                     self.show_window(ctx, frame);
                 }
-                self.status_message = format!(
-                    "热键唤出：{}", self.plugins[event.plugin_index].name()
-                );
+                self.status_message =
+                    format!("热键唤出：{}", self.plugins[event.plugin_index].name());
             }
         }
     }
@@ -269,14 +295,14 @@ impl App {
                 TrayEvent::ToggleVisible => {
                     log::info!("[托盘事件] 切换窗口可见性，当前={}", self.window_visible);
                     if self.window_visible {
-                        self.hide_window(ctx, frame);
+                        self.hide_window(frame);
                     } else {
                         self.show_window(ctx, frame);
                     }
                 }
-                TrayEvent::Quit => {
-                    log::info!("[托盘事件] 退出程序");
-                    std::process::exit(0);
+                TrayEvent::ShowWindow => {
+                    log::info!("[托盘事件] 显示窗口");
+                    self.show_window(ctx, frame);
                 }
             }
         }
@@ -284,30 +310,24 @@ impl App {
 
     /// 隐藏窗口到系统托盘
     ///
-    /// 使用 WS_EX_TOOLWINDOW + Minimized 方案：
-    /// 1. 设置 WS_EX_TOOLWINDOW 移除任务栏按钮
-    /// 2. 最小化窗口（保持事件循环活跃）
-    fn hide_window(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+    /// 使用 Win32 `SW_HIDE` 完全隐藏窗口，不在桌面或任务栏保留最小化窗口。
+    fn hide_window(&mut self, frame: &mut eframe::Frame) {
         self.window_visible = false;
         self.status_message = "已最小化到系统托盘".to_string();
 
         if let Ok(handle) = frame.window_handle() {
             if let raw_window_handle::RawWindowHandle::Win32(h) = handle.as_raw() {
                 let hwnd = h.hwnd.get() as _;
+                crate::tray::set_main_window_handle(hwnd);
                 // SAFETY: hwnd 是有效的 Win32 窗口句柄
                 unsafe {
-                    // 设置 WS_EX_TOOLWINDOW，移除任务栏按钮
-                    let style = GetWindowLongW(hwnd, GWL_EXSTYLE);
-                    let new_style = (style & !(WS_EX_APPWINDOW as i32)) | (WS_EX_TOOLWINDOW as i32);
-                    SetWindowLongW(hwnd, GWL_EXSTYLE, new_style);
+                    set_native_window_visible(hwnd, false);
                 }
-                log::info!("已设置 WS_EX_TOOLWINDOW");
+                log::info!("窗口已通过 SW_HIDE 完全隐藏到系统托盘");
             }
         }
 
-        // 最小化（保持事件循环活跃，与 request_repaint_after 配合）
-        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-        log::info!("窗口已最小化到托盘");
+        log::info!("窗口已最小化到系统托盘");
     }
 
     /// 从系统托盘恢复窗口
@@ -320,16 +340,10 @@ impl App {
                 let hwnd = h.hwnd.get() as _;
                 // SAFETY: hwnd 是有效的 Win32 窗口句柄
                 unsafe {
-                    // 恢复 WS_EX_APPWINDOW，显示任务栏按钮
-                    let style = GetWindowLongW(hwnd, GWL_EXSTYLE);
-                    let new_style = (style & !(WS_EX_TOOLWINDOW as i32)) | (WS_EX_APPWINDOW as i32);
-                    SetWindowLongW(hwnd, GWL_EXSTYLE, new_style);
-
-                    // 恢复窗口
-                    ShowWindow(hwnd, SW_RESTORE);
+                    set_native_window_visible(hwnd, true);
                     SetForegroundWindow(hwnd);
                 }
-                log::info!("窗口已恢复（WS_EX_APPWINDOW + SW_RESTORE）");
+                log::info!("窗口已从系统托盘恢复");
             }
         }
 
@@ -422,11 +436,26 @@ impl App {
     fn apply_font_size(&self, ctx: &egui::Context) {
         let mut style = (*ctx.style()).clone();
         style.text_styles = [
-            (egui::TextStyle::Body, egui::FontId::new(self.font_size, FontFamily::Proportional)),
-            (egui::TextStyle::Button, egui::FontId::new(self.font_size, FontFamily::Proportional)),
-            (egui::TextStyle::Small, egui::FontId::new(self.font_size - 2.0, FontFamily::Proportional)),
-            (egui::TextStyle::Heading, egui::FontId::new(self.font_size + 4.0, FontFamily::Proportional)),
-            (egui::TextStyle::Monospace, egui::FontId::new(self.font_size, FontFamily::Monospace)),
+            (
+                egui::TextStyle::Body,
+                egui::FontId::new(self.font_size, FontFamily::Proportional),
+            ),
+            (
+                egui::TextStyle::Button,
+                egui::FontId::new(self.font_size, FontFamily::Proportional),
+            ),
+            (
+                egui::TextStyle::Small,
+                egui::FontId::new(self.font_size - 2.0, FontFamily::Proportional),
+            ),
+            (
+                egui::TextStyle::Heading,
+                egui::FontId::new(self.font_size + 4.0, FontFamily::Proportional),
+            ),
+            (
+                egui::TextStyle::Monospace,
+                egui::FontId::new(self.font_size, FontFamily::Monospace),
+            ),
         ]
         .into();
         ctx.set_style(style);
@@ -472,7 +501,11 @@ impl App {
             ui.label("🔍");
 
             // 计算搜索框宽度：可用宽度减去图标和清空按钮的空间
-            let button_space = if !self.search_query.is_empty() { 30.0 } else { 0.0 };
+            let button_space = if !self.search_query.is_empty() {
+                30.0
+            } else {
+                0.0
+            };
             let search_width = (available_width - 50.0 - button_space).max(100.0);
 
             let response = ui.add_sized(
@@ -514,10 +547,7 @@ impl App {
         // 搜索结果提示
         if !self.search_query.is_empty() {
             ui.horizontal(|ui| {
-                ui.weak(format!(
-                    "找到 {} 个插件",
-                    filtered.len()
-                ));
+                ui.weak(format!("找到 {} 个插件", filtered.len()));
             });
             ui.add_space(4.0);
         }
@@ -654,7 +684,7 @@ impl eframe::App for App {
         // 4. 处理窗口关闭事件（用户点击 ✕）→ 取消关闭，改为隐藏到托盘
         if ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.hide_window(ctx, frame);
+            self.hide_window(frame);
             return;
         }
 
@@ -697,5 +727,106 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ctx, |ui| {
             self.render_plugin_content(ui);
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::set_native_window_visible;
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DestroyWindow, IsIconic, IsWindowVisible, IsZoomed, SW_MAXIMIZE,
+        SW_MINIMIZE, ShowWindow, WS_OVERLAPPED,
+    };
+
+    struct TestWindow(HWND);
+
+    impl TestWindow {
+        fn new() -> Self {
+            let class_name: Vec<u16> = "STATIC\0".encode_utf16().collect();
+            let window_name: Vec<u16> = "Tools Box 托盘测试\0".encode_utf16().collect();
+
+            // SAFETY: 使用系统内置 STATIC 窗口类，字符串均以空字符结尾且在调用期间有效。
+            let hwnd = unsafe {
+                CreateWindowExW(
+                    0,
+                    class_name.as_ptr(),
+                    window_name.as_ptr(),
+                    WS_OVERLAPPED,
+                    0,
+                    0,
+                    100,
+                    100,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                )
+            };
+            assert!(!hwnd.is_null(), "测试窗口创建失败");
+            Self(hwnd)
+        }
+    }
+
+    impl Drop for TestWindow {
+        fn drop(&mut self) {
+            // SAFETY: 句柄由 CreateWindowExW 创建，且仅在此处销毁一次。
+            unsafe {
+                DestroyWindow(self.0);
+            }
+        }
+    }
+
+    #[test]
+    fn native_window_can_be_completely_hidden_and_restored() {
+        let window = TestWindow::new();
+
+        // SAFETY: 句柄在测试期间有效，并由 TestWindow 保持存活。
+        unsafe {
+            set_native_window_visible(window.0, true);
+            assert_ne!(IsWindowVisible(window.0), 0, "窗口恢复后应可见");
+
+            set_native_window_visible(window.0, false);
+            assert_eq!(IsWindowVisible(window.0), 0, "窗口隐藏后应完全不可见");
+
+            set_native_window_visible(window.0, true);
+            assert_ne!(IsWindowVisible(window.0), 0, "窗口再次恢复后应可见");
+        }
+    }
+
+    #[test]
+    fn minimized_window_is_restored_from_tray() {
+        let window = TestWindow::new();
+
+        // SAFETY: 句柄在测试期间有效，并由 TestWindow 保持存活。
+        unsafe {
+            set_native_window_visible(window.0, true);
+            ShowWindow(window.0, SW_MINIMIZE);
+            assert_ne!(IsIconic(window.0), 0, "测试窗口应处于最小化状态");
+
+            set_native_window_visible(window.0, false);
+            set_native_window_visible(window.0, true);
+
+            assert_ne!(IsWindowVisible(window.0), 0, "恢复后的窗口应可见");
+            assert_eq!(IsIconic(window.0), 0, "恢复后的窗口不应保持最小化");
+        }
+    }
+
+    #[test]
+    fn maximized_window_keeps_state_after_tray_restore() {
+        let window = TestWindow::new();
+
+        // SAFETY: 句柄在测试期间有效，并由 TestWindow 保持存活。
+        unsafe {
+            set_native_window_visible(window.0, true);
+            ShowWindow(window.0, SW_MAXIMIZE);
+            assert_ne!(IsZoomed(window.0), 0, "测试窗口应处于最大化状态");
+
+            set_native_window_visible(window.0, false);
+            set_native_window_visible(window.0, true);
+
+            assert_ne!(IsWindowVisible(window.0), 0, "恢复后的窗口应可见");
+            assert_ne!(IsZoomed(window.0), 0, "恢复后的窗口应保持最大化");
+        }
     }
 }

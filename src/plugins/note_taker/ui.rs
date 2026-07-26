@@ -157,10 +157,7 @@ impl NoteTakerUi {
                 }
 
                 // 新建目录按钮
-                if ui
-                    .button(RichText::new("+ 新建目录").strong())
-                    .clicked()
-                {
+                if ui.button(RichText::new("+ 新建目录").strong()).clicked() {
                     self.editing_folder_id = None;
                     self.folder_form_name.clear();
                     self.folder_form_parent_id = None;
@@ -168,10 +165,7 @@ impl NoteTakerUi {
                 }
 
                 // 新建笔记按钮
-                if ui
-                    .button(RichText::new("+ 新建笔记").strong())
-                    .clicked()
-                {
+                if ui.button(RichText::new("+ 新建笔记").strong()).clicked() {
                     action = Some(UiAction::CreateNote);
                 }
             });
@@ -230,8 +224,8 @@ impl NoteTakerUi {
             // 处理拖拽
             if separator_response.dragged() {
                 let delta = separator_response.drag_delta().x;
-                self.left_panel_width = (self.left_panel_width + delta)
-                    .clamp(min_left_width, max_left_width);
+                self.left_panel_width =
+                    (self.left_panel_width + delta).clamp(min_left_width, max_left_width);
             }
 
             // 鼠标样式
@@ -286,7 +280,8 @@ impl NoteTakerUi {
             .max_height(ui.available_height() * 0.4)
             .show(ui, |ui| {
                 // 未分类笔记
-                let uncategorized_selected = self.selected_folder_id.is_none() && !self.show_favorites;
+                let uncategorized_selected =
+                    self.selected_folder_id.is_none() && !self.show_favorites;
                 if ui
                     .selectable_label(uncategorized_selected, "📁 未分类")
                     .clicked()
@@ -298,10 +293,7 @@ impl NoteTakerUi {
 
                 // 收藏夹
                 let fav_selected = self.show_favorites;
-                if ui
-                    .selectable_label(fav_selected, "⭐ 收藏")
-                    .clicked()
-                {
+                if ui.selectable_label(fav_selected, "⭐ 收藏").clicked() {
                     self.show_favorites = true;
                     self.selected_folder_id = None;
                     action = Some(UiAction::ReloadNotes);
@@ -369,8 +361,7 @@ impl NoteTakerUi {
             .collect();
 
         for (folder_id, folder_name, folder_parent_id) in folder_info {
-            let is_selected =
-                self.selected_folder_id == Some(folder_id) && !self.show_favorites;
+            let is_selected = self.selected_folder_id == Some(folder_id) && !self.show_favorites;
             let indent = "  ".repeat(depth);
             let label_text = format!("{}📁 {}", indent, folder_name);
 
@@ -378,10 +369,7 @@ impl NoteTakerUi {
             let mut edit_clicked = false;
 
             ui.horizontal(|ui| {
-                if ui
-                    .selectable_label(is_selected, &label_text)
-                    .clicked()
-                {
+                if ui.selectable_label(is_selected, &label_text).clicked() {
                     clicked = true;
                 }
 
@@ -503,11 +491,7 @@ impl NoteTakerUi {
                             } else {
                                 folder.name.clone()
                             };
-                            ui.selectable_value(
-                                &mut self.form.folder_id,
-                                Some(folder.id),
-                                &name,
-                            );
+                            ui.selectable_value(&mut self.form.folder_id, Some(folder.id), &name);
                         }
                     });
 
@@ -524,10 +508,7 @@ impl NoteTakerUi {
                 ui.separator();
 
                 // 操作按钮
-                if ui
-                    .button(RichText::new("💾 保存").strong())
-                    .clicked()
-                {
+                if ui.button(RichText::new("💾 保存").strong()).clicked() {
                     self.save_note(conn);
                 }
 
@@ -538,7 +519,11 @@ impl NoteTakerUi {
                     .map(|n| n.is_favorite)
                     .unwrap_or(false);
 
-                let fav_text = if is_favorite { "⭐ 已收藏" } else { "☆ 收藏" };
+                let fav_text = if is_favorite {
+                    "⭐ 已收藏"
+                } else {
+                    "☆ 收藏"
+                };
                 if ui.button(fav_text).clicked() {
                     self.toggle_favorite(note_id, conn);
                 }
@@ -591,11 +576,7 @@ impl NoteTakerUi {
                                 .unwrap_or("根目录"),
                         )
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut self.folder_form_parent_id,
-                                None,
-                                "根目录",
-                            );
+                            ui.selectable_value(&mut self.folder_form_parent_id, None, "根目录");
                             for folder in &self.folders {
                                 if Some(folder.id) != self.editing_folder_id {
                                     ui.selectable_value(
@@ -622,9 +603,7 @@ impl NoteTakerUi {
 
                     if self.editing_folder_id.is_some() {
                         if ui
-                            .button(
-                                RichText::new("删除").color(Color32::from_rgb(200, 0, 0)),
-                            )
+                            .button(RichText::new("删除").color(Color32::from_rgb(200, 0, 0)))
                             .clicked()
                         {
                             if let Some(id) = self.editing_folder_id {
@@ -719,11 +698,7 @@ impl NoteTakerUi {
         match store.toggle_favorite(note_id) {
             Ok(is_favorite) => {
                 self.load_notes(conn);
-                log::info!(
-                    "切换收藏状态: id={}, is_favorite={}",
-                    note_id,
-                    is_favorite
-                );
+                log::info!("切换收藏状态: id={}, is_favorite={}", note_id, is_favorite);
             }
             Err(e) => {
                 self.error = Some(format!("切换收藏失败: {}", e));
@@ -740,7 +715,11 @@ impl NoteTakerUi {
 
         let store = NoteStore::new(conn);
         let result = if let Some(folder_id) = self.editing_folder_id {
-            store.update_folder(folder_id, &self.folder_form_name, self.folder_form_parent_id)
+            store.update_folder(
+                folder_id,
+                &self.folder_form_name,
+                self.folder_form_parent_id,
+            )
         } else {
             store
                 .create_folder(&self.folder_form_name, self.folder_form_parent_id)

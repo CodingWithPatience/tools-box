@@ -34,8 +34,7 @@ impl Database {
 
     /// 获取数据库文件路径
     fn db_path() -> Result<PathBuf> {
-        let data_dir = dirs::data_dir()
-            .context("无法获取系统数据目录")?;
+        let data_dir = dirs::data_dir().context("无法获取系统数据目录")?;
         Ok(data_dir.join("tools-box").join("data.db"))
     }
 
@@ -230,7 +229,9 @@ impl Database {
 
         if !has_auto_start {
             self.conn
-                .execute_batch("ALTER TABLE app_settings ADD COLUMN auto_start BOOLEAN NOT NULL DEFAULT 0")
+                .execute_batch(
+                    "ALTER TABLE app_settings ADD COLUMN auto_start BOOLEAN NOT NULL DEFAULT 0",
+                )
                 .context("添加 auto_start 列失败")?;
             log::info!("app_settings 表已迁移：添加 auto_start 列");
         }

@@ -11,10 +11,8 @@ const FONT_SIZE_STEP: f32 = 1.0;
 
 /// 可用于热键的字符列表（大写字母 + 数字）
 const HOTKEY_CHARS: &[char] = &[
-    '1', '2', '3', '4', '5', '6', '7', '8', '9', '0',
-    'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J',
-    'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T',
-    'U', 'V', 'W', 'X', 'Y', 'Z',
+    '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I',
+    'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z',
 ];
 
 /// 设置变更类型
@@ -110,7 +108,10 @@ impl SettingsUi {
         // 未保存提示
         if self.dirty {
             ui.add_space(4.0);
-            ui.colored_label(egui::Color32::from_rgb(255, 200, 0), "⚠ 有未保存的更改，请点击保存");
+            ui.colored_label(
+                egui::Color32::from_rgb(255, 200, 0),
+                "⚠ 有未保存的更改，请点击保存",
+            );
         }
 
         change
@@ -204,12 +205,19 @@ impl SettingsUi {
                             for &c in HOTKEY_CHARS {
                                 let label = format!("Ctrl+Alt+{}", c);
                                 // 检查是否已被其他工具使用
-                                let used_by_other = self.settings.tool_hotkeys.iter().enumerate()
+                                let used_by_other = self
+                                    .settings
+                                    .tool_hotkeys
+                                    .iter()
+                                    .enumerate()
                                     .any(|(j, &hc)| j != i && hc == c);
                                 let is_current = current_char == c;
 
                                 let enabled = !used_by_other || is_current;
-                                let response = ui.add_enabled(enabled, egui::SelectableLabel::new(is_current, &label));
+                                let response = ui.add_enabled(
+                                    enabled,
+                                    egui::SelectableLabel::new(is_current, &label),
+                                );
                                 if response.clicked() && !is_current {
                                     if i < self.settings.tool_hotkeys.len() {
                                         self.settings.tool_hotkeys[i] = c;
@@ -252,8 +260,8 @@ fn apply_auto_start(enable: bool) {
 
     // SAFETY: 调用 Windows API 操作注册表
     unsafe {
-        use windows_sys::Win32::System::Registry::*;
         use windows_sys::Win32::Foundation::*;
+        use windows_sys::Win32::System::Registry::*;
 
         let key_path: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Run\0"
             .encode_utf16()
@@ -271,7 +279,8 @@ fn apply_auto_start(enable: bool) {
 
         if result == ERROR_SUCCESS {
             if enable {
-                let value_data: Vec<u16> = exe_str.encode_utf16().chain(std::iter::once(0)).collect();
+                let value_data: Vec<u16> =
+                    exe_str.encode_utf16().chain(std::iter::once(0)).collect();
                 RegSetValueExW(
                     hkey,
                     value_name.as_ptr(),

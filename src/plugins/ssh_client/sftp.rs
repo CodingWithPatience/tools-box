@@ -174,12 +174,10 @@ impl SftpClient {
                     .collect();
 
                 // 目录在前，文件在后，同类型按名称排序
-                file_list.sort_by(|a, b| {
-                    match (a.is_dir, b.is_dir) {
-                        (true, false) => std::cmp::Ordering::Less,
-                        (false, true) => std::cmp::Ordering::Greater,
-                        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-                    }
+                file_list.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+                    (true, false) => std::cmp::Ordering::Less,
+                    (false, true) => std::cmp::Ordering::Greater,
+                    _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
                 });
 
                 let _ = resp_tx.send(SftpResponse::DirectoryList(path.to_string(), file_list));
@@ -220,10 +218,7 @@ impl SftpClient {
         let total_size = match local_file.metadata() {
             Ok(m) => m.len(),
             Err(e) => {
-                let _ = resp_tx.send(SftpResponse::Error(format!(
-                    "无法读取文件大小: {}",
-                    e
-                )));
+                let _ = resp_tx.send(SftpResponse::Error(format!("无法读取文件大小: {}", e)));
                 return;
             }
         };
@@ -380,10 +375,7 @@ impl SftpClient {
     fn handle_mkdir(sftp: &Sftp, path: &str, resp_tx: &mpsc::SyncSender<SftpResponse>) {
         match sftp.mkdir(Path::new(path), 0o755) {
             Ok(()) => {
-                let _ = resp_tx.send(SftpResponse::OperationDone(format!(
-                    "目录已创建: {}",
-                    path
-                )));
+                let _ = resp_tx.send(SftpResponse::OperationDone(format!("目录已创建: {}", path)));
             }
             Err(e) => {
                 let _ = resp_tx.send(SftpResponse::Error(format!(
@@ -400,25 +392,18 @@ impl SftpClient {
         // 先尝试作为文件删除
         match sftp.unlink(p) {
             Ok(()) => {
-                let _ = resp_tx.send(SftpResponse::OperationDone(format!(
-                    "已删除: {}",
-                    path
-                )));
+                let _ = resp_tx.send(SftpResponse::OperationDone(format!("已删除: {}", path)));
             }
             Err(_) => {
                 // 尝试作为目录删除（仅空目录）
                 match sftp.rmdir(p) {
                     Ok(()) => {
-                        let _ = resp_tx.send(SftpResponse::OperationDone(format!(
-                            "目录已删除: {}",
-                            path
-                        )));
+                        let _ = resp_tx
+                            .send(SftpResponse::OperationDone(format!("目录已删除: {}", path)));
                     }
                     Err(e) => {
-                        let _ = resp_tx.send(SftpResponse::Error(format!(
-                            "删除失败 '{}': {}",
-                            path, e
-                        )));
+                        let _ = resp_tx
+                            .send(SftpResponse::Error(format!("删除失败 '{}': {}", path, e)));
                     }
                 }
             }

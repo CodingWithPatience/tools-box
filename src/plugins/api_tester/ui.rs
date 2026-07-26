@@ -263,10 +263,7 @@ impl ApiTesterUi {
                 .selected_text(format!("环境: {}", env_name))
                 .show_ui(ui, |ui| {
                     for env in &envs {
-                        if ui
-                            .selectable_label(env.is_active, &env.name)
-                            .clicked()
-                        {
+                        if ui.selectable_label(env.is_active, &env.name).clicked() {
                             env_to_activate = Some(env.id);
                         }
                     }
@@ -331,10 +328,7 @@ impl ApiTesterUi {
                 }
 
                 // 新建请求按钮
-                if ui
-                    .button(RichText::new("+ 新建请求").strong())
-                    .clicked()
-                {
+                if ui.button(RichText::new("+ 新建请求").strong()).clicked() {
                     self.request = ApiRequest::new();
                     self.headers = vec![
                         HeaderEntry::new("Content-Type", "application/json"),
@@ -422,8 +416,8 @@ impl ApiTesterUi {
             // 处理拖拽
             if separator_response.dragged() {
                 let delta = separator_response.drag_delta().x;
-                self.left_panel_width = (self.left_panel_width + delta)
-                    .clamp(min_left_width, max_left_width);
+                self.left_panel_width =
+                    (self.left_panel_width + delta).clamp(min_left_width, max_left_width);
             }
 
             // 鼠标样式
@@ -477,10 +471,7 @@ impl ApiTesterUi {
             .show(ui, |ui| {
                 // 全部请求（未分类）
                 let all_selected = self.selected_collection_id.is_none();
-                if ui
-                    .selectable_label(all_selected, "📁 全部请求")
-                    .clicked()
-                {
+                if ui.selectable_label(all_selected, "📁 全部请求").clicked() {
                     self.selected_collection_id = None;
                     self.load_saved_requests(conn);
                 }
@@ -534,15 +525,14 @@ impl ApiTesterUi {
                                 request_to_load = Some(request.clone());
                             }
 
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui
-                                    .small_button("×")
-                                    .on_hover_text("删除")
-                                    .clicked()
-                                {
-                                    request_to_delete = Some(request.id);
-                                }
-                            });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.small_button("×").on_hover_text("删除").clicked() {
+                                        request_to_delete = Some(request.id);
+                                    }
+                                },
+                            );
                         });
                     }
                 }
@@ -593,10 +583,7 @@ impl ApiTesterUi {
             let label_text = format!("{}📁 {}", indent, collection.name);
 
             ui.horizontal(|ui| {
-                if ui
-                    .selectable_label(is_selected, &label_text)
-                    .clicked()
-                {
+                if ui.selectable_label(is_selected, &label_text).clicked() {
                     collection_to_select = Some(collection.id);
                 }
 
@@ -659,10 +646,9 @@ impl ApiTesterUi {
                             ) {
                                 self.error = Some(format!("更新集合失败: {}", e));
                             }
-                        } else if let Err(e) = store.create_collection(
-                            &self.collection_form_name,
-                            None,
-                        ) {
+                        } else if let Err(e) =
+                            store.create_collection(&self.collection_form_name, None)
+                        {
                             self.error = Some(format!("创建集合失败: {}", e));
                         }
                         self.load_collections(conn);
@@ -941,8 +927,7 @@ impl ApiTesterUi {
                                     {
                                         let store = ApiStore::new(conn);
                                         if let Err(e) = store.delete_environment_variable(var.id) {
-                                            self.error =
-                                                Some(format!("删除变量失败: {}", e));
+                                            self.error = Some(format!("删除变量失败: {}", e));
                                         } else {
                                             self.load_environment_variables(conn);
                                         }
@@ -1052,10 +1037,7 @@ impl ApiTesterUi {
                 "保存请求"
             };
 
-            if ui
-                .button(RichText::new(save_btn_text).strong())
-                .clicked()
-            {
+            if ui.button(RichText::new(save_btn_text).strong()).clicked() {
                 self.save_request_to_collection(conn);
             }
 
@@ -1296,8 +1278,7 @@ impl ApiTesterUi {
             .show(ui, |ui| {
                 ui.add_sized(
                     [ui.available_width(), available_height],
-                    egui::TextEdit::multiline(&mut formatted_body.as_str())
-                        .code_editor(),
+                    egui::TextEdit::multiline(&mut formatted_body.as_str()).code_editor(),
                 );
             });
     }
@@ -1430,17 +1411,12 @@ impl ApiTesterUi {
                             }
 
                             // 耗时列
-                            ui.label(
-                                RichText::new(&elapsed_display)
-                                    .color(Color32::GRAY)
-                                    .small(),
-                            );
+                            ui.label(RichText::new(&elapsed_display).color(Color32::GRAY).small());
 
                             // 删除按钮
                             if ui
                                 .small_button(
-                                    RichText::new("×")
-                                        .color(Color32::from_rgb(200, 0, 0)),
+                                    RichText::new("×").color(Color32::from_rgb(200, 0, 0)),
                                 )
                                 .on_hover_text("删除此记录")
                                 .clicked()
@@ -1497,8 +1473,7 @@ impl ApiTesterUi {
 
                 // 解析请求头
                 if !headers.is_empty() {
-                    if let Ok(parsed_headers) = serde_json::from_str::<Vec<HeaderEntry>>(&headers)
-                    {
+                    if let Ok(parsed_headers) = serde_json::from_str::<Vec<HeaderEntry>>(&headers) {
                         self.headers = parsed_headers;
                     }
                 }

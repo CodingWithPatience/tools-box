@@ -94,7 +94,10 @@ impl PasswordManagerUi {
             ui.colored_label(egui::Color32::from_rgb(220, 50, 50), format!("⚠ {}", err));
         }
         if let Some(success) = &self.success_msg.clone() {
-            ui.colored_label(egui::Color32::from_rgb(50, 180, 50), format!("✓ {}", success));
+            ui.colored_label(
+                egui::Color32::from_rgb(50, 180, 50),
+                format!("✓ {}", success),
+            );
         }
     }
 
@@ -881,10 +884,7 @@ impl PasswordManagerUi {
                     if self.form.show_password {
                         ui.text_edit_singleline(&mut self.form.password);
                     } else {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.form.password)
-                                .password(true),
-                        );
+                        ui.add(egui::TextEdit::singleline(&mut self.form.password).password(true));
                     }
 
                     let eye_icon = if self.form.show_password {
@@ -993,26 +993,24 @@ impl PasswordManagerUi {
             if let Some(key) = &self.derived_key {
                 let store = PasswordStore::new(conn);
                 match store.export_entries(key, format) {
-                    Ok(data) => {
-                        match std::fs::write(&path, &data) {
-                            Ok(()) => {
-                                let fmt_name = match format {
-                                    ExportFormat::Json => "JSON",
-                                    ExportFormat::Csv => "CSV",
-                                };
-                                self.set_success(format!(
-                                    "已导出 {} 条记录到 {}（{} 格式）",
-                                    self.entries.len(),
-                                    path.display(),
-                                    fmt_name
-                                ));
-                                log::info!("密码数据已导出到: {}", path.display());
-                            }
-                            Err(e) => {
-                                self.set_error(format!("写入文件失败: {}", e));
-                            }
+                    Ok(data) => match std::fs::write(&path, &data) {
+                        Ok(()) => {
+                            let fmt_name = match format {
+                                ExportFormat::Json => "JSON",
+                                ExportFormat::Csv => "CSV",
+                            };
+                            self.set_success(format!(
+                                "已导出 {} 条记录到 {}（{} 格式）",
+                                self.entries.len(),
+                                path.display(),
+                                fmt_name
+                            ));
+                            log::info!("密码数据已导出到: {}", path.display());
                         }
-                    }
+                        Err(e) => {
+                            self.set_error(format!("写入文件失败: {}", e));
+                        }
+                    },
                     Err(e) => {
                         self.set_error(format!("导出失败: {}", e));
                     }

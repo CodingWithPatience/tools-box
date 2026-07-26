@@ -73,7 +73,12 @@ pub enum BodyType {
 impl BodyType {
     /// 获取所有请求体类型
     pub fn all() -> &'static [BodyType] {
-        &[BodyType::None, BodyType::Json, BodyType::Form, BodyType::Raw]
+        &[
+            BodyType::None,
+            BodyType::Json,
+            BodyType::Form,
+            BodyType::Raw,
+        ]
     }
 
     /// 转换为字符串
@@ -139,9 +144,7 @@ impl ApiRequest {
             name: "New Request".to_string(),
             method: HttpMethod::Get,
             url: String::new(),
-            headers: vec![
-                HeaderEntry::new("Content-Type", "application/json"),
-            ],
+            headers: vec![HeaderEntry::new("Content-Type", "application/json")],
             params: Vec::new(),
             body_type: BodyType::None,
             body: String::new(),
@@ -151,12 +154,22 @@ impl ApiRequest {
     /// 构建完整的 URL（包含查询参数）
     pub fn build_url(&self) -> String {
         let mut url = self.url.clone();
-        let enabled_params: Vec<_> = self.params.iter().filter(|p| p.enabled && !p.key.is_empty()).collect();
+        let enabled_params: Vec<_> = self
+            .params
+            .iter()
+            .filter(|p| p.enabled && !p.key.is_empty())
+            .collect();
 
         if !enabled_params.is_empty() {
             let query_string: String = enabled_params
                 .iter()
-                .map(|p| format!("{}={}", urlencoding::encode(&p.key), urlencoding::encode(&p.value)))
+                .map(|p| {
+                    format!(
+                        "{}={}",
+                        urlencoding::encode(&p.key),
+                        urlencoding::encode(&p.value)
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("&");
 
@@ -331,7 +344,10 @@ mod tests {
             ],
             ..ApiRequest::new()
         };
-        assert_eq!(request.build_url(), "https://example.com/api?key1=value1&key2=value2");
+        assert_eq!(
+            request.build_url(),
+            "https://example.com/api?key1=value1&key2=value2"
+        );
     }
 
     #[test]
@@ -341,7 +357,10 @@ mod tests {
             params: vec![HeaderEntry::new("key1", "value1")],
             ..ApiRequest::new()
         };
-        assert_eq!(request.build_url(), "https://example.com/api?existing=param&key1=value1");
+        assert_eq!(
+            request.build_url(),
+            "https://example.com/api?existing=param&key1=value1"
+        );
     }
 
     #[test]
@@ -361,10 +380,7 @@ mod tests {
     fn test_build_url_skip_empty_key() {
         let request = ApiRequest {
             url: "https://example.com/api".to_string(),
-            params: vec![
-                HeaderEntry::empty(),
-                HeaderEntry::new("key2", "value2"),
-            ],
+            params: vec![HeaderEntry::empty(), HeaderEntry::new("key2", "value2")],
             ..ApiRequest::new()
         };
         assert_eq!(request.build_url(), "https://example.com/api?key2=value2");
@@ -377,6 +393,9 @@ mod tests {
             params: vec![HeaderEntry::new("key", "value with spaces&special=chars")],
             ..ApiRequest::new()
         };
-        assert_eq!(request.build_url(), "https://example.com/api?key=value%20with%20spaces%26special%3Dchars");
+        assert_eq!(
+            request.build_url(),
+            "https://example.com/api?key=value%20with%20spaces%26special%3Dchars"
+        );
     }
 }

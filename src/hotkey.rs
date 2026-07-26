@@ -44,9 +44,7 @@ pub fn default_bindings(plugin_count: usize) -> Vec<HotkeyBinding> {
     });
 
     // 各工具快捷键: Ctrl+Alt+1~9
-    let tool_keys = [
-        0x31u32, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39,
-    ]; // '1'~'9'
+    let tool_keys = [0x31u32, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39]; // '1'~'9'
     for (i, &vk) in tool_keys.iter().enumerate() {
         if i < plugin_count {
             bindings.push(HotkeyBinding {
@@ -114,7 +112,10 @@ impl HotkeyManager {
                     class_name.as_ptr(),
                     std::ptr::null(),
                     WS_OVERLAPPED,
-                    0, 0, 0, 0,
+                    0,
+                    0,
+                    0,
+                    0,
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
                     GetModuleHandleW(std::ptr::null()),
@@ -128,18 +129,19 @@ impl HotkeyManager {
             // 注册所有热键
             for binding in &bindings_clone {
                 // SAFETY: RegisterHotKey 参数已正确初始化
-                let ok = unsafe {
-                    RegisterHotKey(hwnd, binding.id, binding.modifiers, binding.vk)
-                };
+                let ok = unsafe { RegisterHotKey(hwnd, binding.id, binding.modifiers, binding.vk) };
                 if ok == 0 {
                     log::warn!(
                         "注册热键失败: id={}, vk={:#x}（可能被其他程序占用）",
-                        binding.id, binding.vk
+                        binding.id,
+                        binding.vk
                     );
                 } else {
                     log::info!(
                         "注册热键成功: id={}, vk={:#x}, plugin_index={}",
-                        binding.id, binding.vk, binding.plugin_index
+                        binding.id,
+                        binding.vk,
+                        binding.plugin_index
                     );
                 }
             }
@@ -152,11 +154,15 @@ impl HotkeyManager {
                 if let Ok(new_bindings) = update_rx.try_recv() {
                     // 注销旧热键
                     for binding in &current_bindings {
-                        unsafe { UnregisterHotKey(hwnd, binding.id); }
+                        unsafe {
+                            UnregisterHotKey(hwnd, binding.id);
+                        }
                     }
                     // 注册新热键
                     for binding in &new_bindings {
-                        let ok = unsafe { RegisterHotKey(hwnd, binding.id, binding.modifiers, binding.vk) };
+                        let ok = unsafe {
+                            RegisterHotKey(hwnd, binding.id, binding.modifiers, binding.vk)
+                        };
                         if ok == 0 {
                             log::warn!("更新热键失败: id={}, vk={:#x}", binding.id, binding.vk);
                         } else {
@@ -192,9 +198,13 @@ impl HotkeyManager {
 
             // 清理：注销所有热键并销毁窗口
             for binding in &current_bindings {
-                unsafe { UnregisterHotKey(hwnd, binding.id); }
+                unsafe {
+                    UnregisterHotKey(hwnd, binding.id);
+                }
             }
-            unsafe { DestroyWindow(hwnd); }
+            unsafe {
+                DestroyWindow(hwnd);
+            }
             log::info!("热键监听线程已退出");
         });
 

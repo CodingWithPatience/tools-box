@@ -71,40 +71,54 @@ impl SshClient {
         output_tx: &mpsc::SyncSender<SshOutput>,
     ) -> Result<()> {
         // 建立 TCP 连接（带读取超时）
-        let tcp = std::net::TcpStream::connect(addr)
-            .with_context(|| format!("无法连接到 {}", addr))?;
+        let tcp =
+            std::net::TcpStream::connect(addr).with_context(|| format!("无法连接到 {}", addr))?;
         tcp.set_read_timeout(Some(Duration::from_millis(200)))
             .context("设置 TCP 读取超时失败")?;
 
         // 创建 SSH 会话（握手阶段保持阻塞模式）
-        let mut session = Session::new()
-            .context("创建 SSH 会话失败")?;
+        let mut session = Session::new().context("创建 SSH 会话失败")?;
         session.set_tcp_stream(tcp);
-        session.handshake()
-            .context("SSH 握手失败")?;
+        session.handshake().context("SSH 握手失败")?;
 
         // 认证
         match auth {
-            AuthMethod::Password { encrypted_password, iv, salt } => {
+            AuthMethod::Password {
+                encrypted_password,
+                iv,
+                salt,
+            } => {
                 let password = super::crypto::decrypt_password(encrypted_password, iv, salt)
                     .context("解密 SSH 密码失败")?;
-                session.userauth_password(username, &password)
+                session
+                    .userauth_password(username, &password)
                     .with_context(|| format!("密码认证失败 (用户: {})", username))?;
             }
-            AuthMethod::KeyFile { private_key_path, encrypted_passphrase } => {
+            AuthMethod::KeyFile {
+                private_key_path,
+                encrypted_passphrase,
+            } => {
                 let passphrase = if let Some((ct, iv, salt)) = encrypted_passphrase {
-                    Some(super::crypto::decrypt_password(ct, iv, salt)
-                        .context("解密密钥密码短语失败")?)
+                    Some(
+                        super::crypto::decrypt_password(ct, iv, salt)
+                            .context("解密密钥密码短语失败")?,
+                    )
                 } else {
                     None
                 };
-                session.userauth_pubkey_file(
-                    username,
-                    None,
-                    std::path::Path::new(private_key_path),
-                    passphrase.as_deref(),
-                )
-                .with_context(|| format!("密钥认证失败 (用户: {}, 密钥: {})", username, private_key_path))?;
+                session
+                    .userauth_pubkey_file(
+                        username,
+                        None,
+                        std::path::Path::new(private_key_path),
+                        passphrase.as_deref(),
+                    )
+                    .with_context(|| {
+                        format!(
+                            "密钥认证失败 (用户: {}, 密钥: {})",
+                            username, private_key_path
+                        )
+                    })?;
             }
         }
 
@@ -115,12 +129,15 @@ impl SshClient {
         log::info!("SSH 认证成功: {}@{}", username, addr);
 
         // 请求 PTY + 启动 shell
-        let mut channel = session.channel_session()
-            .context("创建 SSH channel 失败")?;
-        channel.request_pty("xterm-256color", None, Some((cols.into(), rows.into(), 0, 0)))
+        let mut channel = session.channel_session().context("创建 SSH channel 失败")?;
+        channel
+            .request_pty(
+                "xterm-256color",
+                None,
+                Some((cols.into(), rows.into(), 0, 0)),
+            )
             .context("请求 PTY 失败")?;
-        channel.shell()
-            .context("启动 shell 失败")?;
+        channel.shell().context("启动 shell 失败")?;
 
         // 切换到非阻塞模式，避免读写操作永久阻塞
         session.set_blocking(false);
@@ -144,7 +161,8 @@ impl SshClient {
                             }
                             Err(e) => {
                                 log::warn!("写入 SSH channel 失败: {}", e);
-                                let _ = output_tx.send(SshOutput::Disconnected(format!("写入失败: {}", e)));
+                                let _ = output_tx
+                                    .send(SshOutput::Disconnected(format!("写入失败: {}", e)));
                                 return Ok(());
                             }
                         }

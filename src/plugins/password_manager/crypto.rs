@@ -1,6 +1,6 @@
 use aes_gcm::{
-    aead::{Aead, KeyInit, OsRng},
     Aes256Gcm, Nonce,
+    aead::{Aead, KeyInit, OsRng},
 };
 use anyhow::{Context, Result};
 use pbkdf2::pbkdf2;
@@ -73,8 +73,7 @@ pub fn hash_master_password(password: &str, salt: &[u8]) -> Vec<u8> {
 /// # 返回
 /// (密文, iv) - 密文包含 authentication tag
 pub fn encrypt_password(key: &[u8; 32], plaintext: &str) -> Result<(Vec<u8>, Vec<u8>)> {
-    let cipher = Aes256Gcm::new_from_slice(key)
-        .context("无法创建 AES-GCM 密码器")?;
+    let cipher = Aes256Gcm::new_from_slice(key).context("无法创建 AES-GCM 密码器")?;
 
     let iv = generate_iv();
     let nonce = Nonce::from_slice(&iv);
@@ -88,8 +87,7 @@ pub fn encrypt_password(key: &[u8; 32], plaintext: &str) -> Result<(Vec<u8>, Vec
 
 /// 使用 AES-256-GCM 解密密码
 pub fn decrypt_password(key: &[u8; 32], ciphertext: &[u8], iv: &[u8]) -> Result<String> {
-    let cipher = Aes256Gcm::new_from_slice(key)
-        .context("无法创建 AES-GCM 密码器")?;
+    let cipher = Aes256Gcm::new_from_slice(key).context("无法创建 AES-GCM 密码器")?;
 
     let nonce = Nonce::from_slice(iv);
 
@@ -97,8 +95,7 @@ pub fn decrypt_password(key: &[u8; 32], ciphertext: &[u8], iv: &[u8]) -> Result<
         .decrypt(nonce, ciphertext)
         .map_err(|e| anyhow::anyhow!("解密失败: {}", e))?;
 
-    String::from_utf8(plaintext)
-        .context("解密结果不是有效的 UTF-8 文本")
+    String::from_utf8(plaintext).context("解密结果不是有效的 UTF-8 文本")
 }
 
 /// 密码生成配置
@@ -225,7 +222,11 @@ mod tests {
         let duration = start.elapsed();
 
         println!("PBKDF2 derive_key 耗时: {:?}", duration);
-        assert!(duration.as_millis() < 5000, "derive_key 耗时过长: {:?}", duration);
+        assert!(
+            duration.as_millis() < 5000,
+            "derive_key 耗时过长: {:?}",
+            duration
+        );
     }
 
     #[test]
@@ -238,7 +239,11 @@ mod tests {
         let duration = start.elapsed();
 
         println!("hash_master_password 耗时: {:?}", duration);
-        assert!(duration.as_millis() < 5000, "hash_master_password 耗时过长: {:?}", duration);
+        assert!(
+            duration.as_millis() < 5000,
+            "hash_master_password 耗时过长: {:?}",
+            duration
+        );
     }
 
     #[test]
@@ -251,7 +256,11 @@ mod tests {
         let duration = start.elapsed();
 
         println!("hash_master_password_with_key 耗时: {:?}", duration);
-        assert!(duration.as_millis() < 5000, "hash_master_password_with_key 耗时过长: {:?}", duration);
+        assert!(
+            duration.as_millis() < 5000,
+            "hash_master_password_with_key 耗时过长: {:?}",
+            duration
+        );
     }
 
     #[test]
@@ -264,7 +273,11 @@ mod tests {
         let duration = start.elapsed();
 
         println!("encrypt_password 耗时: {:?}", duration);
-        assert!(duration.as_millis() < 100, "encrypt_password 耗时过长: {:?}", duration);
+        assert!(
+            duration.as_millis() < 100,
+            "encrypt_password 耗时过长: {:?}",
+            duration
+        );
     }
 
     #[test]
@@ -278,7 +291,11 @@ mod tests {
         let duration = start.elapsed();
 
         println!("decrypt_password 耗时: {:?}", duration);
-        assert!(duration.as_millis() < 100, "decrypt_password 耗时过长: {:?}", duration);
+        assert!(
+            duration.as_millis() < 100,
+            "decrypt_password 耗时过长: {:?}",
+            duration
+        );
     }
 
     #[test]
@@ -322,7 +339,11 @@ mod tests {
 
         let duration = start.elapsed();
         println!("完整验证流程耗时: {:?}", duration);
-        assert!(duration.as_millis() < 5000, "完整验证流程耗时过长: {:?}", duration);
+        assert!(
+            duration.as_millis() < 5000,
+            "完整验证流程耗时过长: {:?}",
+            duration
+        );
 
         // 测试加密和解密
         let plaintext = "test_password";
@@ -332,6 +353,10 @@ mod tests {
         let duration = start.elapsed();
 
         println!("加密+解密单条记录耗时: {:?}", duration);
-        assert!(duration.as_millis() < 100, "加密+解密耗时过长: {:?}", duration);
+        assert!(
+            duration.as_millis() < 100,
+            "加密+解密耗时过长: {:?}",
+            duration
+        );
     }
 }

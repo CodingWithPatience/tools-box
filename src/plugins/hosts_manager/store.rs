@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 
 /// 环境数据
 #[derive(Debug, Clone)]
@@ -187,10 +187,7 @@ impl<'a> HostsStore<'a> {
     /// 删除环境
     pub fn delete_environment(&self, id: i64) -> Result<()> {
         self.conn
-            .execute(
-                "DELETE FROM hosts_environments WHERE id = ?1",
-                params![id],
-            )
+            .execute("DELETE FROM hosts_environments WHERE id = ?1", params![id])
             .context("删除环境失败")?;
         Ok(())
     }
@@ -263,7 +260,13 @@ impl<'a> HostsStore<'a> {
     }
 
     /// 更新条目
-    pub fn update_entry(&self, id: i64, ip: &str, hostname: &str, comment: &Option<String>) -> Result<()> {
+    pub fn update_entry(
+        &self,
+        id: i64,
+        ip: &str,
+        hostname: &str,
+        comment: &Option<String>,
+    ) -> Result<()> {
         self.conn
             .execute(
                 "UPDATE hosts_entries SET ip_address = ?1, hostname = ?2, comment = ?3 WHERE id = ?4",
@@ -294,7 +297,8 @@ impl<'a> HostsStore<'a> {
 
     /// 获取环境下的条目数量
     pub fn count_entries(&self, env_id: i64) -> Result<usize> {
-        let count: usize = self.conn
+        let count: usize = self
+            .conn
             .query_row(
                 "SELECT COUNT(*) FROM hosts_entries WHERE environment_id = ?1",
                 params![env_id],

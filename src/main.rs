@@ -13,8 +13,7 @@ use plugins::settings::AppSettings;
 use storage::Database;
 
 fn main() -> eframe::Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     log::info!("Tools Box 启动中...");
 
