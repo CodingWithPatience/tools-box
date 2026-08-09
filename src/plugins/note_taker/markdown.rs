@@ -1,4 +1,5 @@
-use egui::{Color32, RichText, Ui};
+use egui::text::{LayoutJob, TextFormat};
+use egui::{Color32, FontId, RichText, Stroke, Ui};
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag};
 
 /// 解析后的 Markdown 文档。
@@ -518,11 +519,24 @@ impl MarkdownRenderer {
     /// 渲染 Markdown 内容到 egui UI。
     pub fn render(&mut self, ui: &mut Ui, markdown: &str) {
         let document = MarkdownDocument::parse(markdown);
+        if document.blocks.is_empty() {
+            let weak_text_color = ui.visuals().weak_text_color();
+            ui.vertical_centered(|ui| {
+                ui.add_space(32.0);
+                ui.label(
+                    RichText::new("暂无可预览内容")
+                        .color(weak_text_color)
+                        .italics(),
+                );
+            });
+            return;
+        }
         self.render_blocks(ui, &document.blocks, 0);
     }
 
     fn render_blocks(&self, ui: &mut Ui, blocks: &[MarkdownBlock], list_depth: usize) {
-        for block in blocks {
+        for (block_index, block) in blocks.iter().enumerate() {
+            let is_last_block = block_index + 1 == blocks.len();
             match block {
                 MarkdownBlock::Heading { level, content } => {
                     let style = InlineStyle {
@@ -530,22 +544,45 @@ impl MarkdownRenderer {
                         size: Some(heading_size(*level)),
                         ..InlineStyle::default()
                     };
-                    ui.add_space(8.0);
-                    ui.horizontal_wrapped(|ui| self.render_inlines(ui, content, style));
-                    ui.add_space(4.0);
+                    ui.add_space(12.0);
+                    self.render_inlines(ui, content, style);
+                    if !is_last_block {
+                        ui.add_space(6.0);
+                    }
                 }
                 MarkdownBlock::Paragraph(content) => {
-                    ui.horizontal_wrapped(|ui| {
-                        self.render_inlines(ui, content, InlineStyle::default());
-                    });
-                    ui.add_space(6.0);
+                    self.render_inlines(ui, content, InlineStyle::default());
+                    if !is_last_block {
+                        ui.add_space(8.0);
+                    }
                 }
                 MarkdownBlock::Quote(content) => {
-                    ui.horizontal_top(|ui| {
-                        ui.label(RichText::new("│").color(Color32::GRAY));
-                        ui.vertical(|ui| self.render_blocks(ui, content, list_depth));
-                    });
-                    ui.add_space(6.0);
+                    let quote_stroke =
+                        Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color);
+                    let quote_accent = ui.visuals().selection.bg_fill;
+                    let quote_content_width = (ui.available_width() - 28.0).max(0.0);
+                    let quote_rect = egui::Frame::new()
+                        .fill(ui.visuals().faint_bg_color)
+                        .stroke(quote_stroke)
+                        .inner_margin(egui::Margin::symmetric(14, 8))
+                        .show(ui, |ui| {
+                            ui.set_min_width(quote_content_width);
+                            ui.set_max_width(quote_content_width);
+                            self.render_blocks(ui, content, list_depth);
+                        })
+                        .response
+                        .rect;
+                    let quote_line_x = quote_rect.left() + 6.0;
+                    ui.painter().line_segment(
+                        [
+                            egui::pos2(quote_line_x, quote_rect.top() + 1.0),
+                            egui::pos2(quote_line_x, quote_rect.bottom() - 1.0),
+                        ],
+                        Stroke::new(2.0, quote_accent),
+                    );
+                    if !is_last_block {
+                        ui.add_space(8.0);
+                    }
                 }
                 MarkdownBlock::List {
                     ordered,
@@ -569,28 +606,49 @@ impl MarkdownRenderer {
                             } else {
                                 format!("{} ", marker)
                             };
-                            ui.label(marker);
+                            ui.label(
+                                RichText::new(marker)
+                                    .color(ui.visuals().weak_text_color())
+                                    .strong(),
+                            );
                             ui.vertical(|ui| {
                                 self.render_blocks(ui, &item.blocks, list_depth + 1);
                             });
+                            ui.add_space(2.0);
                         });
                     }
-                    ui.add_space(4.0);
+                    if !is_last_block {
+                        ui.add_space(8.0);
+                    }
                 }
                 MarkdownBlock::CodeBlock { language, content } => {
-                    ui.group(|ui| {
-                        if let Some(language) = language {
-                            ui.label(RichText::new(language).small().strong());
-                        }
-                        let mut code = content.clone();
-                        ui.add(
-                            egui::TextEdit::multiline(&mut code)
-                                .code_editor()
-                                .interactive(false)
-                                .desired_width(f32::INFINITY),
-                        );
-                    });
-                    ui.add_space(6.0);
+                    let code_stroke =
+                        Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color);
+                    egui::Frame::new()
+                        .fill(ui.visuals().code_bg_color)
+                        .stroke(code_stroke)
+                        .inner_margin(egui::Margin::symmetric(8, 6))
+                        .show(ui, |ui| {
+                            if let Some(language) = language {
+                                ui.label(
+                                    RichText::new(language)
+                                        .small()
+                                        .strong()
+                                        .color(ui.visuals().weak_text_color()),
+                                );
+                                ui.add_space(2.0);
+                            }
+                            let mut code = content.clone();
+                            ui.add(
+                                egui::TextEdit::multiline(&mut code)
+                                    .code_editor()
+                                    .interactive(false)
+                                    .desired_width(f32::INFINITY),
+                            );
+                        });
+                    if !is_last_block {
+                        ui.add_space(8.0);
+                    }
                 }
                 MarkdownBlock::Table {
                     alignments: _,
@@ -615,11 +673,16 @@ impl MarkdownRenderer {
                             }
                         });
                     self.paint_table_grid(ui, &cell_rects);
-                    ui.add_space(6.0);
+                    if !is_last_block {
+                        ui.add_space(8.0);
+                    }
                 }
                 MarkdownBlock::ThematicBreak => {
-                    ui.separator();
                     ui.add_space(4.0);
+                    ui.separator();
+                    if !is_last_block {
+                        ui.add_space(8.0);
+                    }
                 }
             }
         }
@@ -640,16 +703,14 @@ impl MarkdownRenderer {
             .fill(fill)
             .inner_margin(egui::Margin::symmetric(6, 4))
             .show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    self.render_inlines(
-                        ui,
-                        content,
-                        InlineStyle {
-                            strong: header,
-                            ..InlineStyle::default()
-                        },
-                    );
-                });
+                self.render_inlines(
+                    ui,
+                    content,
+                    InlineStyle {
+                        strong: header,
+                        ..InlineStyle::default()
+                    },
+                );
             });
         response.response.rect
     }
@@ -665,74 +726,96 @@ impl MarkdownRenderer {
         let stroke = ui.visuals().widgets.noninteractive.bg_stroke;
         let painter = ui.painter();
 
+        let mut x_boundaries = vec![table_rect.left(), table_rect.right()];
+        let mut y_boundaries = vec![table_rect.top(), table_rect.bottom()];
         for rect in cell_rects {
+            if rect.left() > table_rect.left() + 0.5 && rect.left() < table_rect.right() - 0.5 {
+                x_boundaries.push(rect.left());
+            }
+            if rect.top() > table_rect.top() + 0.5 && rect.top() < table_rect.bottom() - 0.5 {
+                y_boundaries.push(rect.top());
+            }
+        }
+
+        x_boundaries.sort_by(f32::total_cmp);
+        y_boundaries.sort_by(f32::total_cmp);
+        x_boundaries.dedup_by(|left, right| (*left - *right).abs() < 0.5);
+        y_boundaries.dedup_by(|top, bottom| (*top - *bottom).abs() < 0.5);
+
+        for y in y_boundaries {
             painter.line_segment(
                 [
-                    egui::pos2(rect.left(), rect.top()),
-                    egui::pos2(rect.right(), rect.top()),
-                ],
-                stroke,
-            );
-            painter.line_segment(
-                [
-                    egui::pos2(rect.left(), rect.top()),
-                    egui::pos2(rect.left(), rect.bottom()),
+                    egui::pos2(table_rect.left(), y),
+                    egui::pos2(table_rect.right(), y),
                 ],
                 stroke,
             );
         }
-        painter.line_segment(
-            [
-                egui::pos2(table_rect.right(), table_rect.top()),
-                egui::pos2(table_rect.right(), table_rect.bottom()),
-            ],
-            stroke,
-        );
-        painter.line_segment(
-            [
-                egui::pos2(table_rect.left(), table_rect.bottom()),
-                egui::pos2(table_rect.right(), table_rect.bottom()),
-            ],
-            stroke,
-        );
+        for x in x_boundaries {
+            painter.line_segment(
+                [
+                    egui::pos2(x, table_rect.top()),
+                    egui::pos2(x, table_rect.bottom()),
+                ],
+                stroke,
+            );
+        }
     }
 
     fn render_inlines(&self, ui: &mut Ui, inlines: &[MarkdownInline], style: InlineStyle) {
+        let mut job = LayoutJob::default();
+        self.append_inlines_to_job(ui, inlines, style, &mut job);
+        ui.add(egui::Label::new(job).wrap());
+    }
+
+    fn append_inlines_to_job(
+        &self,
+        ui: &Ui,
+        inlines: &[MarkdownInline],
+        style: InlineStyle,
+        job: &mut LayoutJob,
+    ) {
         for inline in inlines {
             match inline {
-                MarkdownInline::Text(text) => self.render_text(ui, text, style, false),
-                MarkdownInline::Emphasis(content) => self.render_inlines(
+                MarkdownInline::Text(text) => self.append_text_to_job(ui, text, style, false, job),
+                MarkdownInline::Emphasis(content) => self.append_inlines_to_job(
                     ui,
                     content,
                     InlineStyle {
                         emphasis: true,
                         ..style
                     },
+                    job,
                 ),
-                MarkdownInline::Strong(content) => self.render_inlines(
+                MarkdownInline::Strong(content) => self.append_inlines_to_job(
                     ui,
                     content,
                     InlineStyle {
                         strong: true,
                         ..style
                     },
+                    job,
                 ),
-                MarkdownInline::Strikethrough(content) => self.render_inlines(
+                MarkdownInline::Strikethrough(content) => self.append_inlines_to_job(
                     ui,
                     content,
                     InlineStyle {
                         strikethrough: true,
                         ..style
                     },
+                    job,
                 ),
-                MarkdownInline::Code(code) => self.render_text(ui, code, style, true),
-                MarkdownInline::Link { content, .. } => self.render_inlines(
+                MarkdownInline::Code(code) => {
+                    self.append_text_to_job(ui, code, style, true, job);
+                }
+                MarkdownInline::Link { content, .. } => self.append_inlines_to_job(
                     ui,
                     content,
                     InlineStyle {
                         link: true,
                         ..style
                     },
+                    job,
                 ),
                 MarkdownInline::Image {
                     alt, destination, ..
@@ -742,42 +825,63 @@ impl MarkdownRenderer {
                     } else {
                         format!("[图片: {alt} · {destination}]")
                     };
-                    self.render_text(ui, &text, style, false);
+                    self.append_text_to_job(ui, &text, style, false, job);
                 }
                 MarkdownInline::SoftBreak => {
-                    ui.label(" ");
+                    self.append_text_to_job(ui, "\n", style, false, job);
                 }
                 MarkdownInline::HardBreak => {
-                    ui.label("\n");
+                    self.append_text_to_job(ui, "\n", style, false, job);
                 }
-                MarkdownInline::Html(html) => self.render_text(ui, html, style, false),
+                MarkdownInline::Html(html) => {
+                    self.append_text_to_job(ui, html, style, false, job);
+                }
             }
         }
     }
 
-    fn render_text(&self, ui: &mut Ui, text: &str, style: InlineStyle, code: bool) {
-        let mut rich_text = RichText::new(text.to_owned());
-        if style.strong {
-            rich_text = rich_text.strong();
-        }
-        if style.emphasis {
-            rich_text = rich_text.italics();
-        }
+    fn append_text_to_job(
+        &self,
+        ui: &Ui,
+        text: &str,
+        style: InlineStyle,
+        code: bool,
+        job: &mut LayoutJob,
+    ) {
+        let color = if style.link {
+            ui.visuals().hyperlink_color
+        } else if style.strong {
+            ui.visuals().strong_text_color()
+        } else {
+            ui.visuals().text_color()
+        };
+        let font_size = style.size.unwrap_or_else(|| {
+            ui.style()
+                .text_styles
+                .get(&egui::TextStyle::Body)
+                .map(|font_id| font_id.size)
+                .unwrap_or(14.0)
+        });
+        let mut format = TextFormat {
+            font_id: if code {
+                FontId::monospace(font_size)
+            } else {
+                FontId::proportional(font_size)
+            },
+            color,
+            ..TextFormat::default()
+        };
+        format.italics = style.emphasis;
         if style.strikethrough {
-            rich_text = rich_text.strikethrough();
+            format.strikethrough = Stroke::new(1.0, color);
         }
         if style.link {
-            rich_text = rich_text.color(ui.visuals().hyperlink_color).underline();
+            format.underline = Stroke::new(1.0, color);
         }
         if code {
-            rich_text = rich_text
-                .monospace()
-                .background_color(ui.visuals().faint_bg_color);
+            format.background = ui.visuals().code_bg_color;
         }
-        if let Some(size) = style.size {
-            rich_text = rich_text.size(size);
-        }
-        ui.label(rich_text);
+        job.append(text, 0.0, format);
     }
 }
 
@@ -890,6 +994,33 @@ mod tests {
             MarkdownBlock::CodeBlock { language, content }
                 if language.as_deref() == Some("rust") && content.contains("fn main")
         ));
+    }
+
+    #[test]
+    fn should_parse_soft_break_without_inserting_space() {
+        let document = MarkdownDocument::parse("第一行\n第二行");
+
+        assert_eq!(
+            document.blocks[0],
+            MarkdownBlock::Paragraph(vec![
+                MarkdownInline::Text("第一行".to_string()),
+                MarkdownInline::SoftBreak,
+                MarkdownInline::Text("第二行".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn should_keep_blank_line_between_paragraphs_without_leading_space() {
+        let document = MarkdownDocument::parse("第一段\n\n第二段");
+
+        assert_eq!(
+            document.blocks,
+            vec![
+                MarkdownBlock::Paragraph(vec![MarkdownInline::Text("第一段".to_string())]),
+                MarkdownBlock::Paragraph(vec![MarkdownInline::Text("第二段".to_string())]),
+            ]
+        );
     }
 
     #[test]
