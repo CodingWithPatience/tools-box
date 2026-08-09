@@ -46,4 +46,4 @@
 - 变更涉及重构时，需保证原有单元测试全部通过，且为新逻辑补充测试。
 
 # 构建规则
-- 根据构建 skill [build.md](./.Codex/skills/build.md) 按需执行构建操作
+- 根据构建 skill [build.md](./.codex/skills/build.md) 按需执行构建操作
