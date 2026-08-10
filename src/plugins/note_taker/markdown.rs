@@ -706,7 +706,9 @@ impl MarkdownRenderer {
                                     block_index,
                                     scroll_id,
                                 ))
-                                .auto_shrink([false, false])
+                                // 仅关闭水平方向收缩，垂直方向必须按代码实际高度收缩，
+                                // 否则第一个嵌套水平滚动区会占满父级剩余高度。
+                                .auto_shrink([false, true])
                                 .show(ui, |ui| {
                                     ui.add(egui::Label::new(code_job).extend());
                                 });

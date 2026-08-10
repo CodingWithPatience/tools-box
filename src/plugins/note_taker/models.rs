@@ -52,12 +52,12 @@ impl NoteForm {
             tags: entry.tags.join(", "),
         }
     }
-
 }
 
 /// 视图模式
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum NoteViewMode {
     Edit,
     Preview,
+    Split,
 }

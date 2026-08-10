@@ -27,6 +27,12 @@ pub struct NoteTakerUi {
     form: NoteForm,
     /// 视图模式
     view_mode: NoteViewMode,
+    /// 编辑区纵向滚动偏移
+    editor_scroll_offset: f32,
+    /// 预览区纵向滚动偏移
+    preview_scroll_offset: f32,
+    /// 模式切换后待同步的滚动偏移
+    pending_scroll_sync: Option<f32>,
     /// 搜索关键词
     search_query: String,
     /// 是否显示搜索
@@ -57,6 +63,9 @@ impl NoteTakerUi {
             show_favorites: false,
             form: NoteForm::empty(),
             view_mode: NoteViewMode::Edit,
+            editor_scroll_offset: 0.0,
+            preview_scroll_offset: 0.0,
+            pending_scroll_sync: None,
             search_query: String::new(),
             show_search: false,
             show_folder_dialog: false,
@@ -404,10 +413,11 @@ impl NoteTakerUi {
         // 标题编辑
         ui.horizontal(|ui| {
             ui.label("标题:");
+            let title_width = (ui.available_width() - 280.0).max(120.0);
             ui.add(
                 egui::TextEdit::singleline(&mut self.form.title)
                     .hint_text("输入笔记标题")
-                    .desired_width(ui.available_width() - 100.0),
+                    .desired_width(title_width),
             );
 
             // 视图切换按钮
@@ -415,13 +425,26 @@ impl NoteTakerUi {
                 .selectable_label(self.view_mode == NoteViewMode::Edit, "编辑")
                 .clicked()
             {
-                self.view_mode = NoteViewMode::Edit;
+                self.set_view_mode(NoteViewMode::Edit);
             }
             if ui
                 .selectable_label(self.view_mode == NoteViewMode::Preview, "预览")
                 .clicked()
             {
-                self.view_mode = NoteViewMode::Preview;
+                self.set_view_mode(NoteViewMode::Preview);
+            }
+            if ui
+                .selectable_label(self.view_mode == NoteViewMode::Split, "分栏")
+                .clicked()
+            {
+                self.set_view_mode(NoteViewMode::Split);
+            }
+            if ui
+                .button("复制 Markdown")
+                .on_hover_text("复制当前笔记的 Markdown 原文")
+                .clicked()
+            {
+                ui.ctx().copy_text(self.form.content.clone());
             }
         });
 
@@ -431,27 +454,84 @@ impl NoteTakerUi {
         let bottom_bar_height = 40.0;
         let content_height = (ui.available_height() - bottom_bar_height).max(200.0);
 
+        if let Some(offset) = self.pending_scroll_sync.take() {
+            match self.view_mode {
+                NoteViewMode::Edit => self.editor_scroll_offset = offset,
+                NoteViewMode::Preview => self.preview_scroll_offset = offset,
+                NoteViewMode::Split => {
+                    self.editor_scroll_offset = offset;
+                    self.preview_scroll_offset = offset;
+                }
+            }
+        }
+
         match self.view_mode {
             NoteViewMode::Edit => {
-                egui::ScrollArea::vertical()
+                let output = egui::ScrollArea::vertical()
                     .id_salt("note_content_scroll")
                     .max_height(content_height)
+                    .vertical_scroll_offset(self.editor_scroll_offset)
                     .show(ui, |ui| {
-                        ui.add_sized(
-                            [ui.available_width(), content_height],
+                        // multiline TextEdit 内容自然撑开，由外层 ScrollArea 统一管理滚动。
+                        let editor_width = ui.available_width();
+                        ui.add(
                             egui::TextEdit::multiline(&mut self.form.content)
                                 .hint_text("输入笔记内容，支持 Markdown 格式")
+                                .desired_width(editor_width)
+                                .min_size(egui::vec2(editor_width, content_height))
                                 .code_editor(),
                         );
                     });
+                self.editor_scroll_offset = output.state.offset.y;
             }
             NoteViewMode::Preview => {
-                egui::ScrollArea::vertical()
+                let output = egui::ScrollArea::vertical()
                     .id_salt("note_preview_scroll")
                     .max_height(content_height)
+                    .vertical_scroll_offset(self.preview_scroll_offset)
                     .show(ui, |ui| {
                         self.markdown_renderer.render(ui, &self.form.content);
                     });
+                self.preview_scroll_offset = output.state.offset.y;
+            }
+            NoteViewMode::Split => {
+                ui.columns(2, |columns| {
+                    let editor_width = columns[0].available_width();
+                    let previous_editor_scroll_offset = self.editor_scroll_offset;
+                    let editor_output = egui::ScrollArea::vertical()
+                        .id_salt("note_split_editor_scroll")
+                        .max_height(content_height)
+                        .vertical_scroll_offset(self.editor_scroll_offset)
+                        .show(&mut columns[0], |ui| {
+                            // multiline TextEdit 内容自然撑开，由源码栏统一管理滚动。
+                            ui.add(
+                                egui::TextEdit::multiline(&mut self.form.content)
+                                    .hint_text("输入笔记内容，支持 Markdown 格式")
+                                    .desired_width(editor_width)
+                                    .min_size(egui::vec2(editor_width, content_height))
+                                    .code_editor(),
+                            );
+                        });
+                    self.editor_scroll_offset = editor_output.state.offset.y;
+
+                    let editor_scroll_changed = Self::has_scroll_offset_changed(
+                        previous_editor_scroll_offset,
+                        self.editor_scroll_offset,
+                    );
+                    if editor_scroll_changed {
+                        self.preview_scroll_offset = self.editor_scroll_offset;
+                    }
+
+                    let preview_output = egui::ScrollArea::vertical()
+                        .id_salt("note_split_preview_scroll")
+                        .max_height(content_height)
+                        .vertical_scroll_offset(self.preview_scroll_offset)
+                        .show(&mut columns[1], |ui| {
+                            self.markdown_renderer.render(ui, &self.form.content);
+                        });
+                    // 预览栏保留独立滚动能力，但其滚动位置不会反向修改源码栏。
+                    self.preview_scroll_offset = preview_output.state.offset.y;
+                });
             }
         }
 
@@ -614,6 +694,9 @@ impl NoteTakerUi {
                 self.selected_note_id = Some(note_id);
                 self.form = NoteForm::from_entry(&note);
                 self.view_mode = NoteViewMode::Edit;
+                self.editor_scroll_offset = 0.0;
+                self.preview_scroll_offset = 0.0;
+                self.pending_scroll_sync = None;
             }
             Ok(None) => {
                 self.error = Some("笔记不存在".to_string());
@@ -622,6 +705,29 @@ impl NoteTakerUi {
                 self.error = Some(format!("加载笔记失败: {}", e));
             }
         }
+    }
+
+    /// 切换视图模式并同步目标模式的滚动位置
+    fn set_view_mode(&mut self, mode: NoteViewMode) {
+        if self.view_mode == mode {
+            return;
+        }
+
+        let offset = match mode {
+            NoteViewMode::Edit => self.preview_scroll_offset,
+            NoteViewMode::Preview => self.editor_scroll_offset,
+            NoteViewMode::Split => match self.view_mode {
+                NoteViewMode::Preview => self.preview_scroll_offset,
+                NoteViewMode::Edit | NoteViewMode::Split => self.editor_scroll_offset,
+            },
+        };
+        self.view_mode = mode;
+        self.pending_scroll_sync = Some(offset);
+    }
+
+    /// 判断源码栏滚动位置是否发生变化
+    fn has_scroll_offset_changed(previous: f32, current: f32) -> bool {
+        (current - previous).abs() > f32::EPSILON
     }
 
     /// 创建新笔记
@@ -758,5 +864,30 @@ impl NoteTakerUi {
         } else {
             "未分类".to_string()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_sync_scroll_position_when_switching_view_mode() {
+        let mut ui = NoteTakerUi::new();
+        ui.editor_scroll_offset = 120.0;
+        ui.preview_scroll_offset = 40.0;
+
+        ui.set_view_mode(NoteViewMode::Preview);
+        assert_eq!(ui.pending_scroll_sync, Some(120.0));
+
+        ui.pending_scroll_sync = None;
+        ui.set_view_mode(NoteViewMode::Edit);
+        assert_eq!(ui.pending_scroll_sync, Some(40.0));
+    }
+
+    #[test]
+    fn should_detect_editor_scroll_changes() {
+        assert!(NoteTakerUi::has_scroll_offset_changed(0.0, 1.0));
+        assert!(!NoteTakerUi::has_scroll_offset_changed(12.0, 12.0));
     }
 }
