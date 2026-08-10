@@ -292,11 +292,30 @@ cargo build
 
 阶段 2 验证通过后，下一步进入阶段 3：代码块增强。
 
-### 阶段 3：代码块增强（待实施）
+### 阶段 3：代码块增强（已完成）
 
-- 使用代码块语言标识接入 `syntect`
-- 增加只读代码块、复制代码和长代码水平滚动
-- 缓存语法高亮结果
+实现文件：`src/plugins/note_taker/markdown.rs`，复用 `src/utils/highlight.rs` 的 `SyntaxHighlighter`。
+
+已完成内容：
+
+- 使用代码块语言标识接入现有 `syntect` 高亮器，未知语言自动回退为纯文本
+- 代码块改为只读 `LayoutJob` 渲染，不再使用可编辑的 `TextEdit`
+- 增加“复制”按钮，通过 egui 输出命令复制代码原文
+- 代码块内容使用水平滚动区域承载，长代码行不会被强制折行
+- 按代码内容、语言、主题和等宽字号缓存高亮结果，缓存最多保留 128 条，减少重复解析并避免无界增长
+
+验证方式：
+
+```text
+rustfmt --edition 2024 --check src/plugins/note_taker/markdown.rs
+cargo test
+cargo build
+cargo build --release
+```
+
+验证结果：Markdown 模块 9 个测试通过，Debug 构建通过；标准 Release 输出目录中的可执行文件曾被占用，因此使用独立输出目录完成 Release 构建通过。最终全量测试通过（100 个通过、1 个忽略）。
+
+阶段 3 实现完成后，下一步进入阶段 4：编辑与预览交互。
 
 ### 阶段 4：编辑与预览交互（待实施）
 

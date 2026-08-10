@@ -1,6 +1,12 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
+
 use egui::text::{LayoutJob, TextFormat};
 use egui::{Color32, FontId, RichText, Stroke, Ui};
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag};
+
+use crate::utils::highlight::SyntaxHighlighter;
 
 /// 解析后的 Markdown 文档。
 #[derive(Debug, Clone, PartialEq)]
@@ -499,7 +505,36 @@ fn collect_text_into(node: &RawNode, output: &mut String) {
 /// Markdown 渲染器。
 ///
 /// 渲染器负责将 [`MarkdownDocument`] 映射为 egui 控件，解析逻辑由文档模型负责。
-pub struct MarkdownRenderer;
+pub struct MarkdownRenderer {
+    highlighter: SyntaxHighlighter,
+    code_highlight_cache: RefCell<HashMap<u64, CodeHighlightCacheEntry>>,
+}
+
+/// 单条代码高亮缓存，保存完整上下文以避免哈希碰撞返回错误结果。
+struct CodeHighlightCacheEntry {
+    content: String,
+    language: Option<String>,
+    font_size_bits: u32,
+    is_dark_mode: bool,
+    job: LayoutJob,
+}
+
+impl CodeHighlightCacheEntry {
+    fn matches(
+        &self,
+        content: &str,
+        language: Option<&str>,
+        font_size: f32,
+        is_dark_mode: bool,
+    ) -> bool {
+        self.content == content
+            && self.language.as_deref() == language
+            && self.font_size_bits == font_size.to_bits()
+            && self.is_dark_mode == is_dark_mode
+    }
+}
+
+const MAX_CODE_HIGHLIGHT_CACHE_ENTRIES: usize = 128;
 
 #[derive(Clone, Copy, Default)]
 struct InlineStyle {
@@ -513,7 +548,10 @@ struct InlineStyle {
 impl MarkdownRenderer {
     /// 创建新的渲染器实例。
     pub fn new() -> Self {
-        Self
+        Self {
+            highlighter: SyntaxHighlighter::new(),
+            code_highlight_cache: RefCell::new(HashMap::new()),
+        }
     }
 
     /// 渲染 Markdown 内容到 egui UI。
@@ -629,22 +667,49 @@ impl MarkdownRenderer {
                         .stroke(code_stroke)
                         .inner_margin(egui::Margin::symmetric(8, 6))
                         .show(ui, |ui| {
-                            if let Some(language) = language {
-                                ui.label(
-                                    RichText::new(language)
-                                        .small()
-                                        .strong()
-                                        .color(ui.visuals().weak_text_color()),
+                            ui.horizontal(|ui| {
+                                if let Some(language) = language {
+                                    ui.label(
+                                        RichText::new(language)
+                                            .small()
+                                            .strong()
+                                            .color(ui.visuals().weak_text_color()),
+                                    );
+                                } else {
+                                    ui.label(
+                                        RichText::new("纯文本")
+                                            .small()
+                                            .color(ui.visuals().weak_text_color()),
+                                    );
+                                }
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui.small_button("复制").clicked() {
+                                            ui.ctx().copy_text(content.clone());
+                                        }
+                                    },
                                 );
-                                ui.add_space(2.0);
-                            }
-                            let mut code = content.clone();
-                            ui.add(
-                                egui::TextEdit::multiline(&mut code)
-                                    .code_editor()
-                                    .interactive(false)
-                                    .desired_width(f32::INFINITY),
+                            });
+                            ui.add_space(4.0);
+                            let code_job = self.highlight_code(ui, language.as_deref(), content);
+                            let scroll_id = code_highlight_cache_key(
+                                content,
+                                language.as_deref(),
+                                monospace_font_size(ui),
+                                ui.visuals().dark_mode,
                             );
+                            egui::ScrollArea::horizontal()
+                                .id_salt((
+                                    "markdown_code_block",
+                                    list_depth,
+                                    block_index,
+                                    scroll_id,
+                                ))
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    ui.add(egui::Label::new(code_job).extend());
+                                });
                         });
                     if !is_last_block {
                         ui.add_space(8.0);
@@ -840,6 +905,39 @@ impl MarkdownRenderer {
         }
     }
 
+    fn highlight_code(&self, ui: &Ui, language: Option<&str>, content: &str) -> LayoutJob {
+        let font_size = monospace_font_size(ui);
+        let is_dark_mode = ui.visuals().dark_mode;
+        let cache_key = code_highlight_cache_key(content, language, font_size, is_dark_mode);
+
+        if let Some(entry) = self.code_highlight_cache.borrow().get(&cache_key) {
+            if entry.matches(content, language, font_size, is_dark_mode) {
+                return entry.job.clone();
+            }
+        }
+
+        let job =
+            self.highlighter
+                .highlight_to_layout_job(content, language, font_size, is_dark_mode);
+        let mut cache = self.code_highlight_cache.borrow_mut();
+        if !cache.contains_key(&cache_key) && cache.len() >= MAX_CODE_HIGHLIGHT_CACHE_ENTRIES {
+            if let Some(evicted_key) = cache.keys().next().copied() {
+                cache.remove(&evicted_key);
+            }
+        }
+        cache.insert(
+            cache_key,
+            CodeHighlightCacheEntry {
+                content: content.to_owned(),
+                language: language.map(str::to_owned),
+                font_size_bits: font_size.to_bits(),
+                is_dark_mode,
+                job: job.clone(),
+            },
+        );
+        job
+    }
+
     fn append_text_to_job(
         &self,
         ui: &Ui,
@@ -885,6 +983,28 @@ impl MarkdownRenderer {
     }
 }
 
+fn code_highlight_cache_key(
+    content: &str,
+    language: Option<&str>,
+    font_size: f32,
+    is_dark_mode: bool,
+) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    content.hash(&mut hasher);
+    language.hash(&mut hasher);
+    font_size.to_bits().hash(&mut hasher);
+    is_dark_mode.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn monospace_font_size(ui: &Ui) -> f32 {
+    ui.style()
+        .text_styles
+        .get(&egui::TextStyle::Monospace)
+        .map(|font_id| font_id.size)
+        .unwrap_or(14.0)
+}
+
 fn heading_size(level: u8) -> f32 {
     match level {
         1 => 24.0,
@@ -902,7 +1022,10 @@ fn list_indent(depth: usize) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{MarkdownBlock, MarkdownDocument, MarkdownInline, MarkdownTableAlignment};
+    use super::{
+        MarkdownBlock, MarkdownDocument, MarkdownInline, MarkdownTableAlignment, SyntaxHighlighter,
+        code_highlight_cache_key,
+    };
 
     #[test]
     fn should_parse_nested_inline_styles() {
@@ -994,6 +1117,45 @@ mod tests {
             MarkdownBlock::CodeBlock { language, content }
                 if language.as_deref() == Some("rust") && content.contains("fn main")
         ));
+    }
+
+    #[test]
+    fn should_separate_code_highlight_cache_by_render_context() {
+        let base = code_highlight_cache_key("fn main() {}", Some("rust"), 14.0, true);
+
+        assert_eq!(
+            base,
+            code_highlight_cache_key("fn main() {}", Some("rust"), 14.0, true)
+        );
+        assert_ne!(
+            base,
+            code_highlight_cache_key("fn main() { println!(); }", Some("rust"), 14.0, true)
+        );
+        assert_ne!(
+            base,
+            code_highlight_cache_key("fn main() {}", Some("python"), 14.0, true)
+        );
+        assert_ne!(
+            base,
+            code_highlight_cache_key("fn main() {}", Some("rust"), 16.0, true)
+        );
+        assert_ne!(
+            base,
+            code_highlight_cache_key("fn main() {}", Some("rust"), 14.0, false)
+        );
+    }
+
+    #[test]
+    fn should_fallback_to_plain_text_for_unknown_code_language() {
+        let highlighter = SyntaxHighlighter::new();
+        let job = highlighter.highlight_to_layout_job(
+            "这是一段未知语言代码",
+            Some("unknown-language"),
+            14.0,
+            true,
+        );
+
+        assert_eq!(job.text, "这是一段未知语言代码");
     }
 
     #[test]
