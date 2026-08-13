@@ -7,7 +7,7 @@ use super::client::SshClient;
 use super::crypto;
 use super::models::{
     AuthMethod, AuthType, NewSession, SessionForm, SessionState, SessionTab, SessionViewTab,
-    SftpRequest, SftpResponse, SshInput, SshOutput,
+    SftpControl, SftpRequest, SftpResponse, SshInput, SshOutput, fail_unfinished_transfers,
 };
 use super::sftp::{self, SftpClient};
 use super::store::SshStore;
@@ -202,13 +202,41 @@ impl SshClientUi {
         }
     }
 
-    /// 请求刷新远程文件列表
-    fn refresh_remote_files(&mut self) {
+    /// 请求加载指定远程目录，成功响应后再更新当前目录
+    fn request_remote_directory(&mut self, path: String) {
         let Some(tab) = self.current_tab_mut() else {
             return;
         };
-        if let Some(tx) = &tab.sftp_tx {
-            let _ = tx.send(SftpRequest::ListDirectory(tab.remote_current_dir.clone()));
+        if let Err(error) = send_remote_directory_request(tab.sftp_tx.as_ref(), path) {
+            tab.remote_dir_input = tab.remote_current_dir.clone();
+            tab.sftp_status_msg = error;
+        }
+    }
+
+    /// 将文件传输任务加入队列
+    fn enqueue_transfer(&mut self, task: super::models::TransferTask) {
+        let Some(tab) = self.current_tab_mut() else {
+            return;
+        };
+        if has_active_transfer(&tab.transfer_tasks, &task.source, &task.destination) {
+            tab.sftp_status_msg = format!("传输任务已存在: {}", task.filename);
+            return;
+        }
+
+        let request = match task.direction {
+            super::models::TransferDirection::Upload => SftpRequest::Upload(task.clone()),
+            super::models::TransferDirection::Download => SftpRequest::Download(task.clone()),
+        };
+        match tab.sftp_tx.as_ref().map(|tx| tx.try_send(request)) {
+            Some(Ok(())) => {
+                tab.transfer_tasks.push(task);
+            }
+            Some(Err(mpsc::TrySendError::Full(_))) => {
+                tab.sftp_status_msg = "SFTP 请求队列已满，请稍后重试".to_string();
+            }
+            Some(Err(mpsc::TrySendError::Disconnected(_))) | None => {
+                tab.sftp_status_msg = "SFTP 未连接，无法创建传输任务".to_string();
+            }
         }
     }
 
@@ -231,11 +259,12 @@ impl SshClientUi {
         let auth = session.auth_method.clone();
 
         match SftpClient::connect(&host, port, &username, &auth) {
-            Ok((tx, rx)) => {
+            Ok((tx, control_tx, rx)) => {
                 let Some(tab) = self.current_tab_mut() else {
                     return;
                 };
                 tab.sftp_tx = Some(tx);
+                tab.sftp_control_tx = Some(control_tx);
                 tab.sftp_rx = Some(rx);
                 log::info!("SFTP 连接已发起");
             }
@@ -414,8 +443,13 @@ impl SshClientUi {
                         Ok(msg) => messages.push(msg),
                         Err(mpsc::TryRecvError::Empty) => break,
                         Err(mpsc::TryRecvError::Disconnected) => {
+                            fail_unfinished_transfers(
+                                &mut tab.transfer_tasks,
+                                "SFTP 通道已关闭，传输结果未知",
+                            );
                             tab.sftp_connected = false;
                             tab.sftp_tx = None;
+                            tab.sftp_control_tx = None;
                             tab.sftp_rx = None;
                             tab.sftp_status_msg = "SFTP 通道已关闭".to_string();
                             break;
@@ -432,19 +466,83 @@ impl SshClientUi {
                         tab.remote_files = entries;
                         tab.remote_selected = None;
                     }
+                    SftpResponse::DirectoryError(path, error) => {
+                        if tab.remote_dir_input == path {
+                            tab.remote_dir_input = tab.remote_current_dir.clone();
+                        }
+                        tab.sftp_status_msg = error;
+                    }
                     SftpResponse::TransferProgress(task) => {
                         let existing = tab
                             .transfer_tasks
                             .iter_mut()
-                            .find(|t| t.source == task.source && t.destination == task.destination);
+                            .find(|existing| existing.id == task.id);
                         if let Some(existing) = existing {
                             *existing = task;
                         } else {
                             tab.transfer_tasks.push(task);
                         }
                     }
-                    SftpResponse::OperationDone(msg) => {
-                        tab.sftp_status_msg = msg;
+                    SftpResponse::OperationDone(task) => {
+                        let message = match task.direction {
+                            super::models::TransferDirection::Upload => {
+                                format!("上传完成: {} → {}", task.source, task.destination)
+                            }
+                            super::models::TransferDirection::Download => {
+                                format!("下载完成: {} → {}", task.source, task.destination)
+                            }
+                        };
+                        let direction = task.direction.clone();
+                        let destination = task.destination.clone();
+                        if let Some(existing) = tab
+                            .transfer_tasks
+                            .iter_mut()
+                            .find(|existing| existing.id == task.id)
+                        {
+                            *existing = task;
+                        } else {
+                            tab.transfer_tasks.push(task);
+                        }
+                        tab.sftp_status_msg = message;
+                        match direction {
+                            super::models::TransferDirection::Upload => {
+                                if remote_parent_path_for_file(&destination).is_some_and(|parent| {
+                                    parent == normalize_remote_path(&tab.remote_current_dir)
+                                }) {
+                                    match tab.sftp_tx.as_ref().map(|tx| {
+                                        tx.try_send(SftpRequest::ListDirectory(
+                                            tab.remote_current_dir.clone(),
+                                        ))
+                                    }) {
+                                        Some(Ok(())) => {}
+                                        Some(Err(_)) | None => {
+                                            tab.sftp_status_msg = format!(
+                                                "{}；远程目录自动刷新失败",
+                                                tab.sftp_status_msg
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            super::models::TransferDirection::Download => {
+                                if Path::new(&destination).parent()
+                                    == Some(Path::new(&tab.local_current_dir))
+                                {
+                                    match sftp::list_local_dir(&tab.local_current_dir) {
+                                        Ok(files) => {
+                                            tab.local_files = files;
+                                            tab.local_selected = None;
+                                        }
+                                        Err(error) => {
+                                            tab.sftp_status_msg = format!(
+                                                "{}；本地目录自动刷新失败: {}",
+                                                tab.sftp_status_msg, error
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                     SftpResponse::Error(err) => {
                         tab.sftp_status_msg = err;
@@ -460,8 +558,13 @@ impl SshClientUi {
                         }
                     }
                     SftpResponse::Disconnected => {
+                        fail_unfinished_transfers(
+                            &mut tab.transfer_tasks,
+                            "SFTP 已断开，传输已取消",
+                        );
                         tab.sftp_connected = false;
                         tab.sftp_tx = None;
+                        tab.sftp_control_tx = None;
                         tab.sftp_rx = None;
                         tab.remote_files.clear();
                         tab.sftp_status_msg = "SFTP 已断开".to_string();
@@ -868,11 +971,6 @@ impl SshClientUi {
             return;
         }
 
-        // 清理已完成的传输任务
-        if let Some(tab) = self.current_tab_mut() {
-            tab.transfer_tasks.retain(|t| !t.done);
-        }
-
         let total_h = ui.available_height();
 
         // 上下分区：上方文件面板区占 3/4，下方传输进度区占 1/4（上限 120px）
@@ -904,6 +1002,7 @@ impl SshClientUi {
                 ui.add_space(2.0);
 
                 // 路径导航栏
+                let mut local_dir_changed = false;
                 ui.horizontal(|ui| {
                     let Some(tab) = self.current_tab_mut() else {
                         return;
@@ -913,6 +1012,10 @@ impl SshClientUi {
                         let p = tab.local_dir_input.trim().to_string();
                         if Path::new(&p).is_dir() {
                             tab.local_current_dir = p;
+                            local_dir_changed = true;
+                        } else {
+                            tab.sftp_status_msg = format!("无效的本地目录: {}", p);
+                            tab.local_dir_input = tab.local_current_dir.clone();
                         }
                     }
                     if ui.button("📂").clicked() {
@@ -922,17 +1025,23 @@ impl SshClientUi {
                             .pick_folder()
                         {
                             tab.local_current_dir = path.to_string_lossy().to_string();
+                            local_dir_changed = true;
                         }
                     }
                     if ui.button("⬆").clicked() {
                         if let Some(parent) = Path::new(&tab.local_current_dir).parent() {
                             tab.local_current_dir = parent.to_string_lossy().to_string();
+                            local_dir_changed = true;
                         }
                     }
                     if ui.button("🏠").clicked() {
                         tab.local_current_dir = sftp::home_dir();
+                        local_dir_changed = true;
                     }
                 });
+                if local_dir_changed {
+                    self.refresh_local_files();
+                }
 
                 // 表头
                 render_file_header(ui);
@@ -980,59 +1089,86 @@ impl SshClientUi {
                 let btn_area_h = panel_inner_h - 70.0;
                 ui.add_space(btn_area_h / 2.0 - 30.0);
 
-                let can_upload = self
+                let upload_target = self
                     .current_tab()
                     .and_then(|t| t.local_selected.and_then(|i| t.local_files.get(i)))
-                    .map(|f| !f.is_dir)
+                    .filter(|entry| !entry.is_dir)
+                    .map(|entry| {
+                        let remote_path = format!(
+                            "{}/{}",
+                            self.current_tab()
+                                .map(|tab| tab.remote_current_dir.trim_end_matches('/'))
+                                .unwrap_or_default(),
+                            entry.name
+                        );
+                        (entry.path.clone(), remote_path)
+                    });
+                let can_upload = upload_target
+                    .as_ref()
+                    .map(|(source, destination)| {
+                        !self.current_tab().is_some_and(|tab| {
+                            has_active_transfer(&tab.transfer_tasks, source, destination)
+                        })
+                    })
                     .unwrap_or(false);
 
                 if ui
                     .add_enabled(can_upload, egui::Button::new("上传 →"))
                     .clicked()
                 {
-                    if let Some(tab) = self.current_tab() {
-                        if let Some(idx) = tab.local_selected {
-                            if let Some(entry) = tab.local_files.get(idx) {
-                                let local_path = entry.path.clone();
-                                let remote_path = format!(
-                                    "{}/{}",
-                                    tab.remote_current_dir.trim_end_matches('/'),
-                                    entry.name
-                                );
-                                if let Some(tx) = &tab.sftp_tx {
-                                    let _ = tx.send(SftpRequest::Upload(local_path, remote_path));
-                                }
-                            }
-                        }
+                    if let Some((local_path, remote_path)) = upload_target {
+                        let task = super::models::TransferTask::new(
+                            local_path,
+                            remote_path,
+                            super::models::TransferDirection::Upload,
+                            None,
+                        );
+                        self.enqueue_transfer(task);
                     }
                 }
 
                 ui.add_space(12.0);
 
-                let can_download = self
+                let download_target = self
                     .current_tab()
                     .and_then(|t| t.remote_selected.and_then(|i| t.remote_files.get(i)))
-                    .map(|f| !f.is_dir)
+                    .filter(|entry| !entry.is_dir)
+                    .map(|entry| {
+                        let local_path = Path::new(
+                            self.current_tab()
+                                .map(|tab| tab.local_current_dir.as_str())
+                                .unwrap_or_default(),
+                        )
+                        .join(&entry.name)
+                        .to_string_lossy()
+                        .to_string();
+                        (
+                            entry.path.clone(),
+                            local_path,
+                            entry.size_known.then_some(entry.size),
+                        )
+                    });
+                let can_download = download_target
+                    .as_ref()
+                    .map(|(source, destination, _)| {
+                        !self.current_tab().is_some_and(|tab| {
+                            has_active_transfer(&tab.transfer_tasks, source, destination)
+                        })
+                    })
                     .unwrap_or(false);
 
                 if ui
                     .add_enabled(can_download, egui::Button::new("← 下载"))
                     .clicked()
                 {
-                    if let Some(tab) = self.current_tab() {
-                        if let Some(idx) = tab.remote_selected {
-                            if let Some(entry) = tab.remote_files.get(idx) {
-                                let remote_path = entry.path.clone();
-                                let local_path = format!(
-                                    "{}/{}",
-                                    tab.local_current_dir.trim_end_matches('/'),
-                                    entry.name
-                                );
-                                if let Some(tx) = &tab.sftp_tx {
-                                    let _ = tx.send(SftpRequest::Download(remote_path, local_path));
-                                }
-                            }
-                        }
+                    if let Some((remote_path, local_path, total_size)) = download_target {
+                        let task = super::models::TransferTask::new(
+                            remote_path,
+                            local_path,
+                            super::models::TransferDirection::Download,
+                            total_size,
+                        );
+                        self.enqueue_transfer(task);
                     }
                 }
             });
@@ -1047,23 +1183,31 @@ impl SshClientUi {
                 ui.add_space(2.0);
 
                 // 路径导航栏
+                let mut remote_dir_to_load = None;
                 ui.horizontal(|ui| {
                     let Some(tab) = self.current_tab_mut() else {
                         return;
                     };
                     let resp = ui.text_edit_singleline(&mut tab.remote_dir_input);
                     if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        tab.remote_current_dir = tab.remote_dir_input.trim().to_string();
-                    }
-                    if ui.button("⬆").clicked() {
-                        if let Some(parent) = Path::new(&tab.remote_current_dir).parent() {
-                            tab.remote_current_dir = parent.to_string_lossy().to_string();
+                        let path = tab.remote_dir_input.trim().to_string();
+                        if path.is_empty() {
+                            tab.sftp_status_msg = "远程目录不能为空".to_string();
+                            tab.remote_dir_input = tab.remote_current_dir.clone();
+                        } else {
+                            remote_dir_to_load = Some(path);
                         }
                     }
+                    if ui.button("⬆").clicked() {
+                        remote_dir_to_load = remote_parent_path(&tab.remote_current_dir);
+                    }
                     if ui.button("🔄").clicked() {
-                        self.refresh_remote_files();
+                        remote_dir_to_load = Some(tab.remote_current_dir.clone());
                     }
                 });
+                if let Some(path) = remote_dir_to_load {
+                    self.request_remote_directory(path);
+                }
 
                 // 表头
                 render_file_header(ui);
@@ -1085,10 +1229,13 @@ impl SshClientUi {
                             }
                         }
                         if let Some(idx) = action.open {
-                            if let Some(tab) = self.current_tab_mut() {
-                                tab.remote_current_dir = tab.remote_files[idx].path.clone();
+                            if let Some(path) = self
+                                .current_tab()
+                                .and_then(|tab| tab.remote_files.get(idx))
+                                .map(|entry| entry.path.clone())
+                            {
+                                self.request_remote_directory(path);
                             }
-                            self.refresh_remote_files();
                         }
                     });
             });
@@ -1096,7 +1243,20 @@ impl SshClientUi {
 
         // ---- 下方：传输进度区（始终显示） ----
         ui.separator();
-        ui.strong("传输进度:");
+        ui.horizontal(|ui| {
+            ui.strong("传输进度:");
+            let has_completed = self
+                .current_tab()
+                .is_some_and(|tab| tab.transfer_tasks.iter().any(|task| task.done));
+            if ui
+                .add_enabled(has_completed, egui::Button::new("清除已完成"))
+                .clicked()
+            {
+                if let Some(tab) = self.current_tab_mut() {
+                    tab.transfer_tasks.retain(|task| !task.done);
+                }
+            }
+        });
         let has_transfer_tasks = self
             .current_tab()
             .map(|t| !t.transfer_tasks.is_empty())
@@ -1112,6 +1272,7 @@ impl SshClientUi {
                     let Some(tab) = self.current_tab() else {
                         return;
                     };
+                    let mut task_to_cancel = None;
                     for task in &tab.transfer_tasks {
                         ui.horizontal(|ui| {
                             let icon = match task.direction {
@@ -1122,7 +1283,25 @@ impl SshClientUi {
                             let bar = egui::ProgressBar::new(task.progress()).show_percentage();
                             ui.add_sized([160.0, 16.0], bar);
                             ui.label(task.progress_text());
+                            if !task.done && ui.small_button("取消").clicked() {
+                                task_to_cancel = Some(task.id.clone());
+                            }
                         });
+                    }
+                    if let Some(task_id) = task_to_cancel {
+                        if let Some(tab) = self.current_tab_mut() {
+                            match &tab.sftp_control_tx {
+                                Some(tx)
+                                    if tx.send(SftpControl::CancelTransfer(task_id)).is_ok() =>
+                                {
+                                    tab.sftp_status_msg = "已发送取消请求".to_string();
+                                }
+                                _ => {
+                                    tab.sftp_status_msg =
+                                        "无法发送取消请求，SFTP 控制通道已关闭".to_string();
+                                }
+                            }
+                        }
                     }
                 });
         }
@@ -1849,6 +2028,88 @@ fn format_session_addr(session: &super::models::SshSession) -> String {
     }
 }
 
+fn has_active_transfer(
+    tasks: &[super::models::TransferTask],
+    source: &str,
+    destination: &str,
+) -> bool {
+    tasks
+        .iter()
+        .any(|task| !task.done && task.source == source && task.destination == destination)
+}
+
+/// 获取 SFTP POSIX 路径的上级目录
+fn remote_parent_path(path: &str) -> Option<String> {
+    let normalized = normalize_remote_path(path);
+    if normalized == "/" || normalized == "." {
+        return None;
+    }
+
+    match normalized.rfind('/') {
+        Some(0) => Some("/".to_string()),
+        Some(index) => Some(normalized[..index].to_string()),
+        None if normalized == ".." => Some("../..".to_string()),
+        None => Some(".".to_string()),
+    }
+}
+
+fn remote_parent_path_for_file(path: &str) -> Option<String> {
+    let normalized = normalize_remote_path(path);
+    match normalized.rfind('/') {
+        Some(0) => Some("/".to_string()),
+        Some(index) => Some(normalized[..index].to_string()),
+        None => Some(".".to_string()),
+    }
+}
+
+/// 对 SFTP POSIX 路径进行词法规范化
+fn normalize_remote_path(path: &str) -> String {
+    let trimmed = path.trim();
+    let absolute = trimmed.starts_with('/');
+    let mut components: Vec<&str> = Vec::new();
+
+    for component in trimmed.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => match components.last() {
+                Some(last) if *last != ".." => {
+                    components.pop();
+                }
+                _ if !absolute => components.push(component),
+                _ => {}
+            },
+            _ => components.push(component),
+        }
+    }
+
+    if absolute {
+        if components.is_empty() {
+            "/".to_string()
+        } else {
+            format!("/{}", components.join("/"))
+        }
+    } else if components.is_empty() {
+        ".".to_string()
+    } else {
+        components.join("/")
+    }
+}
+
+/// 发送远程目录加载请求
+fn send_remote_directory_request(
+    tx: Option<&mpsc::SyncSender<SftpRequest>>,
+    path: String,
+) -> Result<(), String> {
+    match tx {
+        Some(tx) => match tx.try_send(SftpRequest::ListDirectory(path)) {
+            Ok(()) => Ok(()),
+            Err(mpsc::TrySendError::Full(_)) => Err("SFTP 请求队列已满，请稍后重试".to_string()),
+            Err(mpsc::TrySendError::Disconnected(_)) => Err("无法发送远程目录刷新请求".to_string()),
+        },
+        None => Err("SFTP 未连接，无法刷新远程目录".to_string()),
+    }
+}
+
 /// 文件列表交互结果
 struct FileListAction {
     select: Option<usize>,
@@ -1906,4 +2167,87 @@ fn render_file_rows(
     }
 
     action
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc;
+
+    use super::{has_active_transfer, remote_parent_path, send_remote_directory_request};
+    use crate::plugins::ssh_client::models::SftpRequest;
+
+    #[test]
+    fn remote_parent_path_uses_posix_semantics() {
+        assert_eq!(remote_parent_path("/home/user"), Some("/home".to_string()));
+        assert_eq!(remote_parent_path("/home/user/"), Some("/home".to_string()));
+        assert_eq!(remote_parent_path("/home"), Some("/".to_string()));
+        assert_eq!(
+            remote_parent_path("relative/path"),
+            Some("relative".to_string())
+        );
+        assert_eq!(remote_parent_path("relative"), Some(".".to_string()));
+        assert_eq!(remote_parent_path(".."), Some("../..".to_string()));
+        assert_eq!(remote_parent_path("../dir"), Some("..".to_string()));
+        assert_eq!(remote_parent_path("/a/../b"), Some("/".to_string()));
+        assert_eq!(remote_parent_path("/a//b"), Some("/a".to_string()));
+        assert_eq!(remote_parent_path("/../../a"), Some("/".to_string()));
+        assert_eq!(
+            remote_parent_path("../../a/../b"),
+            Some("../..".to_string())
+        );
+        assert_eq!(remote_parent_path("a/../../b"), Some("..".to_string()));
+    }
+
+    #[test]
+    fn remote_parent_path_stops_at_root_or_current_directory() {
+        assert_eq!(remote_parent_path("/"), None);
+        assert_eq!(remote_parent_path("."), None);
+        assert_eq!(remote_parent_path(""), None);
+        assert_eq!(remote_parent_path("   "), None);
+        assert_eq!(remote_parent_path("//"), None);
+        assert_eq!(remote_parent_path("///"), None);
+    }
+
+    #[test]
+    fn remote_parent_path_does_not_use_windows_separator() {
+        assert_eq!(remote_parent_path(r"home\user\file"), Some(".".to_string()));
+    }
+
+    #[test]
+    fn remote_directory_request_sends_requested_path() {
+        let (tx, rx) = mpsc::sync_channel(1);
+
+        assert!(send_remote_directory_request(Some(&tx), "/home/user".to_string()).is_ok());
+        match rx.try_recv() {
+            Ok(SftpRequest::ListDirectory(path)) => assert_eq!(path, "/home/user"),
+            result => panic!("收到非预期请求: {:?}", result),
+        }
+    }
+
+    #[test]
+    fn remote_directory_request_reports_missing_or_closed_channel() {
+        assert!(send_remote_directory_request(None, "/home".to_string()).is_err());
+
+        let (tx, rx) = mpsc::sync_channel(1);
+        drop(rx);
+        assert!(send_remote_directory_request(Some(&tx), "/home".to_string()).is_err());
+    }
+
+    #[test]
+    fn active_transfer_detection_ignores_completed_tasks() {
+        let mut task = crate::plugins::ssh_client::models::TransferTask::new(
+            "/source".to_string(),
+            "/destination".to_string(),
+            crate::plugins::ssh_client::models::TransferDirection::Upload,
+            Some(10),
+        );
+        assert!(has_active_transfer(
+            std::slice::from_ref(&task),
+            "/source",
+            "/destination"
+        ));
+
+        task.done = true;
+        assert!(!has_active_transfer(&[task], "/source", "/destination"));
+    }
 }

@@ -197,6 +197,8 @@ pub struct FileEntry {
     pub is_dir: bool,
     /// 文件大小（字节，目录为 0）
     pub size: u64,
+    /// 文件大小是否由文件系统明确提供
+    pub size_known: bool,
     /// 修改时间戳（秒）
     pub modified: Option<i64>,
 }
@@ -206,6 +208,9 @@ impl FileEntry {
     pub fn size_display(&self) -> String {
         if self.is_dir {
             return "<DIR>".to_string();
+        }
+        if !self.size_known {
+            return "未知".to_string();
         }
         if self.size < 1024 {
             format!("{} B", self.size)
@@ -244,6 +249,8 @@ pub enum TransferDirection {
 /// 文件传输任务
 #[derive(Debug, Clone)]
 pub struct TransferTask {
+    /// 任务唯一标识
+    pub id: String,
     /// 源路径
     pub source: String,
     /// 目标路径
@@ -251,7 +258,7 @@ pub struct TransferTask {
     /// 传输方向
     pub direction: TransferDirection,
     /// 文件总大小（字节）
-    pub total_size: u64,
+    pub total_size: Option<u64>,
     /// 已传输大小（字节）
     pub transferred: u64,
     /// 文件名（用于显示）
@@ -263,13 +270,40 @@ pub struct TransferTask {
 }
 
 impl TransferTask {
+    /// 创建文件传输任务
+    pub fn new(
+        source: String,
+        destination: String,
+        direction: TransferDirection,
+        total_size: Option<u64>,
+    ) -> Self {
+        let filename = std::path::Path::new(&source)
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| source.clone());
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            source,
+            destination,
+            direction,
+            total_size,
+            transferred: 0,
+            filename,
+            done: false,
+            error: None,
+        }
+    }
+
     /// 获取传输进度百分比 (0.0 ~ 1.0)
     pub fn progress(&self) -> f32 {
-        if self.total_size == 0 {
-            return 1.0;
+        match self.total_size {
+            Some(0) => 1.0,
+            Some(total_size) => {
+                let ratio = self.transferred as f64 / total_size as f64;
+                ratio.min(1.0) as f32
+            }
+            None => 0.0,
         }
-        let ratio = self.transferred as f64 / self.total_size as f64;
-        ratio.min(1.0) as f32
     }
 
     /// 获取进度显示文本
@@ -280,10 +314,17 @@ impl TransferTask {
                 None => "✅ 完成".to_string(),
             }
         } else {
+            let Some(total_size) = self.total_size else {
+                return if self.transferred == 0 {
+                    "等待中".to_string()
+                } else {
+                    format!("已传输 {}", Self::format_size(self.transferred))
+                };
+            };
             format!(
                 "{} / {} ({:.0}%)",
                 Self::format_size(self.transferred),
-                Self::format_size(self.total_size),
+                Self::format_size(total_size),
                 self.progress() * 100.0
             )
         }
@@ -308,10 +349,17 @@ pub enum SftpRequest {
     /// 列出远程目录
     ListDirectory(String),
     /// 上传文件 (本地路径, 远程路径)
-    Upload(String, String),
+    Upload(TransferTask),
     /// 下载文件 (远程路径, 本地路径)
-    Download(String, String),
-    /// 断开 SFTP 连接
+    Download(TransferTask),
+}
+
+/// SFTP 控制请求，不与普通操作共用有界队列
+#[derive(Debug)]
+pub enum SftpControl {
+    /// 取消指定传输任务
+    CancelTransfer(String),
+    /// 断开 SFTP 连接并取消全部未完成任务
     Disconnect,
 }
 
@@ -320,10 +368,12 @@ pub enum SftpRequest {
 pub enum SftpResponse {
     /// 目录列表结果
     DirectoryList(String, Vec<FileEntry>),
+    /// 远程目录加载失败（请求路径, 错误信息）
+    DirectoryError(String, String),
     /// 传输进度更新
     TransferProgress(TransferTask),
     /// 操作完成
-    OperationDone(String),
+    OperationDone(TransferTask),
     /// 操作错误
     Error(String),
     /// SFTP 连接已就绪
@@ -371,6 +421,8 @@ pub struct SessionTab {
     pub active_tab: SessionViewTab,
     /// SFTP 请求发送端
     pub sftp_tx: Option<std::sync::mpsc::SyncSender<SftpRequest>>,
+    /// SFTP 控制请求发送端
+    pub sftp_control_tx: Option<std::sync::mpsc::Sender<SftpControl>>,
     /// SFTP 响应接收端
     pub sftp_rx: Option<std::sync::mpsc::Receiver<SftpResponse>>,
     /// 本地当前目录
@@ -413,6 +465,7 @@ impl SessionTab {
             ime_active: false,
             active_tab: SessionViewTab::Terminal,
             sftp_tx: None,
+            sftp_control_tx: None,
             sftp_rx: None,
             local_current_dir: home.clone(),
             local_files: Vec::new(),
@@ -443,15 +496,20 @@ impl SessionTab {
 
     /// 断开 SFTP 连接
     pub fn disconnect_sftp(&mut self) {
-        if let Some(tx) = &self.sftp_tx {
-            let _ = tx.send(SftpRequest::Disconnect);
+        if let Some(tx) = &self.sftp_control_tx {
+            if tx.send(SftpControl::Disconnect).is_ok() {
+                self.sftp_connected = false;
+                self.sftp_status_msg = "正在断开 SFTP...".to_string();
+                return;
+            }
         }
         self.sftp_tx = None;
+        self.sftp_control_tx = None;
         self.sftp_rx = None;
         self.sftp_connected = false;
         self.remote_files.clear();
         self.remote_current_dir.clear();
-        self.transfer_tasks.clear();
+        fail_unfinished_transfers(&mut self.transfer_tasks, "SFTP 控制通道已关闭");
         self.sftp_status_msg = "SFTP 已断开".to_string();
     }
 
@@ -459,6 +517,14 @@ impl SessionTab {
     pub fn disconnect_all(&mut self) {
         self.disconnect_terminal();
         self.disconnect_sftp();
+    }
+}
+
+/// 将所有未完成传输标记为失败
+pub fn fail_unfinished_transfers(tasks: &mut [TransferTask], reason: &str) {
+    for task in tasks.iter_mut().filter(|task| !task.done) {
+        task.done = true;
+        task.error = Some(reason.to_string());
     }
 }
 
@@ -473,6 +539,7 @@ mod tests {
             path: "/test".to_string(),
             is_dir: true,
             size: 0,
+            size_known: true,
             modified: None,
         };
         assert_eq!(dir.size_display(), "<DIR>");
@@ -482,6 +549,7 @@ mod tests {
             path: "/a.txt".to_string(),
             is_dir: false,
             size: 500,
+            size_known: true,
             modified: None,
         };
         assert_eq!(small.size_display(), "500 B");
@@ -491,6 +559,7 @@ mod tests {
             path: "/b.txt".to_string(),
             is_dir: false,
             size: 2048,
+            size_known: true,
             modified: None,
         };
         assert_eq!(kb.size_display(), "2.0 KB");
@@ -500,6 +569,7 @@ mod tests {
             path: "/c.bin".to_string(),
             is_dir: false,
             size: 5 * 1024 * 1024,
+            size_known: true,
             modified: None,
         };
         assert_eq!(mb.size_display(), "5.0 MB");
@@ -509,18 +579,30 @@ mod tests {
             path: "/d.bin".to_string(),
             is_dir: false,
             size: 2 * 1024 * 1024 * 1024,
+            size_known: true,
             modified: None,
         };
         assert_eq!(gb.size_display(), "2.0 GB");
+
+        let unknown = FileEntry {
+            name: "unknown.bin".to_string(),
+            path: "/unknown.bin".to_string(),
+            is_dir: false,
+            size: 0,
+            size_known: false,
+            modified: None,
+        };
+        assert_eq!(unknown.size_display(), "未知");
     }
 
     #[test]
     fn test_transfer_task_progress() {
         let task = TransferTask {
+            id: "upload-1".to_string(),
             source: "/a".to_string(),
             destination: "/b".to_string(),
             direction: TransferDirection::Upload,
-            total_size: 1000,
+            total_size: Some(1000),
             transferred: 500,
             filename: "test.bin".to_string(),
             done: false,
@@ -529,10 +611,11 @@ mod tests {
         assert!((task.progress() - 0.5).abs() < 0.01);
 
         let empty = TransferTask {
+            id: "download-1".to_string(),
             source: "/a".to_string(),
             destination: "/b".to_string(),
             direction: TransferDirection::Download,
-            total_size: 0,
+            total_size: Some(0),
             transferred: 0,
             filename: "empty".to_string(),
             done: false,
@@ -544,10 +627,11 @@ mod tests {
     #[test]
     fn test_transfer_task_progress_text() {
         let in_progress = TransferTask {
+            id: "upload-2".to_string(),
             source: "/a".to_string(),
             destination: "/b".to_string(),
             direction: TransferDirection::Upload,
-            total_size: 1024,
+            total_size: Some(1024),
             transferred: 512,
             filename: "test.bin".to_string(),
             done: false,
@@ -555,11 +639,24 @@ mod tests {
         };
         assert!(in_progress.progress_text().contains("50%"));
 
+        let pending = TransferTask::new(
+            "/a".to_string(),
+            "/b".to_string(),
+            TransferDirection::Upload,
+            None,
+        );
+        assert_eq!(pending.progress_text(), "等待中");
+
+        let mut unknown_size = pending;
+        unknown_size.transferred = 2048;
+        assert_eq!(unknown_size.progress_text(), "已传输 2.0 KB");
+
         let done = TransferTask {
+            id: "upload-3".to_string(),
             source: "/a".to_string(),
             destination: "/b".to_string(),
             direction: TransferDirection::Upload,
-            total_size: 1024,
+            total_size: Some(1024),
             transferred: 1024,
             filename: "test.bin".to_string(),
             done: true,
@@ -568,10 +665,11 @@ mod tests {
         assert_eq!(done.progress_text(), "✅ 完成");
 
         let failed = TransferTask {
+            id: "download-2".to_string(),
             source: "/a".to_string(),
             destination: "/b".to_string(),
             direction: TransferDirection::Download,
-            total_size: 1024,
+            total_size: Some(1024),
             transferred: 0,
             filename: "test.bin".to_string(),
             done: true,
@@ -587,8 +685,37 @@ mod tests {
             path: "/a".to_string(),
             is_dir: false,
             size: 0,
+            size_known: true,
             modified: None,
         };
         assert_eq!(entry.modified_display(), "-");
+    }
+
+    #[test]
+    fn fail_unfinished_transfers_preserves_completed_history() {
+        let mut active = TransferTask::new(
+            "/active".to_string(),
+            "/target".to_string(),
+            TransferDirection::Upload,
+            Some(10),
+        );
+        let mut completed = TransferTask::new(
+            "/completed".to_string(),
+            "/target".to_string(),
+            TransferDirection::Download,
+            Some(10),
+        );
+        completed.done = true;
+        completed.transferred = 10;
+        let mut tasks = vec![active.clone(), completed.clone()];
+
+        fail_unfinished_transfers(&mut tasks, "连接已断开");
+
+        active.done = true;
+        active.error = Some("连接已断开".to_string());
+        assert_eq!(tasks[0].done, active.done);
+        assert_eq!(tasks[0].error, active.error);
+        assert!(tasks[1].done);
+        assert_eq!(tasks[1].error, completed.error);
     }
 }
