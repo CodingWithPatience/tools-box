@@ -20,6 +20,71 @@ enum LeftPanelView {
     History,
 }
 
+/// 一个打开的请求标签页状态
+#[derive(Clone)]
+struct OpenRequestTab {
+    request: ApiRequest,
+    response: Option<ApiResponse>,
+    headers: Vec<HeaderEntry>,
+    params: Vec<HeaderEntry>,
+    body_type: BodyType,
+    body: String,
+    request_tab: RequestTab,
+    response_tab: ResponseTab,
+    saved_request_id: Option<i64>,
+    collection_id: Option<i64>,
+    is_default_name: bool,
+    is_sending: bool,
+}
+
+impl OpenRequestTab {
+    fn new() -> Self {
+        Self {
+            request: ApiRequest::new(),
+            response: None,
+            headers: vec![
+                HeaderEntry::new("Content-Type", "application/json"),
+                HeaderEntry::new("Accept", "*/*"),
+            ],
+            params: Vec::new(),
+            body_type: BodyType::None,
+            body: String::new(),
+            request_tab: RequestTab::Headers,
+            response_tab: ResponseTab::Body,
+            saved_request_id: None,
+            collection_id: None,
+            is_default_name: true,
+            is_sending: false,
+        }
+    }
+
+    fn from_saved_request(request: SavedApiRequest) -> Self {
+        Self {
+            request: ApiRequest {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: request.name,
+                method: request.method,
+                url: request.url,
+                headers: request.headers.clone(),
+                params: request.params.clone(),
+                body_type: request.body_type.clone(),
+                body: request.body.clone(),
+            },
+            response: None,
+            headers: request.headers,
+            params: request.params,
+            body_type: request.body_type,
+            body: request.body,
+            request_tab: RequestTab::Headers,
+            response_tab: ResponseTab::Body,
+            saved_request_id: Some(request.id),
+            collection_id: request.collection_id,
+            is_default_name: false,
+            is_sending: false,
+        }
+    }
+}
+
 /// API 调试工具 UI
 pub struct ApiTesterUi {
     /// 当前请求配置
@@ -46,6 +111,16 @@ pub struct ApiTesterUi {
     history: Vec<RequestHistory>,
     /// 是否正在发送请求
     is_sending: bool,
+    /// 已打开的请求标签页
+    open_tabs: Vec<OpenRequestTab>,
+    /// 当前激活的请求标签页索引
+    active_tab_index: usize,
+    /// 当前请求对应的已保存请求 ID
+    saved_request_id: Option<i64>,
+    /// 当前请求原本所属的集合 ID
+    request_collection_id: Option<i64>,
+    /// 当前请求是否仍使用新建请求的默认名称
+    is_default_name: bool,
     /// Mock 服务器（仅 debug 模式）
     #[cfg(debug_assertions)]
     mock_server: Option<MockServer>,
@@ -116,6 +191,11 @@ impl ApiTesterUi {
             error: None,
             history: Vec::new(),
             is_sending: false,
+            open_tabs: vec![OpenRequestTab::new()],
+            active_tab_index: 0,
+            saved_request_id: None,
+            request_collection_id: None,
+            is_default_name: true,
             #[cfg(debug_assertions)]
             mock_server: None,
 
@@ -156,6 +236,114 @@ impl ApiTesterUi {
         self.load_collections(conn);
         self.load_environments(conn);
         self.load_history(conn);
+    }
+
+    /// 将当前编辑器状态写回激活的请求标签页
+    fn save_active_tab(&mut self) {
+        if let Some(tab) = self.open_tabs.get_mut(self.active_tab_index) {
+            tab.request = self.request.clone();
+            tab.response = self.response.clone();
+            tab.headers = self.headers.clone();
+            tab.params = self.params.clone();
+            tab.body_type = self.body_type.clone();
+            tab.body = self.body.clone();
+            tab.request_tab = self.request_tab.clone();
+            tab.response_tab = self.response_tab.clone();
+            tab.saved_request_id = self.saved_request_id;
+            tab.collection_id = self.request_collection_id;
+            tab.is_default_name = self.is_default_name;
+            tab.is_sending = self.is_sending;
+        }
+    }
+
+    /// 加载指定请求标签页的编辑器状态
+    fn load_tab(&mut self, index: usize) {
+        if let Some(tab) = self.open_tabs.get(index).cloned() {
+            self.active_tab_index = index;
+            self.request = tab.request;
+            self.response = tab.response;
+            self.headers = tab.headers;
+            self.params = tab.params;
+            self.body_type = tab.body_type;
+            self.body = tab.body;
+            self.request_tab = tab.request_tab;
+            self.response_tab = tab.response_tab;
+            self.saved_request_id = tab.saved_request_id;
+            self.request_collection_id = tab.collection_id;
+            self.is_default_name = tab.is_default_name;
+            self.is_sending = tab.is_sending;
+        }
+    }
+
+    /// 新建请求标签页
+    fn create_request_tab(&mut self) {
+        self.save_active_tab();
+        self.open_tabs.push(OpenRequestTab::new());
+        self.load_tab(self.open_tabs.len() - 1);
+        self.error = None;
+    }
+
+    /// 打开已保存请求标签页；重复打开同一请求时切换到已有标签页
+    fn open_saved_request(&mut self, request: SavedApiRequest) {
+        self.save_active_tab();
+
+        if let Some(index) = self
+            .open_tabs
+            .iter()
+            .position(|tab| tab.saved_request_id == Some(request.id))
+        {
+            self.load_tab(index);
+            return;
+        }
+
+        self.open_tabs
+            .push(OpenRequestTab::from_saved_request(request));
+        self.load_tab(self.open_tabs.len() - 1);
+        self.error = None;
+    }
+
+    /// 切换请求标签页
+    fn activate_request_tab(&mut self, index: usize) {
+        if index == self.active_tab_index || index >= self.open_tabs.len() {
+            return;
+        }
+
+        self.save_active_tab();
+        self.load_tab(index);
+        self.error = None;
+    }
+
+    /// 关闭请求标签页
+    fn close_request_tab(&mut self, index: usize) {
+        if index >= self.open_tabs.len() {
+            return;
+        }
+
+        self.save_active_tab();
+        self.open_tabs.remove(index);
+
+        if self.open_tabs.is_empty() {
+            self.open_tabs.push(OpenRequestTab::new());
+            self.load_tab(0);
+            return;
+        }
+
+        let next_index = if index < self.active_tab_index {
+            self.active_tab_index - 1
+        } else if index == self.active_tab_index {
+            self.active_tab_index.min(self.open_tabs.len() - 1)
+        } else {
+            self.active_tab_index
+        };
+        self.load_tab(next_index);
+    }
+
+    /// 将请求编辑器字段同步到请求模型
+    fn sync_request_fields(&mut self) {
+        self.request.headers = self.headers.clone();
+        self.request.params = self.params.clone();
+        self.request.body_type = self.body_type.clone();
+        self.request.body = self.body.clone();
     }
 
     /// 加载历史记录
@@ -326,15 +514,7 @@ impl ApiTesterUi {
 
                 // 新建请求按钮
                 if ui.button(RichText::new("+ 新建请求").strong()).clicked() {
-                    self.request = ApiRequest::new();
-                    self.headers = vec![
-                        HeaderEntry::new("Content-Type", "application/json"),
-                        HeaderEntry::new("Accept", "*/*"),
-                    ];
-                    self.params = Vec::new();
-                    self.body_type = BodyType::None;
-                    self.body = String::new();
-                    self.response = None;
+                    self.create_request_tab();
                 }
 
                 // 历史按钮
@@ -364,8 +544,10 @@ impl ApiTesterUi {
 
         // 主内容区域 - 左右分栏（可拖拽调整宽度）
         let available_width = ui.available_width();
-        let min_left_width = 180.0;
-        let max_left_width = (available_width * 0.4).min(400.0);
+        // 历史列表所在的左侧区域最多占插件内容宽度的一半
+        let max_left_width = (available_width * 0.5)
+            .min(400.0);
+        let min_left_width = max_left_width.min(180.0);
 
         ui.horizontal_top(|ui| {
             // 左侧面板（使用固定宽度）
@@ -514,11 +696,13 @@ impl ApiTesterUi {
                                     .small(),
                             );
 
-                            if ui
-                                .selectable_label(false, &request.name)
-                                .on_hover_text(&format!("{} {}", request.method, request.url))
-                                .clicked()
-                            {
+                            let request_label = ui
+                                .add(
+                                    egui::Label::new(&request.name)
+                                        .sense(egui::Sense::click()),
+                                )
+                                .on_hover_text(&format!("{} {}", request.method, request.url));
+                            if request_label.clicked() {
                                 request_to_load = Some(request.clone());
                             }
 
@@ -536,14 +720,7 @@ impl ApiTesterUi {
             });
 
         if let Some(request) = request_to_load {
-            self.request.name = request.name;
-            self.request.method = request.method;
-            self.request.url = request.url;
-            self.headers = request.headers;
-            self.params = request.params;
-            self.body_type = request.body_type;
-            self.body = request.body;
-            self.response = None;
+            self.open_saved_request(request);
         }
 
         if let Some(id) = request_to_delete {
@@ -551,6 +728,16 @@ impl ApiTesterUi {
             if let Err(e) = store.delete_saved_request(id) {
                 self.error = Some(format!("删除请求失败: {}", e));
             } else {
+                for tab in &mut self.open_tabs {
+                    if tab.saved_request_id == Some(id) {
+                        tab.saved_request_id = None;
+                        tab.collection_id = None;
+                    }
+                }
+                if self.saved_request_id == Some(id) {
+                    self.saved_request_id = None;
+                    self.request_collection_id = None;
+                }
                 self.load_saved_requests(conn);
             }
         }
@@ -607,6 +794,24 @@ impl ApiTesterUi {
         }
     }
 
+    /// 获取集合及其所有后代集合的 ID
+    fn collection_and_descendant_ids(&self, collection_id: i64) -> Vec<i64> {
+        let mut ids = vec![collection_id];
+        let mut index = 0;
+
+        while index < ids.len() {
+            let parent_id = ids[index];
+            for collection in &self.collections {
+                if collection.parent_id == Some(parent_id) && !ids.contains(&collection.id) {
+                    ids.push(collection.id);
+                }
+            }
+            index += 1;
+        }
+
+        ids
+    }
+
     /// 渲染集合管理弹窗
     fn render_collection_dialog(&mut self, ui: &mut Ui, conn: &rusqlite::Connection) {
         egui::Window::new(if self.editing_collection_id.is_some() {
@@ -659,10 +864,25 @@ impl ApiTesterUi {
                         .clicked()
                     {
                         if let Some(id) = self.editing_collection_id {
+                            let deleted_collection_ids =
+                                self.collection_and_descendant_ids(id);
                             let store = ApiStore::new(conn);
                             if let Err(e) = store.delete_collection(id) {
                                 self.error = Some(format!("删除集合失败: {}", e));
                             } else {
+                                for tab in &mut self.open_tabs {
+                                    if tab
+                                        .collection_id
+                                        .is_some_and(|tab_id| deleted_collection_ids.contains(&tab_id))
+                                    {
+                                        tab.collection_id = None;
+                                    }
+                                }
+                                if self.request_collection_id.is_some_and(|tab_id| {
+                                    deleted_collection_ids.contains(&tab_id)
+                                }) {
+                                    self.request_collection_id = None;
+                                }
                                 self.load_collections(conn);
                                 self.show_collection_dialog = false;
                             }
@@ -999,6 +1219,8 @@ impl ApiTesterUi {
 
     /// 渲染主内容区域
     fn render_main_content(&mut self, ui: &mut Ui, conn: &rusqlite::Connection) {
+        self.render_open_request_tabs(ui);
+
         // 请求配置区域
         self.render_request_config(ui);
 
@@ -1055,6 +1277,20 @@ impl ApiTesterUi {
     /// 渲染请求配置
     fn render_request_config(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
+            ui.label("请求名称:");
+            let name_response = ui.add(
+                egui::TextEdit::singleline(&mut self.request.name)
+                    .hint_text("输入请求名称")
+                    .desired_width(260.0),
+            );
+            if name_response.changed() {
+                self.is_default_name = false;
+            }
+        });
+
+        ui.add_space(5.0);
+
+        ui.horizontal(|ui| {
             // HTTP 方法选择
             egui::ComboBox::from_id_salt("http_method")
                 .selected_text(self.request.method.as_str())
@@ -1075,6 +1311,111 @@ impl ApiTesterUi {
                     .desired_width(ui.available_width()),
             );
         });
+    }
+
+    /// 渲染已打开的请求标签页
+    fn render_open_request_tabs(&mut self, ui: &mut Ui) {
+        let tab_names: Vec<String> = self
+            .open_tabs
+            .iter()
+            .enumerate()
+            .map(|(index, tab)| {
+                if index == self.active_tab_index {
+                    Self::request_display_name(&self.request, self.is_default_name)
+                } else {
+                    Self::request_display_name(&tab.request, tab.is_default_name)
+                }
+            })
+            .collect();
+        let mut tab_to_activate = None;
+        let mut tab_to_close = None;
+
+        egui::ScrollArea::horizontal()
+            .id_salt("open_request_tabs")
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for (index, name) in tab_names.iter().enumerate() {
+                        let is_active = index == self.active_tab_index;
+                        let response = ui
+                            .selectable_label(is_active, name)
+                            .on_hover_text(name);
+                        if response.clicked() {
+                            tab_to_activate = Some(index);
+                        }
+
+                        if ui
+                            .small_button("×")
+                            .on_hover_text("关闭请求标签页")
+                            .clicked()
+                        {
+                            tab_to_close = Some(index);
+                        }
+                    }
+                });
+            });
+        ui.separator();
+
+        if let Some(index) = tab_to_close {
+            self.close_request_tab(index);
+        } else if let Some(index) = tab_to_activate {
+            self.activate_request_tab(index);
+        }
+    }
+
+    /// 获取请求标签页及集合列表使用的完整显示名称
+    fn request_display_name(request: &ApiRequest, is_default_name: bool) -> String {
+        if request.name.trim().is_empty() || (is_default_name && request.name == "New Request") {
+            if request.url.is_empty() {
+                "新建请求".to_string()
+            } else {
+                request.url.clone()
+            }
+        } else {
+            request.name.clone()
+        }
+    }
+
+    /// 获取保存到数据库的请求名称，不截断 URL 或用户输入
+    fn saved_request_name(request: &ApiRequest, is_default_name: bool) -> String {
+        if request.name.trim().is_empty() || (is_default_name && request.name == "New Request") {
+            if request.url.is_empty() {
+                "未命名请求".to_string()
+            } else {
+                request.url.clone()
+            }
+        } else {
+            request.name.trim().to_string()
+        }
+    }
+
+    /// 按显示字符数省略过长 URL，并保留完整 URL 作为悬浮提示
+    fn truncate_url(url: &str, max_chars: usize) -> String {
+        let chars: Vec<char> = url.chars().collect();
+        if chars.len() <= max_chars {
+            return url.to_string();
+        }
+
+        if max_chars <= 3 {
+            return chars.into_iter().take(max_chars).collect();
+        }
+
+        let prefix: String = chars.into_iter().take(max_chars - 3).collect();
+        format!("{}...", prefix)
+    }
+
+    /// 根据历史列表宽度计算 URL 列宽和近似可显示字符数
+    fn history_url_layout(available_width: f32) -> (f32, usize) {
+        let column_width = (available_width * 0.32).clamp(40.0, 240.0);
+        let max_chars = if column_width < 80.0 {
+            10
+        } else if column_width < 120.0 {
+            16
+        } else if column_width < 180.0 {
+            24
+        } else {
+            36
+        };
+        (column_width, max_chars)
     }
 
     /// 渲染请求标签页
@@ -1307,6 +1648,7 @@ impl ApiTesterUi {
         let mut to_load: Option<i64> = None;
         let mut to_delete: Option<i64> = None;
         let mut clear_all = false;
+        let (url_column_width, url_max_chars) = Self::history_url_layout(ui.available_width());
 
         // 工具栏：显示记录数和清空按钮
         ui.horizontal(|ui| {
@@ -1334,11 +1676,12 @@ impl ApiTesterUi {
             .show(ui, |ui| {
                 egui::Grid::new("api_history_table")
                     .striped(true)
-                    .num_columns(5)
+                    .num_columns(6)
                     .spacing([8.0, 4.0])
                     .min_col_width(40.0)
                     .show(ui, |ui| {
                         // 表头
+                        ui.strong("名称");
                         ui.strong("方法");
                         ui.strong("URL");
                         ui.strong("状态");
@@ -1368,6 +1711,17 @@ impl ApiTesterUi {
                                 "-".to_string()
                             };
 
+                            // 名称列
+                            let name_label = ui
+                                .add(
+                                    egui::Label::new(&history.name)
+                                        .sense(egui::Sense::click()),
+                                )
+                                .on_hover_text(&history.name);
+                            if name_label.clicked() {
+                                to_load = Some(history.id);
+                            }
+
                             // 方法列
                             ui.label(
                                 RichText::new(&history.method)
@@ -1378,17 +1732,21 @@ impl ApiTesterUi {
                             );
 
                             // URL 列（可点击）
+                            let url_display = Self::truncate_url(&history.url, url_max_chars);
                             let url_label = ui
-                                .label(
-                                    RichText::new(&history.url)
-                                        .small()
-                                        .color(Color32::from_rgb(100, 149, 237)),
+                                .add_sized(
+                                    [url_column_width, 20.0],
+                                    egui::Label::new(
+                                        RichText::new(url_display)
+                                            .small()
+                                            .color(Color32::from_rgb(100, 149, 237)),
+                                    )
+                                    .sense(egui::Sense::click()),
                                 )
                                 .on_hover_text(&history.url);
                             if url_label.clicked() {
                                 to_load = Some(history.id);
                             }
-
                             // 状态码列
                             if let Some(status) = history.status_code {
                                 let status_color = if status < 300 {
@@ -1462,31 +1820,38 @@ impl ApiTesterUi {
     fn load_history_item(&mut self, id: i64, conn: &rusqlite::Connection) {
         let store = ApiStore::new(conn);
         match store.get_history_by_id(id) {
-            Ok(Some((method, url, headers, params, body))) => {
+            Ok(Some((name, method, url, headers, params, body))) => {
+                self.create_request_tab();
+                self.request.name = if name.is_empty() { url.clone() } else { name };
+                self.saved_request_id = None;
+                self.request_collection_id = None;
+                self.is_default_name = false;
+
                 if let Some(m) = HttpMethod::from_str(&method) {
                     self.request.method = m;
                 }
                 self.request.url = url;
 
                 // 解析请求头
-                if !headers.is_empty() {
-                    if let Ok(parsed_headers) = serde_json::from_str::<Vec<HeaderEntry>>(&headers) {
+                if !headers.trim().is_empty() {
+                    if let Ok(parsed_headers) = serde_json::from_str::<Vec<HeaderEntry>>(&headers)
+                    {
                         self.headers = parsed_headers;
                     }
                 }
 
                 // 解析查询参数
-                if !params.is_empty() {
+                if !params.trim().is_empty() {
                     if let Ok(parsed_params) = serde_json::from_str::<Vec<HeaderEntry>>(&params) {
                         self.params = parsed_params;
                     }
-                } else {
-                    self.params = Vec::new();
                 }
 
                 // 解析请求体
-                if !body.is_empty() {
-                    self.body = body;
+                self.body = body;
+                if self.body.is_empty() {
+                    self.body_type = BodyType::None;
+                } else {
                     // 尝试检测请求体类型
                     if serde_json::from_str::<serde_json::Value>(&self.body).is_ok() {
                         self.body_type = BodyType::Json;
@@ -1516,10 +1881,7 @@ impl ApiTesterUi {
         self.response = None;
 
         // 更新请求配置
-        self.request.headers = self.headers.clone();
-        self.request.params = self.params.clone();
-        self.request.body_type = self.body_type.clone();
-        self.request.body = self.body.clone();
+        self.sync_request_fields();
 
         // 替换环境变量
         let replaced_request = self.replace_variables_in_request(&self.request);
@@ -1540,6 +1902,7 @@ impl ApiTesterUi {
 
                     match store.save_history(
                         &self.request.id,
+                        &Self::request_display_name(&self.request, self.is_default_name),
                         self.request.method.as_str(),
                         &self.request.url,
                         &headers_json,
@@ -1575,45 +1938,57 @@ impl ApiTesterUi {
     /// 保存请求到集合
     fn save_request_to_collection(&mut self, conn: &rusqlite::Connection) {
         // 更新请求配置
-        self.request.headers = self.headers.clone();
-        self.request.params = self.params.clone();
-        self.request.body_type = self.body_type.clone();
-        self.request.body = self.body.clone();
+        self.sync_request_fields();
 
         let store = ApiStore::new(conn);
         let headers_json = serde_json::to_string(&self.request.headers).unwrap_or_default();
         let params_json = serde_json::to_string(&self.request.params).unwrap_or_default();
 
-        // 如果请求名称为空，使用 URL 作为名称
-        let name = if self.request.name.is_empty() || self.request.name == "New Request" {
-            if self.request.url.is_empty() {
-                "未命名请求".to_string()
-            } else {
-                let url_display = if self.request.url.chars().count() > 40 {
-                    let truncated: String = self.request.url.chars().take(40).collect();
-                    format!("{}...", truncated)
-                } else {
-                    self.request.url.clone()
-                };
-                url_display
-            }
+        let name = Self::saved_request_name(&self.request, self.is_default_name);
+
+        let collection_id = if self.saved_request_id.is_some() {
+            self.request_collection_id
         } else {
-            self.request.name.clone()
+            self.selected_collection_id
+        };
+        let result = if let Some(id) = self.saved_request_id {
+            store.update_request(
+                id,
+                collection_id,
+                &name,
+                self.request.method.as_str(),
+                &self.request.url,
+                &headers_json,
+                &params_json,
+                self.request.body_type.as_str(),
+                &self.request.body,
+            )
+        } else {
+            match store.save_request(
+                collection_id,
+                &name,
+                self.request.method.as_str(),
+                &self.request.url,
+                &headers_json,
+                &params_json,
+                self.request.body_type.as_str(),
+                &self.request.body,
+            ) {
+                Ok(id) => {
+                    self.saved_request_id = Some(id);
+                    self.request_collection_id = collection_id;
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
         };
 
-        match store.save_request(
-            self.selected_collection_id,
-            &name,
-            self.request.method.as_str(),
-            &self.request.url,
-            &headers_json,
-            &params_json,
-            self.request.body_type.as_str(),
-            &self.request.body,
-        ) {
-            Ok(_) => {
-                self.load_saved_requests(conn);
+        match result {
+            Ok(()) => {
                 self.request.name = name;
+                self.is_default_name = false;
+                self.load_saved_requests(conn);
+                self.save_active_tab();
                 log::info!("请求已保存到集合");
             }
             Err(e) => {
@@ -1647,5 +2022,66 @@ impl ApiTesterUi {
             self.request.url = format!("http://localhost:{}/api/users", MOCK_SERVER_PORT);
             self.request.method = HttpMethod::Get;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_display_name_keeps_full_custom_name() {
+        let long_name = "这是一个超过原有限制的完整请求名称，用于验证不会被截断";
+        let request = ApiRequest {
+            name: long_name.to_string(),
+            ..ApiRequest::new()
+        };
+
+        assert_eq!(
+            ApiTesterUi::request_display_name(&request, false),
+            long_name
+        );
+        assert_eq!(
+            ApiTesterUi::saved_request_name(&request, false),
+            long_name
+        );
+    }
+
+    #[test]
+    fn request_name_falls_back_to_full_url() {
+        let long_url = "https://example.com/api/requests/with/a/very/long/path?param=full-value";
+        let request = ApiRequest {
+            url: long_url.to_string(),
+            ..ApiRequest::new()
+        };
+
+        assert_eq!(
+            ApiTesterUi::request_display_name(&request, true),
+            long_url
+        );
+        assert_eq!(ApiTesterUi::saved_request_name(&request, true), long_url);
+    }
+
+    #[test]
+    fn custom_new_request_name_is_not_replaced_by_url() {
+        let request = ApiRequest {
+            name: "New Request".to_string(),
+            url: "https://example.com/api".to_string(),
+            ..ApiRequest::new()
+        };
+
+        assert_eq!(
+            ApiTesterUi::saved_request_name(&request, false),
+            "New Request"
+        );
+    }
+
+    #[test]
+    fn long_url_is_truncated_with_ellipsis() {
+        assert_eq!(
+            ApiTesterUi::truncate_url("https://example.com/very-long-path", 20),
+            "https://example.c..."
+        );
+        assert_eq!(ApiTesterUi::truncate_url("short", 20), "short");
     }
 }

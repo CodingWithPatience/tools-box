@@ -92,6 +92,7 @@ impl<'a> ApiStore<'a> {
             "CREATE TABLE IF NOT EXISTS api_history (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
                 request_id   TEXT NOT NULL,
+                name         TEXT NOT NULL DEFAULT '',
                 method       TEXT NOT NULL,
                 url          TEXT NOT NULL,
                 headers      TEXT,
@@ -116,22 +117,30 @@ impl<'a> ApiStore<'a> {
             [],
         )?;
 
-        // 添加 params 列（如果不存在）
-        match self
-            .conn
-            .execute("ALTER TABLE api_history ADD COLUMN params TEXT", [])
-        {
-            Ok(_) => {}
-            Err(rusqlite::Error::SqliteFailure(e, _))
-                if e.extended_code == rusqlite::ffi::SQLITE_ERROR =>
-            {
-                // 列已存在，忽略错误
-            }
-            Err(e) => return Err(e.into()),
-        }
+        // 兼容旧版本历史表结构
+        self.ensure_history_column("params", "TEXT")?;
+        self.ensure_history_column("name", "TEXT NOT NULL DEFAULT ''")?;
 
         // 初始化默认全局环境（如果不存在）
         self.init_default_environment()?;
+
+        Ok(())
+    }
+
+    /// 为历史表补充缺失列
+    fn ensure_history_column(&self, column: &str, definition: &str) -> Result<()> {
+        let mut stmt = self.conn.prepare("PRAGMA table_info(api_history)")?;
+        let column_names: Vec<String> = stmt
+            .query_map([], |row| row.get(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        if !column_names.iter().any(|name| name == column) {
+            let sql = format!(
+                "ALTER TABLE api_history ADD COLUMN {} {}",
+                column, definition
+            );
+            self.conn.execute(&sql, [])?;
+        }
 
         Ok(())
     }
@@ -158,6 +167,7 @@ impl<'a> ApiStore<'a> {
     pub fn save_history(
         &self,
         request_id: &str,
+        name: &str,
         method: &str,
         url: &str,
         headers: &str,
@@ -169,10 +179,11 @@ impl<'a> ApiStore<'a> {
         elapsed_ms: Option<i64>,
     ) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO api_history (request_id, method, url, headers, params, body_type, body, status_code, response, elapsed_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO api_history (request_id, name, method, url, headers, params, body_type, body, status_code, response, elapsed_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 request_id,
+                name,
                 method,
                 url,
                 headers,
@@ -191,7 +202,8 @@ impl<'a> ApiStore<'a> {
     /// 获取最近的历史记录
     pub fn get_recent_history(&self, limit: usize) -> Result<Vec<RequestHistory>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, request_id, method, url, status_code, elapsed_ms, executed_at
+            "SELECT id, request_id, COALESCE(NULLIF(name, ''), url), method, url,
+                    status_code, elapsed_ms, executed_at
              FROM api_history
              ORDER BY executed_at DESC
              LIMIT ?1",
@@ -202,11 +214,12 @@ impl<'a> ApiStore<'a> {
                 Ok(RequestHistory {
                     id: row.get(0)?,
                     request_id: row.get(1)?,
-                    method: row.get(2)?,
-                    url: row.get(3)?,
-                    status_code: row.get(4)?,
-                    elapsed_ms: row.get(5)?,
-                    executed_at: row.get(6)?,
+                    name: row.get(2)?,
+                    method: row.get(3)?,
+                    url: row.get(4)?,
+                    status_code: row.get(5)?,
+                    elapsed_ms: row.get(6)?,
+                    executed_at: row.get(7)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -218,19 +231,23 @@ impl<'a> ApiStore<'a> {
     pub fn get_history_by_id(
         &self,
         id: i64,
-    ) -> Result<Option<(String, String, String, String, String)>> {
+    ) -> Result<Option<(String, String, String, String, String, String)>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT method, url, headers, params, body FROM api_history WHERE id = ?1")?;
+            .prepare(
+                "SELECT name, method, url, headers, params, body
+                 FROM api_history WHERE id = ?1",
+            )?;
 
         let result = stmt
             .query_row(params![id], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
-                    row.get::<_, String>(2).unwrap_or_default(),
+                    row.get::<_, String>(2)?,
                     row.get::<_, String>(3).unwrap_or_default(),
                     row.get::<_, String>(4).unwrap_or_default(),
+                    row.get::<_, String>(5).unwrap_or_default(),
                 ))
             })
             .optional()?;
@@ -351,6 +368,45 @@ impl<'a> ApiStore<'a> {
             params![collection_id, name, method, url, headers, params, body_type, body],
         )?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// 更新已保存的请求
+    pub fn update_request(
+        &self,
+        id: i64,
+        collection_id: Option<i64>,
+        name: &str,
+        method: &str,
+        url: &str,
+        headers: &str,
+        params: &str,
+        body_type: &str,
+        body: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE api_saved_requests
+             SET collection_id = ?1, name = ?2, method = ?3, url = ?4,
+                 headers = ?5, params = ?6, body_type = ?7, body = ?8,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?9",
+            params![
+                collection_id,
+                name,
+                method,
+                url,
+                headers,
+                params,
+                body_type,
+                body,
+                id,
+            ],
+        )?;
+
+        if self.conn.changes() == 0 {
+            return Err(anyhow::anyhow!("保存的请求不存在: {}", id));
+        }
+
+        Ok(())
     }
 
     /// 删除保存的请求
@@ -535,5 +591,106 @@ impl<T> OptionalExt<T> for Result<T, rusqlite::Error> {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    #[test]
+    fn update_request_updates_existing_row() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        let store = ApiStore::new(&conn);
+        store.init_table()?;
+
+        let id = store.save_request(
+            None,
+            "原始名称",
+            "GET",
+            "https://example.com/old",
+            "[]",
+            "[]",
+            "None",
+            "",
+        )?;
+        let collection_id = store.create_collection("测试集合", None)?;
+
+        store.update_request(
+            id,
+            Some(collection_id),
+            "更新后的完整请求名称",
+            "POST",
+            "https://example.com/new",
+            "[]",
+            "[]",
+            "JSON",
+            "{}",
+        )?;
+
+        let requests = store.get_requests_by_collection(Some(collection_id))?;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].id, id);
+        assert_eq!(requests[0].name, "更新后的完整请求名称");
+        assert_eq!(requests[0].url, "https://example.com/new");
+        assert!(store.get_requests_by_collection(None)?.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn update_request_returns_error_for_missing_row() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        let store = ApiStore::new(&conn);
+        store.init_table()?;
+
+        let result = store.update_request(
+            999,
+            None,
+            "请求",
+            "GET",
+            "https://example.com",
+            "[]",
+            "[]",
+            "None",
+            "",
+        );
+
+        assert!(result.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn history_preserves_request_name() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        let store = ApiStore::new(&conn);
+        store.init_table()?;
+
+        let id = store.save_history(
+            "request-id",
+            "用户列表请求",
+            "GET",
+            "https://example.com/users",
+            "[]",
+            "[]",
+            "None",
+            "",
+            Some(200),
+            Some("{}"),
+            Some(10),
+        )?;
+
+        let history = store.get_recent_history(10)?;
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].id, id);
+        assert_eq!(history[0].name, "用户列表请求");
+
+        let detail = store.get_history_by_id(id)?.ok_or_else(|| {
+            anyhow::anyhow!("历史记录不存在")
+        })?;
+        assert_eq!(detail.0, "用户列表请求");
+
+        Ok(())
     }
 }

@@ -616,6 +616,7 @@ CREATE INDEX idx_api_env_vars_environment ON api_environment_variables(environme
 CREATE TABLE api_history (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     request_id   TEXT NOT NULL,
+    name         TEXT NOT NULL DEFAULT '',  -- 请求名称
     method       TEXT NOT NULL,
     url          TEXT NOT NULL,
     headers      TEXT,
@@ -749,8 +750,28 @@ CREATE INDEX idx_api_history_executed_at ON api_history(executed_at);
 
 ### 6.2 API 工具扩展
 
-- 请求集合管理
+- 集合导入导出增强
 - 环境变量集合
 - 自动化测试脚本
 - WebSocket 支持
 - GraphQL 支持
+
+### 6.3 API 调试插件功能优化完成记录（2026-08-16）
+
+本次已完成 API 调试插件的请求保存与多请求编辑能力优化：
+
+| 优化项 | 完成结果 |
+|--------|----------|
+| 自定义请求名称 | 请求编辑区新增名称输入框，保存时使用用户输入的名称；名称为空时使用完整 URL 或“未命名请求” |
+| 名称完整显示 | 移除保存时对 URL 名称的 40 字符截断；集合请求列表和请求 Tab 使用完整名称，并通过悬浮提示辅助查看 |
+| 历史列表名称与宽度 | 历史列表新增名称列并置于第一列；点击历史记录后 Tab 使用请求名称；历史 URL 超出列表可用宽度时省略显示并保留悬浮提示 |
+| 修改请求名称 | 已保存请求加载后可直接修改名称，点击保存会更新原记录 |
+| 保存更新逻辑 | 请求 Tab 保存已存在的请求时按数据库 ID 执行 `UPDATE`，不再重复插入；新请求仍执行 `INSERT` |
+| 多请求 Tab | 每个请求 Tab 独立保存请求配置、请求头、查询参数、请求体、响应及编辑子 Tab，可新建、打开、切换和关闭多个请求 |
+| 重复打开处理 | 已打开的已保存请求再次点击时切换到原 Tab，避免同一请求重复打开 |
+| 数据层测试 | 增加已保存请求更新成功和目标记录不存在时返回错误的单元测试 |
+
+涉及实现文件：
+
+- `src/plugins/api_tester/ui.rs`：请求 Tab 状态管理、名称编辑、保存更新调用及请求列表交互。
+- `src/plugins/api_tester/store.rs`：新增已保存请求更新方法及对应单元测试。

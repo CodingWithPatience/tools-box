@@ -228,6 +228,7 @@ impl ApiResponse {
 pub struct RequestHistory {
     pub id: i64,
     pub request_id: String,
+    pub name: String,
     pub method: String,
     pub url: String,
     pub status_code: Option<i32>,
