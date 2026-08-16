@@ -72,3 +72,7 @@ windows-sys = { version = "0.60", features = [
     "Win32_System_Threading",
     "Win32_Storage_FileSystem",
 ] }
+
+[patch.crates-io]
+# Windows 下保留 Ctrl+Shift+C/V 的 Key 事件，供 SSH 终端可靠区分控制键与剪贴板快捷键。
+egui-winit = { path = "vendor/egui-winit-0.31.1" }

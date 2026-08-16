@@ -7,11 +7,127 @@ use super::client::SshClient;
 use super::crypto;
 use super::models::{
     AuthMethod, AuthType, NewSession, SessionForm, SessionState, SessionTab, SessionViewTab,
-    SftpControl, SftpRequest, SftpResponse, SshInput, SshOutput, fail_unfinished_transfers,
+    SftpControl, SftpRequest, SftpResponse, SshInput, SshOutput, TerminalSelection,
+    fail_unfinished_transfers,
 };
 use super::sftp::{self, SftpClient};
 use super::store::SshStore;
 use super::terminal::TerminalEmulator;
+
+/// 终端内容与底部状态栏之间的安全间距
+const TERMINAL_BOTTOM_PADDING: f32 = 6.0;
+/// 等待系统剪贴板 Paste 事件的最长时间
+const TERMINAL_PASTE_TIMEOUT_SECONDS: f64 = 2.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalClipboardAction {
+    Copy,
+    Paste,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TerminalClipboardFrame {
+    copy_requested: bool,
+    interrupt_requested: bool,
+    paste_requested: bool,
+    paste_text: Option<String>,
+}
+
+fn terminal_clipboard_action(
+    key: egui::Key,
+    pressed: bool,
+    repeat: bool,
+    modifiers: egui::Modifiers,
+) -> Option<TerminalClipboardAction> {
+    if !pressed || repeat || !modifiers.ctrl || !modifiers.shift {
+        return None;
+    }
+
+    match key {
+        egui::Key::C => Some(TerminalClipboardAction::Copy),
+        egui::Key::V => Some(TerminalClipboardAction::Paste),
+        _ => None,
+    }
+}
+
+fn is_terminal_clipboard_shortcut(key: egui::Key, modifiers: egui::Modifiers) -> bool {
+    modifiers.ctrl && modifiers.shift && matches!(key, egui::Key::C | egui::Key::V)
+}
+
+fn analyze_terminal_clipboard_events(events: &[egui::Event]) -> TerminalClipboardFrame {
+    let mut frame = TerminalClipboardFrame::default();
+    for event in events {
+        match event {
+            egui::Event::Key {
+                key,
+                pressed,
+                repeat,
+                modifiers,
+                ..
+            } if modifiers.ctrl && *key == egui::Key::C => {
+                if *pressed && !*repeat && !modifiers.shift {
+                    frame.interrupt_requested = true;
+                } else if let Some(action) =
+                    terminal_clipboard_action(*key, *pressed, *repeat, *modifiers)
+                {
+                    match action {
+                        TerminalClipboardAction::Copy => frame.copy_requested = true,
+                        TerminalClipboardAction::Paste => frame.paste_requested = true,
+                    }
+                }
+            }
+            egui::Event::Key {
+                key,
+                pressed,
+                repeat,
+                modifiers,
+                ..
+            } if is_terminal_clipboard_shortcut(*key, *modifiers) => {
+                match terminal_clipboard_action(*key, *pressed, *repeat, *modifiers) {
+                    Some(TerminalClipboardAction::Copy) => frame.copy_requested = true,
+                    Some(TerminalClipboardAction::Paste) => frame.paste_requested = true,
+                    None => {}
+                }
+            }
+            egui::Event::Copy if cfg!(target_os = "windows") => {
+                // 本地 egui-winit 补丁会为 Ctrl+Shift+C 保留 Key 事件，
+                // 因此 Windows 下剩余的 Copy 对应普通 Ctrl+C。
+                frame.interrupt_requested = true;
+            }
+            egui::Event::Copy => frame.copy_requested = true,
+            egui::Event::Paste(text) if frame.paste_text.is_none() => {
+                frame.paste_text = Some(text.clone());
+            }
+            _ => {}
+        }
+    }
+
+    frame
+}
+
+fn accepted_terminal_paste_text(
+    frame: &TerminalClipboardFrame,
+    paste_was_pending: bool,
+) -> Option<&str> {
+    if frame.paste_requested || paste_was_pending {
+        frame.paste_text.as_deref()
+    } else {
+        None
+    }
+}
+
+fn send_terminal_paste(tx: &mpsc::SyncSender<SshInput>, text: &str) -> Result<bool, String> {
+    if text.is_empty() {
+        return Ok(false);
+    }
+
+    tx.try_send(SshInput::KeyInput(text.as_bytes().to_vec()))
+        .map(|()| true)
+        .map_err(|error| match error {
+            mpsc::TrySendError::Full(_) => "终端输入队列已满，请稍后重试".to_string(),
+            mpsc::TrySendError::Disconnected(_) => "终端连接已关闭，无法粘贴".to_string(),
+        })
+}
 
 /// SSH 客户端 UI 状态
 pub struct SshClientUi {
@@ -63,6 +179,69 @@ impl SshClientUi {
     /// 获取当前活动标签的可变引用
     fn current_tab_mut(&mut self) -> Option<&mut SessionTab> {
         self.active_tab_index.and_then(|idx| self.tabs.get_mut(idx))
+    }
+
+    /// 复制终端选区；没有选区时复制当前可见内容
+    fn copy_terminal_text(&mut self, ctx: &egui::Context) {
+        let Some(tab) = self.current_tab_mut() else {
+            return;
+        };
+        let Some(terminal) = tab.terminal.as_ref() else {
+            return;
+        };
+
+        let (text, selected) = match tab.terminal_selection {
+            Some(selection) => {
+                let (start, end) = selection.normalized();
+                (terminal.text_between(start, end), true)
+            }
+            None => (terminal.visible_text(), false),
+        };
+
+        if text.is_empty() {
+            tab.status_msg = "终端没有可复制的文本".to_string();
+            return;
+        }
+
+        ctx.copy_text(text);
+        tab.status_msg = if selected {
+            "已复制终端选中文本".to_string()
+        } else {
+            "已复制当前可见终端内容".to_string()
+        };
+    }
+
+    /// 请求平台读取系统剪贴板并生成 Paste 事件
+    fn request_terminal_paste(&mut self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+        ctx.request_repaint_after(std::time::Duration::from_secs_f64(
+            TERMINAL_PASTE_TIMEOUT_SECONDS,
+        ));
+        let deadline = ctx.input(|i| i.time + TERMINAL_PASTE_TIMEOUT_SECONDS);
+        if let Some(tab) = self.current_tab_mut() {
+            tab.terminal_paste_deadline = Some(deadline);
+            tab.status_msg = "已请求读取剪贴板".to_string();
+        }
+    }
+
+    /// 应用终端粘贴成功后的统一状态
+    fn finish_terminal_paste(&mut self) {
+        if let Some(tab) = self.current_tab_mut() {
+            tab.status_msg = "已粘贴剪贴板文本".to_string();
+            tab.terminal_paste_deadline = None;
+            tab.terminal_selection = None;
+            if let Some(terminal) = &mut tab.terminal {
+                terminal.set_scrollback(0);
+            }
+        }
+    }
+
+    /// 应用平台未返回可粘贴文本时的状态
+    fn finish_empty_terminal_paste(&mut self) {
+        if let Some(tab) = self.current_tab_mut() {
+            tab.terminal_paste_deadline = None;
+            tab.status_msg = "剪贴板为空，未执行粘贴".to_string();
+        }
     }
 
     /// 关闭指定索引的标签
@@ -341,9 +520,11 @@ impl SshClientUi {
                             if scroll_y > 0.0 && scrollback < scrollback_size {
                                 // 向上滚动
                                 term.set_scrollback(scrollback + 1);
+                                tab.terminal_selection = None;
                             } else if scroll_y < 0.0 && scrollback > 0 {
                                 // 向下滚动
                                 term.set_scrollback(scrollback - 1);
+                                tab.terminal_selection = None;
                             }
                         }
                     }
@@ -353,6 +534,7 @@ impl SshClientUi {
                         if let Some(term) = &mut tab.terminal {
                             term.set_scrollback(0);
                         }
+                        tab.terminal_selection = None;
                     }
                 } else if let Some(tab) = self.current_tab_mut() {
                     // 同步全局字体大小（用户未自定义且大小变化时）
@@ -391,6 +573,9 @@ impl SshClientUi {
                     Ok(SshOutput::TerminalData(data)) => {
                         if let Some(term) = &mut tab.terminal {
                             term.process(&data);
+                        }
+                        if !data.is_empty() {
+                            tab.terminal_selection = None;
                         }
                     }
                     Ok(SshOutput::Connected) => {
@@ -754,7 +939,7 @@ impl SshClientUi {
                 ui.selectable_value(&mut active_sub_tab, SessionViewTab::Terminal, "🖥 终端");
                 // 更新到标签
                 if active_sub_tab != tab.active_tab {
-                    self.tabs[active_idx].active_tab = active_sub_tab;
+                    self.tabs[active_idx].active_tab = active_sub_tab.clone();
                 }
             } else {
                 ui.add_enabled(false, egui::Label::new("🖥 终端(已断开)"));
@@ -788,6 +973,8 @@ impl SshClientUi {
     // ===================================================================
 
     fn render_terminal_content(&mut self, ui: &mut egui::Ui) {
+        let mut copy_terminal = false;
+        let mut paste_terminal = false;
         let Some(tab) = self.current_tab() else {
             ui.centered_and_justified(|ui| {
                 ui.label("没有活动的会话标签");
@@ -825,9 +1012,8 @@ impl SshClientUi {
         let new_cols = ((ui.available_width() - 20.0) / char_width)
             .max(1.0)
             .min(f32::from(u16::MAX)) as u16;
-        let new_rows = (available_height / line_height)
-            .max(1.0)
-            .min(f32::from(u16::MAX)) as u16;
+        let terminal_content_height = (available_height - TERMINAL_BOTTOM_PADDING).max(line_height);
+        let new_rows = terminal_content_rows(available_height, line_height);
 
         // 调整终端大小
         let Some(tab) = self.current_tab_mut() else {
@@ -837,6 +1023,7 @@ impl SshClientUi {
             let (cur_cols, cur_rows) = term.size();
             if new_cols != cur_cols || new_rows != cur_rows {
                 term.resize(new_cols, new_rows);
+                tab.terminal_selection = None;
                 if let Some(tx) = &tab.input_tx {
                     let _ = tx.send(SshInput::Resize(new_cols, new_rows));
                 }
@@ -861,23 +1048,95 @@ impl SshClientUi {
             let job = term.render_to_layout_job(is_dark_mode);
             let content_w = f32::from(new_cols) * char_width + 20.0;
             ui.set_min_width(content_w);
-            ui.set_min_height(available_height);
+            ui.set_min_height(terminal_content_height);
 
-            let response = ui.label(job);
+            let response = ui.add(
+                egui::Label::new(job)
+                    .sense(egui::Sense::click_and_drag())
+                    .selectable(false),
+            );
             let text_rect = response.rect;
+
+            if response.clicked_by(egui::PointerButton::Primary) {
+                tab.terminal_selection = None;
+            }
+            if response.drag_started_by(egui::PointerButton::Primary)
+                && let Some(pointer_pos) = response.interact_pointer_pos()
+                && let Some(position) = terminal_position_from_pointer(
+                    pointer_pos,
+                    text_rect,
+                    char_width,
+                    line_height,
+                    new_cols,
+                    new_rows,
+                )
+            {
+                tab.terminal_selection =
+                    Some(TerminalSelection::new(term.normalize_position(position)));
+            }
+            if response.dragged_by(egui::PointerButton::Primary)
+                && let Some(pointer_pos) = response.interact_pointer_pos()
+                && let Some(position) = terminal_position_from_pointer(
+                    pointer_pos,
+                    text_rect,
+                    char_width,
+                    line_height,
+                    new_cols,
+                    new_rows,
+                )
+                && let Some(selection) = &mut tab.terminal_selection
+            {
+                selection.focus = term.normalize_position(position);
+            }
+
+            if let Some(selection) = tab.terminal_selection {
+                let (_, end) = selection.normalized();
+                paint_terminal_selection(
+                    ui,
+                    text_rect,
+                    selection,
+                    char_width,
+                    line_height,
+                    new_cols,
+                    term.char_width_at(end),
+                );
+            }
+
+            response.context_menu(|ui| {
+                if ui.button("📋 复制").clicked() {
+                    copy_terminal = true;
+                    ui.close_menu();
+                }
+                if ui.button("📥 粘贴").clicked() {
+                    paste_terminal = true;
+                    ui.close_menu();
+                }
+                if ui.button("清除选择").clicked() {
+                    tab.terminal_selection = None;
+                    ui.close_menu();
+                }
+            });
 
             // 绘制闪烁光标（考虑滚动偏移）
             let (c_col, c_row) = term.cursor_position();
             let scrollback = term.scrollback();
             let cursor_w = term.cursor_char_width();
-            let cursor_x = text_rect.left() + f32::from(c_col) * char_width;
-            // 光标位置需要考虑滚动偏移
-            let cursor_y = text_rect.top() + f32::from(c_row + scrollback as u16) * line_height;
-            let cursor_width = char_width * f32::from(cursor_w);
+            let cursor_display_row = terminal_cursor_display_row(c_row, scrollback);
+            let cursor_rect = terminal_cursor_rect(
+                text_rect.min,
+                c_col,
+                cursor_display_row,
+                cursor_w,
+                char_width,
+                line_height,
+            );
+            let terminal_canvas_rect = egui::Rect::from_min_size(
+                text_rect.min,
+                egui::vec2(f32::from(new_cols) * char_width, terminal_content_height),
+            );
 
-            // 只有光标在可视区域内才显示
-            let cursor_in_view =
-                cursor_y >= text_rect.top() && cursor_y + line_height <= text_rect.bottom();
+            // 使用显式终端画布判断可见性，避免最后一行受文本 galley 浮点边界影响
+            let cursor_in_view = terminal_cursor_in_view(cursor_rect, terminal_canvas_rect);
             if cursor_in_view {
                 let time = ui.ctx().input(|i| i.time);
                 let blink_on = (time * 2.0) as u64 % 2 == 0;
@@ -887,30 +1146,22 @@ impl SshClientUi {
                     } else {
                         Color32::from_rgb(0x30, 0x30, 0x30)
                     };
-                    ui.painter().rect_filled(
-                        egui::Rect::from_min_size(
-                            egui::pos2(cursor_x, cursor_y),
-                            egui::vec2(cursor_width, line_height),
-                        ),
-                        0.0,
-                        cursor_color,
-                    );
+                    ui.painter()
+                        .with_clip_rect(terminal_canvas_rect)
+                        .rect_filled(cursor_rect, 0.0, cursor_color);
                 }
             }
 
             // 设置 IME 输出位置
-            let cursor_rect = egui::Rect::from_min_size(
-                egui::pos2(cursor_x, cursor_y),
-                egui::vec2(cursor_width, line_height),
-            );
             let to_global = ui
                 .ctx()
                 .layer_transform_to_global(ui.layer_id())
                 .unwrap_or_default();
             ui.ctx().output_mut(|o| {
                 o.ime = Some(egui::output::IMEOutput {
-                    rect: to_global * text_rect,
-                    cursor_rect: to_global * cursor_rect,
+                    rect: to_global * terminal_canvas_rect,
+                    cursor_rect: to_global
+                        * terminal_ime_cursor_rect(cursor_rect, terminal_canvas_rect),
                 });
             });
         } else if tab.connection_state == SessionState::Connecting {
@@ -918,6 +1169,8 @@ impl SshClientUi {
                 ui.label("正在连接...");
             });
         }
+
+        ui.add_space(TERMINAL_BOTTOM_PADDING);
 
         // 底部状态栏
         let cursor_pos = tab
@@ -932,6 +1185,13 @@ impl SshClientUi {
                 cursor_pos.0, cursor_pos.1, font_size, status_msg
             ));
         });
+
+        if copy_terminal {
+            self.copy_terminal_text(ui.ctx());
+        }
+        if paste_terminal {
+            self.request_terminal_paste(ui.ctx());
+        }
     }
 
     // ===================================================================
@@ -1326,23 +1586,36 @@ impl SshClientUi {
     ) -> bool {
         let mut had_input = false;
         let mut ime_active = self.current_tab().map(|t| t.ime_active).unwrap_or(false);
+        let current_time = ctx.input(|i| i.time);
+        let paste_deadline = self
+            .current_tab()
+            .and_then(|tab| tab.terminal_paste_deadline);
+        let paste_was_pending = paste_deadline.is_some_and(|deadline| current_time <= deadline);
+        let paste_request_expired = paste_deadline.is_some_and(|deadline| current_time > deadline);
+        let mut clipboard_frame = TerminalClipboardFrame::default();
 
         ctx.input_mut(|i| {
+            clipboard_frame = analyze_terminal_clipboard_events(&i.events);
             for event in i.events.clone() {
                 match event {
                     egui::Event::Key {
                         key,
-                        pressed: true,
+                        pressed,
                         modifiers,
                         ..
                     } => {
-                        if ime_active && !modifiers.ctrl {
+                        if modifiers.ctrl && key == egui::Key::C {
+                            i.consume_key(modifiers, key);
                             continue;
                         }
-                        if key == egui::Key::C && modifiers.ctrl {
-                            let _ = tx.send(SshInput::KeyInput(vec![0x03]));
+                        if is_terminal_clipboard_shortcut(key, modifiers) {
                             i.consume_key(modifiers, key);
-                            had_input = true;
+                            continue;
+                        }
+                        if !pressed {
+                            continue;
+                        }
+                        if ime_active && !modifiers.ctrl {
                             continue;
                         }
                         if key == egui::Key::D && modifiers.ctrl {
@@ -1422,6 +1695,7 @@ impl SshClientUi {
                         let _ = tx.send(SshInput::KeyInput(text.as_bytes().to_vec()));
                         had_input = true;
                     }
+                    egui::Event::Paste(_) => {}
                     egui::Event::Ime(ime_event) => match ime_event {
                         egui::ImeEvent::Enabled => {
                             ime_active = true;
@@ -1446,6 +1720,36 @@ impl SshClientUi {
         // 更新当前标签的 IME 状态
         if let Some(tab) = self.current_tab_mut() {
             tab.ime_active = ime_active;
+        }
+
+        if clipboard_frame.copy_requested {
+            self.copy_terminal_text(ctx);
+        }
+        if clipboard_frame.interrupt_requested {
+            let _ = tx.send(SshInput::KeyInput(vec![0x03]));
+            had_input = true;
+        }
+        let accepted_paste =
+            accepted_terminal_paste_text(&clipboard_frame, paste_was_pending).map(str::to_owned);
+        if let Some(text) = accepted_paste {
+            match send_terminal_paste(tx, &text) {
+                Ok(true) => {
+                    had_input = true;
+                    self.finish_terminal_paste();
+                }
+                Ok(false) => self.finish_empty_terminal_paste(),
+                Err(error) => {
+                    if let Some(tab) = self.current_tab_mut() {
+                        tab.terminal_paste_deadline = None;
+                        tab.status_msg = format!("粘贴失败: {}", error);
+                    }
+                    log::error!("发送终端粘贴文本失败: {}", error);
+                }
+            }
+        } else if clipboard_frame.paste_requested {
+            self.request_terminal_paste(ctx);
+        } else if paste_request_expired {
+            self.finish_empty_terminal_paste();
         }
 
         let terminal_id = egui::Id::new("ssh_terminal_input");
@@ -2020,6 +2324,146 @@ impl SshClientUi {
     }
 }
 
+fn terminal_position_from_pointer(
+    pointer_pos: egui::Pos2,
+    text_rect: egui::Rect,
+    char_width: f32,
+    line_height: f32,
+    cols: u16,
+    rows: u16,
+) -> Option<(u16, u16)> {
+    if char_width <= 0.0 || line_height <= 0.0 || cols == 0 || rows == 0 {
+        return None;
+    }
+
+    let relative_x = (pointer_pos.x - text_rect.left()).max(0.0);
+    let relative_y = (pointer_pos.y - text_rect.top()).max(0.0);
+    let col = terminal_axis_position(relative_x, char_width, cols);
+    let row = terminal_axis_position(relative_y, line_height, rows);
+    Some((col, row))
+}
+
+fn terminal_content_rows(available_height: f32, line_height: f32) -> u16 {
+    if !available_height.is_finite() || !line_height.is_finite() || line_height <= 0.0 {
+        return 1;
+    }
+
+    let usable_height = (available_height - TERMINAL_BOTTOM_PADDING).max(line_height);
+    let mut low = 1_u16;
+    let mut high = u16::MAX;
+    while low < high {
+        let middle = low + (high - low).saturating_add(1) / 2;
+        if f32::from(middle) * line_height <= usable_height {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    low
+}
+
+fn terminal_cursor_rect(
+    text_origin: egui::Pos2,
+    col: u16,
+    row: u16,
+    cursor_cols: u16,
+    char_width: f32,
+    line_height: f32,
+) -> egui::Rect {
+    let vertical_inset = 1.0_f32.min(line_height / 4.0);
+    let cursor_height = (line_height - vertical_inset * 2.0).max(1.0);
+    egui::Rect::from_min_size(
+        egui::pos2(
+            text_origin.x + f32::from(col) * char_width,
+            text_origin.y + f32::from(row) * line_height + vertical_inset,
+        ),
+        egui::vec2(char_width * f32::from(cursor_cols.max(1)), cursor_height),
+    )
+}
+
+fn terminal_cursor_in_view(cursor_rect: egui::Rect, canvas_rect: egui::Rect) -> bool {
+    const EDGE_TOLERANCE: f32 = 0.5;
+
+    cursor_rect.left() >= canvas_rect.left() - EDGE_TOLERANCE
+        && cursor_rect.right() <= canvas_rect.right() + EDGE_TOLERANCE
+        && cursor_rect.top() >= canvas_rect.top() - EDGE_TOLERANCE
+        && cursor_rect.bottom() <= canvas_rect.bottom() + EDGE_TOLERANCE
+}
+
+fn terminal_cursor_display_row(cursor_row: u16, scrollback: usize) -> u16 {
+    let scrollback_rows = u16::try_from(scrollback).unwrap_or(u16::MAX);
+    cursor_row.saturating_add(scrollback_rows)
+}
+
+fn terminal_ime_cursor_rect(cursor_rect: egui::Rect, canvas_rect: egui::Rect) -> egui::Rect {
+    let cursor_size = egui::vec2(
+        cursor_rect.width().min(canvas_rect.width()),
+        cursor_rect.height().min(canvas_rect.height()),
+    );
+    let max_x = (canvas_rect.right() - cursor_size.x).max(canvas_rect.left());
+    let max_y = (canvas_rect.bottom() - cursor_size.y).max(canvas_rect.top());
+    let cursor_min = egui::pos2(
+        cursor_rect.left().clamp(canvas_rect.left(), max_x),
+        cursor_rect.top().clamp(canvas_rect.top(), max_y),
+    );
+    egui::Rect::from_min_size(cursor_min, cursor_size)
+}
+
+fn terminal_axis_position(relative: f32, cell_size: f32, cell_count: u16) -> u16 {
+    if cell_count == 0 {
+        return 0;
+    }
+
+    let mut low = 0;
+    let mut high = cell_count;
+    while low < high {
+        let middle = low + (high - low) / 2;
+        let boundary = f32::from(middle.saturating_add(1)) * cell_size;
+        if relative < boundary {
+            high = middle;
+        } else {
+            low = middle.saturating_add(1);
+        }
+    }
+    low.min(cell_count - 1)
+}
+
+fn paint_terminal_selection(
+    ui: &egui::Ui,
+    text_rect: egui::Rect,
+    selection: TerminalSelection,
+    char_width: f32,
+    line_height: f32,
+    cols: u16,
+    end_char_width: u16,
+) {
+    if cols == 0 {
+        return;
+    }
+
+    let ((start_col, start_row), (end_col, end_row)) = selection.normalized();
+    let base_color = ui.visuals().selection.bg_fill;
+    let selection_color =
+        Color32::from_rgba_unmultiplied(base_color.r(), base_color.g(), base_color.b(), 96);
+
+    for row in start_row..=end_row {
+        let row_start_col = if row == start_row { start_col } else { 0 };
+        let row_end_col = if row == end_row { end_col } else { cols - 1 };
+        let min = egui::pos2(
+            text_rect.left() + f32::from(row_start_col) * char_width,
+            text_rect.top() + f32::from(row) * line_height,
+        );
+        let end_width = if row == end_row { end_char_width } else { 1 };
+        let row_end_exclusive = row_end_col.saturating_add(end_width).min(cols);
+        let max = egui::pos2(
+            text_rect.left() + f32::from(row_end_exclusive) * char_width,
+            min.y + line_height,
+        );
+        ui.painter()
+            .rect_filled(egui::Rect::from_min_max(min, max), 0.0, selection_color);
+    }
+}
+
 fn format_session_addr(session: &super::models::SshSession) -> String {
     if session.port == 22 {
         format!("{}@{}", session.username, session.host)
@@ -2173,8 +2617,246 @@ fn render_file_rows(
 mod tests {
     use std::sync::mpsc;
 
-    use super::{has_active_transfer, remote_parent_path, send_remote_directory_request};
-    use crate::plugins::ssh_client::models::SftpRequest;
+    use super::{
+        SshClientUi, TERMINAL_BOTTOM_PADDING, TerminalClipboardAction,
+        accepted_terminal_paste_text, analyze_terminal_clipboard_events, has_active_transfer,
+        remote_parent_path, send_remote_directory_request, send_terminal_paste,
+        terminal_clipboard_action, terminal_content_rows, terminal_cursor_display_row,
+        terminal_cursor_in_view, terminal_cursor_rect, terminal_ime_cursor_rect,
+        terminal_position_from_pointer,
+    };
+    use crate::plugins::ssh_client::models::{SessionTab, SftpRequest, SshInput};
+
+    fn clipboard_key_event(key: egui::Key, pressed: bool, repeat: bool) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed,
+            repeat,
+            modifiers: egui::Modifiers {
+                ctrl: true,
+                shift: true,
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn terminal_clipboard_shortcuts_require_ctrl_and_shift() {
+        let clipboard_modifiers = egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            terminal_clipboard_action(egui::Key::C, true, false, clipboard_modifiers),
+            Some(TerminalClipboardAction::Copy)
+        );
+        assert_eq!(
+            terminal_clipboard_action(egui::Key::V, true, false, clipboard_modifiers),
+            Some(TerminalClipboardAction::Paste)
+        );
+
+        let interrupt_modifiers = egui::Modifiers {
+            ctrl: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            terminal_clipboard_action(egui::Key::C, true, false, interrupt_modifiers),
+            None
+        );
+        assert_eq!(
+            terminal_clipboard_action(egui::Key::V, false, false, clipboard_modifiers),
+            None
+        );
+        assert_eq!(
+            terminal_clipboard_action(egui::Key::V, true, true, clipboard_modifiers),
+            None
+        );
+    }
+
+    #[test]
+    fn terminal_clipboard_frame_deduplicates_key_and_paste_events() {
+        let events = vec![
+            clipboard_key_event(egui::Key::V, true, false),
+            egui::Event::Paste("first".to_string()),
+            egui::Event::Paste("second".to_string()),
+        ];
+        let frame = analyze_terminal_clipboard_events(&events);
+
+        assert!(frame.paste_requested);
+        assert_eq!(frame.paste_text.as_deref(), Some("first"));
+
+        let request_only =
+            analyze_terminal_clipboard_events(&[clipboard_key_event(egui::Key::V, true, false)]);
+        assert!(request_only.paste_requested);
+        assert!(request_only.paste_text.is_none());
+    }
+
+    #[test]
+    fn terminal_clipboard_frame_accepts_pending_async_paste_once() {
+        for event in [
+            clipboard_key_event(egui::Key::V, true, true),
+            clipboard_key_event(egui::Key::V, false, false),
+        ] {
+            let frame = analyze_terminal_clipboard_events(&[
+                event,
+                egui::Event::Paste("duplicate".to_string()),
+            ]);
+            assert!(!frame.paste_requested);
+            assert_eq!(
+                accepted_terminal_paste_text(&frame, true),
+                Some("duplicate")
+            );
+            assert_eq!(accepted_terminal_paste_text(&frame, false), None);
+        }
+
+        let standalone =
+            analyze_terminal_clipboard_events(&[egui::Event::Paste("menu".to_string())]);
+        assert_eq!(accepted_terminal_paste_text(&standalone, false), None);
+        assert_eq!(
+            accepted_terminal_paste_text(&standalone, true),
+            Some("menu")
+        );
+    }
+
+    #[test]
+    fn terminal_native_clipboard_events_preserve_interrupt_and_shift_shortcuts() {
+        let native_copy = analyze_terminal_clipboard_events(&[egui::Event::Copy]);
+        if cfg!(target_os = "windows") {
+            assert!(native_copy.interrupt_requested);
+            assert!(!native_copy.copy_requested);
+        } else {
+            assert!(native_copy.copy_requested);
+            assert!(!native_copy.interrupt_requested);
+        }
+
+        let ordinary_paste =
+            analyze_terminal_clipboard_events(&[egui::Event::Paste("普通粘贴".to_string())]);
+        assert_eq!(accepted_terminal_paste_text(&ordinary_paste, false), None);
+
+        let shifted_paste = analyze_terminal_clipboard_events(&[
+            clipboard_key_event(egui::Key::V, true, false),
+            egui::Event::Paste("快捷键粘贴".to_string()),
+        ]);
+        assert_eq!(
+            accepted_terminal_paste_text(&shifted_paste, false),
+            Some("快捷键粘贴")
+        );
+    }
+
+    #[test]
+    fn empty_terminal_paste_finishes_pending_state() {
+        let mut ssh_ui = SshClientUi::new();
+        ssh_ui.tabs.push(SessionTab::new(1, "测试".to_string()));
+        ssh_ui.active_tab_index = Some(0);
+        let ctx = egui::Context::default();
+
+        ssh_ui.request_terminal_paste(&ctx);
+        let Some(pending_tab) = ssh_ui.current_tab() else {
+            panic!("测试标签应存在");
+        };
+        assert!(pending_tab.terminal_paste_deadline.is_some());
+
+        ssh_ui.finish_empty_terminal_paste();
+        let Some(finished_tab) = ssh_ui.current_tab() else {
+            panic!("测试标签应存在");
+        };
+        assert!(finished_tab.terminal_paste_deadline.is_none());
+        assert_eq!(finished_tab.status_msg, "剪贴板为空，未执行粘贴");
+    }
+
+    #[test]
+    fn terminal_paste_sends_non_empty_text_once() {
+        let (tx, rx) = mpsc::sync_channel(1);
+
+        assert_eq!(send_terminal_paste(&tx, "命令\r"), Ok(true));
+        match rx.try_recv() {
+            Ok(SshInput::KeyInput(bytes)) => assert_eq!(bytes, "命令\r".as_bytes()),
+            result => panic!("收到非预期终端输入: {:?}", result),
+        }
+        assert!(rx.try_recv().is_err());
+        assert_eq!(send_terminal_paste(&tx, ""), Ok(false));
+    }
+
+    #[test]
+    fn terminal_paste_reports_full_and_closed_channels() {
+        let (full_tx, _full_rx) = mpsc::sync_channel(1);
+        assert!(full_tx.try_send(SshInput::Resize(80, 24)).is_ok());
+        assert!(send_terminal_paste(&full_tx, "text").is_err());
+
+        let (closed_tx, closed_rx) = mpsc::sync_channel(1);
+        drop(closed_rx);
+        assert!(send_terminal_paste(&closed_tx, "text").is_err());
+    }
+
+    #[test]
+    fn terminal_pointer_position_maps_and_clamps_to_cells() {
+        let rect = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(80.0, 60.0));
+
+        assert_eq!(
+            terminal_position_from_pointer(egui::pos2(35.0, 45.0), rect, 10.0, 20.0, 8, 3,),
+            Some((2, 1))
+        );
+        assert_eq!(
+            terminal_position_from_pointer(egui::pos2(-100.0, -100.0), rect, 10.0, 20.0, 8, 3,),
+            Some((0, 0))
+        );
+        assert_eq!(
+            terminal_position_from_pointer(egui::pos2(500.0, 500.0), rect, 10.0, 20.0, 8, 3,),
+            Some((7, 2))
+        );
+    }
+
+    #[test]
+    fn terminal_rows_reserve_bottom_cursor_padding() {
+        assert_eq!(terminal_content_rows(65.0, 20.0), 2);
+        assert_eq!(terminal_content_rows(66.0, 20.0), 3);
+        assert_eq!(terminal_content_rows(5.0, 20.0), 1);
+        assert_eq!(terminal_content_rows(f32::NAN, 20.0), 1);
+
+        let rows = terminal_content_rows(105.0, 20.0);
+        assert!(f32::from(rows) * 20.0 <= 105.0 - TERMINAL_BOTTOM_PADDING);
+    }
+
+    #[test]
+    fn terminal_last_row_cursor_stays_inside_explicit_canvas() {
+        let canvas = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(80.0, 100.0));
+        let cursor = terminal_cursor_rect(canvas.min, 0, 4, 1, 10.0, 20.0);
+
+        assert_eq!(cursor.top(), 101.0);
+        assert_eq!(cursor.bottom(), 119.0);
+        assert!(terminal_cursor_in_view(cursor, canvas));
+
+        let below_canvas = terminal_cursor_rect(canvas.min, 0, 5, 1, 10.0, 20.0);
+        assert!(!terminal_cursor_in_view(below_canvas, canvas));
+    }
+
+    #[test]
+    fn terminal_last_row_cursor_handles_fractional_line_height() {
+        let canvas = egui::Rect::from_min_size(egui::pos2(10.25, 20.25), egui::vec2(80.0, 97.5));
+        let cursor = terminal_cursor_rect(canvas.min, 0, 4, 1, 9.75, 19.5);
+
+        assert!(terminal_cursor_in_view(cursor, canvas));
+        assert!(cursor.bottom() < canvas.bottom());
+
+        let near_edge = cursor.translate(egui::vec2(0.0, 1.4));
+        assert!(terminal_cursor_in_view(near_edge, canvas));
+        let outside_tolerance = cursor.translate(egui::vec2(0.0, 1.6));
+        assert!(!terminal_cursor_in_view(outside_tolerance, canvas));
+    }
+
+    #[test]
+    fn terminal_scrollback_row_saturates_and_ime_cursor_is_clamped() {
+        assert_eq!(terminal_cursor_display_row(20, usize::MAX), u16::MAX);
+
+        let canvas = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(80.0, 100.0));
+        let cursor = terminal_cursor_rect(canvas.min, 0, u16::MAX, 1, 10.0, 20.0);
+        let ime_cursor = terminal_ime_cursor_rect(cursor, canvas);
+
+        assert!(canvas.contains_rect(ime_cursor));
+        assert_eq!(ime_cursor.bottom(), canvas.bottom());
+    }
 
     #[test]
     fn remote_parent_path_uses_posix_semantics() {

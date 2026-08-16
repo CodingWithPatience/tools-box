@@ -395,6 +395,36 @@ pub enum SessionViewTab {
     Sftp,
 }
 
+/// 终端文本选择范围
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalSelection {
+    /// 鼠标开始拖动时的单元格位置（列、行）
+    pub anchor: (u16, u16),
+    /// 鼠标当前拖动到的单元格位置（列、行）
+    pub focus: (u16, u16),
+}
+
+impl TerminalSelection {
+    /// 从指定终端单元格开始创建选择范围
+    pub fn new(position: (u16, u16)) -> Self {
+        Self {
+            anchor: position,
+            focus: position,
+        }
+    }
+
+    /// 按终端显示顺序返回选择范围的起止位置
+    pub fn normalized(&self) -> ((u16, u16), (u16, u16)) {
+        let anchor_key = (self.anchor.1, self.anchor.0);
+        let focus_key = (self.focus.1, self.focus.0);
+        if anchor_key <= focus_key {
+            (self.anchor, self.focus)
+        } else {
+            (self.focus, self.anchor)
+        }
+    }
+}
+
 /// 单个会话标签的状态
 pub struct SessionTab {
     /// 关联的会话配置 ID
@@ -415,6 +445,10 @@ pub struct SessionTab {
     pub custom_font_size: Option<f32>,
     /// IME 状态
     pub ime_active: bool,
+    /// 当前终端文本选择范围
+    pub terminal_selection: Option<TerminalSelection>,
+    /// 等待平台返回终端粘贴事件的截止时间（egui 时间秒）
+    pub terminal_paste_deadline: Option<f64>,
 
     // ===== SFTP 相关 =====
     /// 当前活动的子 Tab（终端/SFTP)
@@ -463,6 +497,8 @@ impl SessionTab {
             status_msg: "就绪".to_string(),
             custom_font_size: None,
             ime_active: false,
+            terminal_selection: None,
+            terminal_paste_deadline: None,
             active_tab: SessionViewTab::Terminal,
             sftp_tx: None,
             sftp_control_tx: None,
@@ -492,6 +528,8 @@ impl SessionTab {
         self.connection_state = SessionState::Disconnected;
         self.status_msg = "终端已断开".to_string();
         self.custom_font_size = None;
+        self.terminal_selection = None;
+        self.terminal_paste_deadline = None;
     }
 
     /// 断开 SFTP 连接
@@ -531,6 +569,21 @@ pub fn fail_unfinished_transfers(tasks: &mut [TransferTask], reason: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_selection_normalizes_reverse_drag() {
+        let forward = TerminalSelection {
+            anchor: (2, 1),
+            focus: (5, 3),
+        };
+        assert_eq!(forward.normalized(), ((2, 1), (5, 3)));
+
+        let reverse = TerminalSelection {
+            anchor: (5, 3),
+            focus: (2, 1),
+        };
+        assert_eq!(reverse.normalized(), ((2, 1), (5, 3)));
+    }
 
     #[test]
     fn test_file_entry_size_display() {

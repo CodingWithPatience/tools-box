@@ -126,6 +126,61 @@ impl TerminalEmulator {
         }
     }
 
+    /// 获取当前可见终端的纯文本内容
+    pub fn visible_text(&self) -> String {
+        self.parser.screen().contents()
+    }
+
+    /// 将宽字符后半单元格位置归一化到该字符的起始单元格
+    pub fn normalize_position(&self, position: (u16, u16)) -> (u16, u16) {
+        let screen = self.parser.screen();
+        let (rows, cols) = screen.size();
+        if rows == 0 || cols == 0 {
+            return (0, 0);
+        }
+
+        let col = position.0.min(cols - 1);
+        let row = position.1.min(rows - 1);
+        match screen.cell(row, col) {
+            Some(cell) if cell.is_wide_continuation() && col > 0 => (col - 1, row),
+            _ => (col, row),
+        }
+    }
+
+    /// 获取指定单元格字符在终端中占用的列数
+    pub fn char_width_at(&self, position: (u16, u16)) -> u16 {
+        let position = self.normalize_position(position);
+        self.parser
+            .screen()
+            .cell(position.1, position.0)
+            .map(|cell| if cell.is_wide() { 2 } else { 1 })
+            .unwrap_or(1)
+    }
+
+    /// 获取两个终端单元格之间的纯文本内容，起止位置均包含在结果中
+    pub fn text_between(&self, start: (u16, u16), end: (u16, u16)) -> String {
+        let screen = self.parser.screen();
+        let (rows, cols) = screen.size();
+        if rows == 0 || cols == 0 {
+            return String::new();
+        }
+
+        let normalized_start = self.normalize_position(start);
+        let normalized_end = self.normalize_position(end);
+        let ((start_col, start_row), (end_col, end_row)) =
+            if (normalized_start.1, normalized_start.0) <= (normalized_end.1, normalized_end.0) {
+                (normalized_start, normalized_end)
+            } else {
+                (normalized_end, normalized_start)
+            };
+        screen.contents_between(
+            start_row,
+            start_col,
+            end_row,
+            end_col.saturating_add(1).min(cols),
+        )
+    }
+
     /// 将终端屏幕渲染为 egui::LayoutJob
     pub fn render_to_layout_job(&mut self, is_dark_mode: bool) -> LayoutJob {
         let screen = self.parser.screen();
@@ -255,3 +310,53 @@ const ANSI_PALETTE: [Color32; 16] = [
     Color32::from_rgb(85, 255, 255),  // 14 Bright Cyan
     Color32::from_rgb(255, 255, 255), // 15 Bright White
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::TerminalEmulator;
+
+    #[test]
+    fn visible_text_returns_plain_terminal_contents() {
+        let mut terminal = TerminalEmulator::new(12, 3, 14.0);
+        terminal.process(b"hello\r\nworld");
+
+        assert_eq!(terminal.visible_text(), "hello\nworld");
+    }
+
+    #[test]
+    fn text_between_includes_both_selected_cells() {
+        let mut terminal = TerminalEmulator::new(12, 3, 14.0);
+        terminal.process(b"hello\r\nworld");
+
+        assert_eq!(terminal.text_between((1, 0), (3, 0)), "ell");
+        assert_eq!(terminal.text_between((3, 0), (1, 1)), "lo\nwo");
+        assert_eq!(terminal.text_between((1, 1), (3, 0)), "lo\nwo");
+    }
+
+    #[test]
+    fn text_between_clamps_positions_to_terminal_bounds() {
+        let mut terminal = TerminalEmulator::new(5, 2, 14.0);
+        terminal.process(b"abcde\r\nfghij");
+
+        assert_eq!(terminal.text_between((4, 1), (99, 99)), "j");
+    }
+
+    #[test]
+    fn wide_character_continuation_selects_the_whole_character() {
+        let mut terminal = TerminalEmulator::new(5, 2, 14.0);
+        terminal.process("中ab".as_bytes());
+
+        assert_eq!(terminal.normalize_position((1, 0)), (0, 0));
+        assert_eq!(terminal.char_width_at((1, 0)), 2);
+        assert_eq!(terminal.text_between((1, 0), (1, 0)), "中");
+    }
+
+    #[test]
+    fn wide_character_selection_works_at_line_end_and_across_rows() {
+        let mut terminal = TerminalEmulator::new(4, 3, 14.0);
+        terminal.process("ab中\r\n文cd".as_bytes());
+
+        assert_eq!(terminal.text_between((3, 0), (3, 0)), "中");
+        assert_eq!(terminal.text_between((3, 0), (1, 1)), "中\n文");
+    }
+}
