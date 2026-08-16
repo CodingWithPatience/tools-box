@@ -33,6 +33,8 @@ pub struct NoteTakerUi {
     preview_scroll_offset: f32,
     /// 模式切换后待同步的滚动偏移
     pending_scroll_sync: Option<f32>,
+    /// 待定位的 Markdown 标题目录索引
+    pending_heading_index: Option<usize>,
     /// 搜索关键词
     search_query: String,
     /// 是否显示搜索
@@ -66,6 +68,7 @@ impl NoteTakerUi {
             editor_scroll_offset: 0.0,
             preview_scroll_offset: 0.0,
             pending_scroll_sync: None,
+            pending_heading_index: None,
             search_query: String::new(),
             show_search: false,
             show_folder_dialog: false,
@@ -447,7 +450,6 @@ impl NoteTakerUi {
                 ui.ctx().copy_text(self.form.content.clone());
             }
         });
-
         ui.add_space(5.0);
 
         // 内容编辑区（占据剩余空间）
@@ -464,6 +466,8 @@ impl NoteTakerUi {
                 }
             }
         }
+
+        let pending_heading_index = self.pending_heading_index.take();
 
         match self.view_mode {
             NoteViewMode::Edit => {
@@ -485,14 +489,36 @@ impl NoteTakerUi {
                 self.editor_scroll_offset = output.state.offset.y;
             }
             NoteViewMode::Preview => {
-                let output = egui::ScrollArea::vertical()
-                    .id_salt("note_preview_scroll")
-                    .max_height(content_height)
-                    .vertical_scroll_offset(self.preview_scroll_offset)
+                let preview_fill = ui.visuals().faint_bg_color;
+                let preview_stroke =
+                    egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color);
+                egui::Frame::new()
+                    .fill(preview_fill)
+                    .stroke(preview_stroke)
+                    .inner_margin(egui::Margin::symmetric(8, 6))
                     .show(ui, |ui| {
-                        self.markdown_renderer.render(ui, &self.form.content);
+                        let has_heading_selector = self.render_heading_selector(ui);
+                        let selector_height = if has_heading_selector { 30.0 } else { 0.0 };
+                        let preview_height = (content_height - selector_height - 12.0).max(120.0);
+                        ui.set_min_height(content_height - 12.0);
+
+                        let output = egui::ScrollArea::vertical()
+                            .id_salt("note_preview_scroll")
+                            .max_height(preview_height)
+                            .vertical_scroll_offset(self.preview_scroll_offset)
+                            .show(ui, |ui| {
+                                if let Some(heading_index) = pending_heading_index {
+                                    self.markdown_renderer.render_with_heading_target(
+                                        ui,
+                                        &self.form.content,
+                                        Some(heading_index),
+                                    );
+                                } else {
+                                    self.markdown_renderer.render(ui, &self.form.content);
+                                }
+                            });
+                        self.preview_scroll_offset = output.state.offset.y;
                     });
-                self.preview_scroll_offset = output.state.offset.y;
             }
             NoteViewMode::Split => {
                 ui.columns(2, |columns| {
@@ -522,15 +548,40 @@ impl NoteTakerUi {
                         self.preview_scroll_offset = self.editor_scroll_offset;
                     }
 
-                    let preview_output = egui::ScrollArea::vertical()
-                        .id_salt("note_split_preview_scroll")
-                        .max_height(content_height)
-                        .vertical_scroll_offset(self.preview_scroll_offset)
+                    let preview_fill = columns[1].visuals().faint_bg_color;
+                    let preview_stroke = egui::Stroke::new(
+                        1.0,
+                        columns[1].visuals().widgets.noninteractive.bg_stroke.color,
+                    );
+                    egui::Frame::new()
+                        .fill(preview_fill)
+                        .stroke(preview_stroke)
+                        .inner_margin(egui::Margin::symmetric(8, 6))
                         .show(&mut columns[1], |ui| {
-                            self.markdown_renderer.render(ui, &self.form.content);
+                            let has_heading_selector = self.render_heading_selector(ui);
+                            let selector_height = if has_heading_selector { 30.0 } else { 0.0 };
+                            let preview_height =
+                                (content_height - selector_height - 12.0).max(120.0);
+                            ui.set_min_height(content_height - 12.0);
+
+                            let preview_output = egui::ScrollArea::vertical()
+                                .id_salt("note_split_preview_scroll")
+                                .max_height(preview_height)
+                                .vertical_scroll_offset(self.preview_scroll_offset)
+                                .show(ui, |ui| {
+                                    if let Some(heading_index) = pending_heading_index {
+                                        self.markdown_renderer.render_with_heading_target(
+                                            ui,
+                                            &self.form.content,
+                                            Some(heading_index),
+                                        );
+                                    } else {
+                                        self.markdown_renderer.render(ui, &self.form.content);
+                                    }
+                                });
+                            // 预览栏保留独立滚动能力，但其滚动位置不会反向修改源码栏。
+                            self.preview_scroll_offset = preview_output.state.offset.y;
                         });
-                    // 预览栏保留独立滚动能力，但其滚动位置不会反向修改源码栏。
-                    self.preview_scroll_offset = preview_output.state.offset.y;
                 });
             }
         }
@@ -697,6 +748,7 @@ impl NoteTakerUi {
                 self.editor_scroll_offset = 0.0;
                 self.preview_scroll_offset = 0.0;
                 self.pending_scroll_sync = None;
+                self.pending_heading_index = None;
             }
             Ok(None) => {
                 self.error = Some("笔记不存在".to_string());
@@ -723,6 +775,40 @@ impl NoteTakerUi {
         };
         self.view_mode = mode;
         self.pending_scroll_sync = Some(offset);
+    }
+
+    fn render_heading_selector(&mut self, ui: &mut Ui) -> bool {
+        if self.view_mode == NoteViewMode::Edit {
+            return false;
+        }
+
+        let headings = self.markdown_renderer.heading_outline(&self.form.content);
+        if headings.is_empty() {
+            return false;
+        }
+
+        ui.horizontal(|ui| {
+            ui.label("目录:");
+            egui::ComboBox::from_id_salt("note_heading_navigation")
+                .selected_text("选择标题")
+                .show_ui(ui, |ui| {
+                    for (index, heading) in headings.iter().enumerate() {
+                        let indent = "  ".repeat(usize::from(heading.level.saturating_sub(1)));
+                        let title = if heading.title.is_empty() {
+                            "（无标题）"
+                        } else {
+                            heading.title.as_str()
+                        };
+                        if ui
+                            .selectable_label(false, format!("{indent}{title}"))
+                            .clicked()
+                        {
+                            self.pending_heading_index = Some(index);
+                        }
+                    }
+                });
+        });
+        true
     }
 
     /// 判断源码栏滚动位置是否发生变化

@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::rc::Rc;
 
 use egui::text::{LayoutJob, TextFormat};
 use egui::{Color32, FontId, RichText, Stroke, Ui};
@@ -13,6 +14,15 @@ use crate::utils::highlight::SyntaxHighlighter;
 pub struct MarkdownDocument {
     /// 文档中的块级内容。
     pub blocks: Vec<MarkdownBlock>,
+}
+
+/// Markdown 标题目录项。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkdownHeading {
+    /// 标题级别，取值范围为 1 到 6。
+    pub level: u8,
+    /// 标题显示文本。
+    pub title: String,
 }
 
 /// Markdown 块级内容。
@@ -81,7 +91,7 @@ pub struct MarkdownListItem {
 }
 
 /// Markdown 行内内容。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub enum MarkdownInline {
     /// 普通文本。
     Text(String),
@@ -131,6 +141,52 @@ impl MarkdownDocument {
             blocks: build_blocks(&root.children),
         }
     }
+
+    /// 提取文档中的标题目录，保留标题层级和文档顺序。
+    pub fn headings(&self) -> Vec<MarkdownHeading> {
+        let mut headings = Vec::new();
+        collect_headings(&self.blocks, &mut headings);
+        headings
+    }
+}
+
+fn collect_headings(blocks: &[MarkdownBlock], headings: &mut Vec<MarkdownHeading>) {
+    for block in blocks {
+        match block {
+            MarkdownBlock::Heading { level, content } => headings.push(MarkdownHeading {
+                level: *level,
+                title: inline_text(content),
+            }),
+            MarkdownBlock::Quote(content) => collect_headings(content, headings),
+            MarkdownBlock::List { items, .. } => {
+                for item in items {
+                    collect_headings(&item.blocks, headings);
+                }
+            }
+            MarkdownBlock::Paragraph(_)
+            | MarkdownBlock::CodeBlock { .. }
+            | MarkdownBlock::Table { .. }
+            | MarkdownBlock::ThematicBreak => {}
+        }
+    }
+}
+
+fn inline_text(inlines: &[MarkdownInline]) -> String {
+    let mut text = String::new();
+    for inline in inlines {
+        match inline {
+            MarkdownInline::Text(value)
+            | MarkdownInline::Code(value)
+            | MarkdownInline::Html(value) => text.push_str(value),
+            MarkdownInline::Emphasis(content)
+            | MarkdownInline::Strong(content)
+            | MarkdownInline::Strikethrough(content)
+            | MarkdownInline::Link { content, .. } => text.push_str(&inline_text(content)),
+            MarkdownInline::Image { alt, .. } => text.push_str(alt),
+            MarkdownInline::SoftBreak | MarkdownInline::HardBreak => text.push(' '),
+        }
+    }
+    text
 }
 
 #[derive(Debug, Clone)]
@@ -507,7 +563,46 @@ fn collect_text_into(node: &RawNode, output: &mut String) {
 /// 渲染器负责将 [`MarkdownDocument`] 映射为 egui 控件，解析逻辑由文档模型负责。
 pub struct MarkdownRenderer {
     highlighter: SyntaxHighlighter,
+    parsed_document_cache: Option<ParsedDocumentCache>,
+    inline_layout_cache: RefCell<HashMap<u64, InlineLayoutCacheEntry>>,
     code_highlight_cache: RefCell<HashMap<u64, CodeHighlightCacheEntry>>,
+}
+
+/// 最近一次 Markdown 内容对应的解析结果。
+struct ParsedDocumentCache {
+    content: String,
+    document: Rc<MarkdownDocument>,
+}
+
+/// 行内布局缓存的渲染上下文。
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct InlineLayoutContext {
+    available_width_bits: u32,
+    body_font_size_bits: u32,
+    monospace_font_size_bits: u32,
+    text_color: [u8; 4],
+    strong_text_color: [u8; 4],
+    hyperlink_color: [u8; 4],
+    code_background_color: [u8; 4],
+}
+
+/// 单条行内布局缓存，保存完整输入以避免哈希碰撞返回错误结果。
+struct InlineLayoutCacheEntry {
+    inlines: Vec<MarkdownInline>,
+    style: InlineStyle,
+    context: InlineLayoutContext,
+    job: LayoutJob,
+}
+
+impl InlineLayoutCacheEntry {
+    fn matches(
+        &self,
+        inlines: &[MarkdownInline],
+        style: InlineStyle,
+        context: InlineLayoutContext,
+    ) -> bool {
+        self.inlines == inlines && self.style == style && self.context == context
+    }
 }
 
 /// 单条代码高亮缓存，保存完整上下文以避免哈希碰撞返回错误结果。
@@ -535,8 +630,9 @@ impl CodeHighlightCacheEntry {
 }
 
 const MAX_CODE_HIGHLIGHT_CACHE_ENTRIES: usize = 128;
+const MAX_INLINE_LAYOUT_CACHE_ENTRIES: usize = 256;
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq)]
 struct InlineStyle {
     emphasis: bool,
     strong: bool,
@@ -550,13 +646,25 @@ impl MarkdownRenderer {
     pub fn new() -> Self {
         Self {
             highlighter: SyntaxHighlighter::new(),
+            parsed_document_cache: None,
+            inline_layout_cache: RefCell::new(HashMap::new()),
             code_highlight_cache: RefCell::new(HashMap::new()),
         }
     }
 
     /// 渲染 Markdown 内容到 egui UI。
     pub fn render(&mut self, ui: &mut Ui, markdown: &str) {
-        let document = MarkdownDocument::parse(markdown);
+        self.render_with_heading_target(ui, markdown, None);
+    }
+
+    /// 渲染 Markdown 内容，并可将指定标题滚动到预览区域顶部。
+    pub fn render_with_heading_target(
+        &mut self,
+        ui: &mut Ui,
+        markdown: &str,
+        target_heading: Option<usize>,
+    ) {
+        let document = self.get_cached_document(markdown);
         if document.blocks.is_empty() {
             let weak_text_color = ui.visuals().weak_text_color();
             ui.vertical_centered(|ui| {
@@ -569,10 +677,38 @@ impl MarkdownRenderer {
             });
             return;
         }
-        self.render_blocks(ui, &document.blocks, 0);
+        let mut heading_index = 0;
+        self.render_blocks(ui, &document.blocks, 0, &mut heading_index, target_heading);
     }
 
-    fn render_blocks(&self, ui: &mut Ui, blocks: &[MarkdownBlock], list_depth: usize) {
+    /// 获取 Markdown 标题目录，复用当前内容的解析缓存。
+    pub fn heading_outline(&mut self, markdown: &str) -> Vec<MarkdownHeading> {
+        self.get_cached_document(markdown).headings()
+    }
+
+    fn get_cached_document(&mut self, markdown: &str) -> Rc<MarkdownDocument> {
+        if let Some(cache) = &self.parsed_document_cache {
+            if cache.content == markdown {
+                return Rc::clone(&cache.document);
+            }
+        }
+
+        let document = Rc::new(MarkdownDocument::parse(markdown));
+        self.parsed_document_cache = Some(ParsedDocumentCache {
+            content: markdown.to_owned(),
+            document: Rc::clone(&document),
+        });
+        document
+    }
+
+    fn render_blocks(
+        &self,
+        ui: &mut Ui,
+        blocks: &[MarkdownBlock],
+        list_depth: usize,
+        heading_index: &mut usize,
+        target_heading: Option<usize>,
+    ) {
         for (block_index, block) in blocks.iter().enumerate() {
             let is_last_block = block_index + 1 == blocks.len();
             match block {
@@ -583,7 +719,12 @@ impl MarkdownRenderer {
                         ..InlineStyle::default()
                     };
                     ui.add_space(12.0);
-                    self.render_inlines(ui, content, style);
+                    let current_heading_index = *heading_index;
+                    *heading_index += 1;
+                    let heading_response = self.render_inlines(ui, content, style);
+                    if target_heading == Some(current_heading_index) {
+                        ui.scroll_to_rect(heading_response.rect, Some(egui::Align::TOP));
+                    }
                     if !is_last_block {
                         ui.add_space(6.0);
                     }
@@ -606,7 +747,13 @@ impl MarkdownRenderer {
                         .show(ui, |ui| {
                             ui.set_min_width(quote_content_width);
                             ui.set_max_width(quote_content_width);
-                            self.render_blocks(ui, content, list_depth);
+                            self.render_blocks(
+                                ui,
+                                content,
+                                list_depth,
+                                heading_index,
+                                target_heading,
+                            );
                         })
                         .response
                         .rect;
@@ -650,7 +797,13 @@ impl MarkdownRenderer {
                                     .strong(),
                             );
                             ui.vertical(|ui| {
-                                self.render_blocks(ui, &item.blocks, list_depth + 1);
+                                self.render_blocks(
+                                    ui,
+                                    &item.blocks,
+                                    list_depth + 1,
+                                    heading_index,
+                                    target_heading,
+                                );
                             });
                             ui.add_space(2.0);
                         });
@@ -829,10 +982,38 @@ impl MarkdownRenderer {
         }
     }
 
-    fn render_inlines(&self, ui: &mut Ui, inlines: &[MarkdownInline], style: InlineStyle) {
+    fn render_inlines(
+        &self,
+        ui: &mut Ui,
+        inlines: &[MarkdownInline],
+        style: InlineStyle,
+    ) -> egui::Response {
+        let context = inline_layout_context(ui);
+        let cache_key = inline_layout_cache_key(inlines, style, context);
+        if let Some(entry) = self.inline_layout_cache.borrow().get(&cache_key) {
+            if entry.matches(inlines, style, context) {
+                return ui.add(egui::Label::new(entry.job.clone()).wrap());
+            }
+        }
+
         let mut job = LayoutJob::default();
         self.append_inlines_to_job(ui, inlines, style, &mut job);
-        ui.add(egui::Label::new(job).wrap());
+        let mut cache = self.inline_layout_cache.borrow_mut();
+        if !cache.contains_key(&cache_key) && cache.len() >= MAX_INLINE_LAYOUT_CACHE_ENTRIES {
+            if let Some(evicted_key) = cache.keys().next().copied() {
+                cache.remove(&evicted_key);
+            }
+        }
+        cache.insert(
+            cache_key,
+            InlineLayoutCacheEntry {
+                inlines: inlines.to_vec(),
+                style,
+                context,
+                job: job.clone(),
+            },
+        );
+        ui.add(egui::Label::new(job).wrap())
     }
 
     fn append_inlines_to_job(
@@ -999,6 +1180,43 @@ fn code_highlight_cache_key(
     hasher.finish()
 }
 
+fn inline_layout_cache_key(
+    inlines: &[MarkdownInline],
+    style: InlineStyle,
+    context: InlineLayoutContext,
+) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    inlines.hash(&mut hasher);
+    style.emphasis.hash(&mut hasher);
+    style.strong.hash(&mut hasher);
+    style.strikethrough.hash(&mut hasher);
+    style.link.hash(&mut hasher);
+    style.size.map(f32::to_bits).hash(&mut hasher);
+    context.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn inline_layout_context(ui: &Ui) -> InlineLayoutContext {
+    let visuals = ui.visuals();
+    InlineLayoutContext {
+        available_width_bits: ui.available_width().to_bits(),
+        body_font_size_bits: body_font_size(ui).to_bits(),
+        monospace_font_size_bits: monospace_font_size(ui).to_bits(),
+        text_color: visuals.text_color().to_array(),
+        strong_text_color: visuals.strong_text_color().to_array(),
+        hyperlink_color: visuals.hyperlink_color.to_array(),
+        code_background_color: visuals.code_bg_color.to_array(),
+    }
+}
+
+fn body_font_size(ui: &Ui) -> f32 {
+    ui.style()
+        .text_styles
+        .get(&egui::TextStyle::Body)
+        .map(|font_id| font_id.size)
+        .unwrap_or(14.0)
+}
+
 fn monospace_font_size(ui: &Ui) -> f32 {
     ui.style()
         .text_styles
@@ -1025,9 +1243,25 @@ fn list_indent(depth: usize) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        MarkdownBlock, MarkdownDocument, MarkdownInline, MarkdownTableAlignment, SyntaxHighlighter,
-        code_highlight_cache_key,
+        InlineLayoutContext, InlineStyle, MarkdownBlock, MarkdownDocument, MarkdownInline,
+        MarkdownRenderer, MarkdownTableAlignment, SyntaxHighlighter, code_highlight_cache_key,
+        inline_layout_cache_key,
     };
+
+    fn render_markdown_frame(ctx: &egui::Context, renderer: &mut MarkdownRenderer, width: f32) {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(width, 600.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                renderer.render(ui, "普通文本 **粗体** [链接](https://example.com)");
+            });
+        });
+    }
 
     #[test]
     fn should_parse_nested_inline_styles() {
@@ -1046,6 +1280,34 @@ mod tests {
                 MarkdownInline::Text(" 与 ".to_string()),
                 MarkdownInline::Code("代码".to_string()),
             ])
+        );
+    }
+
+    #[test]
+    fn should_collect_heading_outline_in_document_order() {
+        let document =
+            MarkdownDocument::parse("# 第一章\n\n## 第二节\n\n> ### 引用标题\n\n- #### 列表标题");
+
+        assert_eq!(
+            document.headings(),
+            vec![
+                super::MarkdownHeading {
+                    level: 1,
+                    title: "第一章".to_string(),
+                },
+                super::MarkdownHeading {
+                    level: 2,
+                    title: "第二节".to_string(),
+                },
+                super::MarkdownHeading {
+                    level: 3,
+                    title: "引用标题".to_string(),
+                },
+                super::MarkdownHeading {
+                    level: 4,
+                    title: "列表标题".to_string(),
+                },
+            ]
         );
     }
 
@@ -1145,6 +1407,139 @@ mod tests {
             base,
             code_highlight_cache_key("fn main() {}", Some("rust"), 14.0, false)
         );
+    }
+
+    #[test]
+    fn should_reuse_parsed_document_until_content_changes() {
+        let mut renderer = MarkdownRenderer::new();
+        let first = renderer.get_cached_document("# 标题");
+        let same_content = renderer.get_cached_document("# 标题");
+        let changed_content = renderer.get_cached_document("## 新标题");
+
+        assert!(std::rc::Rc::ptr_eq(&first, &same_content));
+        assert!(!std::rc::Rc::ptr_eq(&same_content, &changed_content));
+    }
+
+    #[test]
+    fn should_recalculate_inline_layout_when_render_context_changes() {
+        let inlines = vec![MarkdownInline::Text("正文".to_string())];
+        let style = InlineStyle::default();
+        let context = InlineLayoutContext {
+            available_width_bits: 800.0_f32.to_bits(),
+            body_font_size_bits: 14.0_f32.to_bits(),
+            monospace_font_size_bits: 14.0_f32.to_bits(),
+            text_color: [220, 220, 220, 255],
+            strong_text_color: [255, 255, 255, 255],
+            hyperlink_color: [90, 170, 255, 255],
+            code_background_color: [64, 64, 64, 255],
+        };
+        let base = inline_layout_cache_key(&inlines, style, context);
+
+        let mut narrow_context = context;
+        narrow_context.available_width_bits = 480.0_f32.to_bits();
+        assert_ne!(
+            base,
+            inline_layout_cache_key(&inlines, style, narrow_context)
+        );
+
+        let mut light_theme_context = context;
+        light_theme_context.text_color = [30, 30, 30, 255];
+        assert_ne!(
+            base,
+            inline_layout_cache_key(&inlines, style, light_theme_context)
+        );
+
+        let mut large_font_context = context;
+        large_font_context.body_font_size_bits = 16.0_f32.to_bits();
+        large_font_context.monospace_font_size_bits = 16.0_f32.to_bits();
+        assert_ne!(
+            base,
+            inline_layout_cache_key(&inlines, style, large_font_context)
+        );
+
+        let mut strong_color_context = context;
+        strong_color_context.strong_text_color = [255, 220, 120, 255];
+        assert_ne!(
+            base,
+            inline_layout_cache_key(&inlines, style, strong_color_context)
+        );
+
+        let mut hyperlink_color_context = context;
+        hyperlink_color_context.hyperlink_color = [80, 220, 160, 255];
+        assert_ne!(
+            base,
+            inline_layout_cache_key(&inlines, style, hyperlink_color_context)
+        );
+
+        let mut code_background_context = context;
+        code_background_context.code_background_color = [230, 230, 230, 255];
+        assert_ne!(
+            base,
+            inline_layout_cache_key(&inlines, style, code_background_context)
+        );
+
+        let strong_style = InlineStyle {
+            strong: true,
+            ..style
+        };
+        assert_ne!(
+            base,
+            inline_layout_cache_key(&inlines, strong_style, context)
+        );
+    }
+
+    #[test]
+    fn should_rebuild_inline_layout_when_width_or_theme_changes() {
+        let ctx = egui::Context::default();
+        let mut renderer = MarkdownRenderer::new();
+
+        render_markdown_frame(&ctx, &mut renderer, 800.0);
+        let initial_entries = renderer.inline_layout_cache.borrow().len();
+        assert!(initial_entries > 0);
+
+        render_markdown_frame(&ctx, &mut renderer, 800.0);
+        assert_eq!(renderer.inline_layout_cache.borrow().len(), initial_entries);
+
+        render_markdown_frame(&ctx, &mut renderer, 480.0);
+        let narrow_entries = renderer.inline_layout_cache.borrow().len();
+        assert!(narrow_entries > initial_entries);
+
+        ctx.set_visuals(egui::Visuals::light());
+        render_markdown_frame(&ctx, &mut renderer, 480.0);
+        let light_theme_entries = renderer.inline_layout_cache.borrow().len();
+        assert!(light_theme_entries > narrow_entries);
+    }
+
+    #[test]
+    fn should_scroll_to_selected_heading() {
+        let ctx = egui::Context::default();
+        let mut renderer = MarkdownRenderer::new();
+        let markdown =
+            "# 第一标题\n\n第一段内容\n\n第二段内容\n\n第三段内容\n\n# 目标标题\n\n目标内容";
+        let mut scroll_offset = 0.0;
+
+        for _ in 0..2 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(600.0, 120.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let output = egui::ScrollArea::vertical()
+                        .id_salt("markdown_heading_navigation_test")
+                        .max_height(100.0)
+                        .show(ui, |ui| {
+                            renderer.render_with_heading_target(ui, markdown, Some(1));
+                        });
+                    scroll_offset = output.state.offset.y;
+                });
+            });
+        }
+
+        assert!(scroll_offset > 0.0);
     }
 
     #[test]
