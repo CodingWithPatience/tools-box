@@ -5,7 +5,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use egui::{Color32, RichText, text::LayoutJob};
 
 use super::differ;
-use super::models::{DiffResult, DiffType, SplitLine, TextSegment, ViewMode};
+use super::models::{DiffHunk, DiffResult, DiffType, SplitLine, TextSegment, ViewMode};
 use crate::utils::highlight::SyntaxHighlighter;
 
 const SUPPORTED_LANGUAGES: &[(&str, &str)] = &[
@@ -72,6 +72,10 @@ pub struct DiffViewerUi {
     pending_sync_right_x: Cell<Option<f32>>,
     /// 上一帧 Unified 视图的纵向滚动偏移量
     last_unified_offset: Cell<f32>,
+    /// 当前选中的差异块索引
+    current_diff_index: Cell<Option<usize>>,
+    /// 待跳转到的差异块起始行索引
+    pending_navigation_row: Cell<Option<usize>>,
 }
 
 impl DiffViewerUi {
@@ -98,6 +102,8 @@ impl DiffViewerUi {
             pending_sync_left_x: Cell::new(None),
             pending_sync_right_x: Cell::new(None),
             last_unified_offset: Cell::new(0.0),
+            current_diff_index: Cell::new(None),
+            pending_navigation_row: Cell::new(None),
         }
     }
 
@@ -294,6 +300,8 @@ impl DiffViewerUi {
                 self.right_file_name = None;
                 self.diff_result = None;
                 self.error = None;
+                self.current_diff_index.set(None);
+                self.pending_navigation_row.set(None);
                 self.clear_cache();
             }
             ui.separator();
@@ -319,6 +327,8 @@ impl DiffViewerUi {
                 self.last_right_offset.set(0.0);
                 self.pending_sync_left.set(None);
                 self.pending_sync_right.set(None);
+                self.current_diff_index.set(None);
+                self.pending_navigation_row.set(None);
             }
         });
     }
@@ -346,6 +356,42 @@ impl DiffViewerUi {
             return;
         };
 
+        let hunk_count = result.diff_hunks.len();
+        let current_diff_index = self
+            .current_diff_index
+            .get()
+            .filter(|index| *index < hunk_count);
+        if current_diff_index != self.current_diff_index.get() {
+            self.current_diff_index.set(current_diff_index);
+        }
+
+        ui.horizontal(|ui| {
+            let can_go_previous =
+                hunk_count > 0 && current_diff_index.map(|index| index > 0).unwrap_or(false);
+            let can_go_next = hunk_count > 0
+                && current_diff_index
+                    .map(|index| index + 1 < hunk_count)
+                    .unwrap_or(true);
+
+            let previous_response = ui
+                .add_enabled(can_go_previous, egui::Button::new("↑"))
+                .on_hover_text("上一个差异");
+            if previous_response.clicked() {
+                self.navigate_to_diff(result, true);
+            }
+            let next_response = ui
+                .add_enabled(can_go_next, egui::Button::new("↓"))
+                .on_hover_text("下一个差异");
+            if next_response.clicked() {
+                self.navigate_to_diff(result, false);
+            }
+
+            let position_text = current_diff_index
+                .map(|index| format!("差异 {}/{}", index + 1, hunk_count))
+                .unwrap_or_else(|| format!("共 {} 个差异", hunk_count));
+            ui.label(RichText::new(position_text).color(Color32::from_rgb(100, 100, 100)));
+        });
+
         // 底部统计栏
         let text_style = egui::TextStyle::Small;
         let stats_height = ui.text_style_height(&text_style) + 16.0;
@@ -364,6 +410,33 @@ impl DiffViewerUi {
                         .color(Color32::from_rgb(100, 100, 100)),
                     );
                 });
+            });
+
+        const OVERVIEW_WIDTH: f32 = 32.0;
+        const OVERVIEW_HEADER_HEIGHT: f32 = 30.0;
+        let right_current_offset = Cell::new(self.last_right_offset.get());
+        egui::SidePanel::right("diff_split_overview")
+            .exact_width(OVERVIEW_WIDTH)
+            .resizable(false)
+            .frame(egui::Frame::NONE)
+            .show_inside(ui, |ui| {
+                let available_size = ui.available_size();
+                if let Some(clicked_hunk) = Self::render_diff_overview(
+                    ui,
+                    result,
+                    available_size.x,
+                    available_size.y,
+                    OVERVIEW_HEADER_HEIGHT,
+                    18.0,
+                    right_current_offset.get(),
+                    ui.visuals().dark_mode,
+                    self.current_diff_index.get(),
+                ) {
+                    self.current_diff_index.set(Some(clicked_hunk));
+                    self.clear_pending_scroll_sync();
+                    self.pending_navigation_row
+                        .set(Some(result.diff_hunks[clicked_hunk].start_line));
+                }
             });
 
         let dim_color = Color32::from_rgb(128, 128, 128);
@@ -397,12 +470,23 @@ impl DiffViewerUi {
             let num_digits = format!("{}", max_left_num.max(max_right_num)).len().max(3);
             let gutter_w = ((num_digits + 3) as f32 * font_size * 0.6).max(40.0);
 
+            const SPLIT_PANEL_HEADER_HEIGHT: f32 = 30.0;
             let available_size = ui.available_size_before_wrap();
-            let col_width = (available_size.x / 2.0).max(100.0);
+            const SPLIT_SEPARATOR_WIDTH: f32 = 1.0;
+            let col_width = ((available_size.x - SPLIT_SEPARATOR_WIDTH) / 2.0).max(100.0);
 
             // 读取上一帧的待同步偏移量
-            let sync_left = self.pending_sync_left.get();
-            let sync_right = self.pending_sync_right.get();
+            let navigation_offset = self.pending_navigation_row.get().map(|row| {
+                self.pending_navigation_row.set(None);
+                let content_height = (available_size.y - SPLIT_PANEL_HEADER_HEIGHT).max(0.0);
+                let content_total_height =
+                    Self::usize_to_f32(result.split_lines.len()) * row_height;
+                let max_scroll = (content_total_height - content_height).max(0.0);
+                (Self::usize_to_f32(row) * row_height - content_height * 0.35)
+                    .clamp(0.0, max_scroll)
+            });
+            let sync_left = navigation_offset.or(self.pending_sync_left.get());
+            let sync_right = navigation_offset.or(self.pending_sync_right.get());
             let sync_left_x = self.pending_sync_left_x.get();
             let sync_right_x = self.pending_sync_right_x.get();
 
@@ -414,7 +498,6 @@ impl DiffViewerUi {
 
             // 用于记录当前帧的面板偏移量
             let left_current_offset: Cell<f32> = Cell::new(0.0);
-            let right_current_offset: Cell<f32> = Cell::new(0.0);
             let left_current_offset_x: Cell<f32> = Cell::new(0.0);
             let right_current_offset_x: Cell<f32> = Cell::new(0.0);
             // 记录面板是否可滚动（内容高度超过视口高度）
@@ -424,345 +507,490 @@ impl DiffViewerUi {
             let left_sync_applied: Cell<bool> = Cell::new(false);
             let left_sync_applied_x: Cell<bool> = Cell::new(false);
 
-            ui.horizontal(|ui| {
-                // ===== 左面板（先渲染，获取滚动位置） =====
-                ui.allocate_ui_with_layout(
-                    egui::vec2(col_width, available_size.y),
-                    egui::Layout::top_down(egui::Align::LEFT),
-                    |ui| {
-                        ui.label(RichText::new("原始文本").strong().color(dim_color));
-                        let content_height = available_size.y - 30.0;
-                        // 计算行号区域的纵向偏移量
-                        // 优先使用来自右面板的同步值，否则使用当前帧的内容偏移量
-                        let gutter_offset_y = sync_left.unwrap_or(self.last_left_offset.get());
-                        ui.horizontal(|ui| {
-                            // 行号区域（固定宽度，隐藏滚动条）
+            ui.allocate_ui_with_layout(
+                egui::vec2(available_size.x, available_size.y),
+                egui::Layout::left_to_right(egui::Align::Min),
+                |ui| {
+                    let original_item_spacing = ui.spacing().item_spacing;
+                    ui.spacing_mut().item_spacing.x = 0.0;
+
+                    // ===== 左面板（先渲染，获取滚动位置） =====
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(col_width, available_size.y),
+                        egui::Layout::top_down(egui::Align::LEFT),
+                        |ui| {
                             ui.allocate_ui_with_layout(
-                                egui::vec2(gutter_w, content_height),
+                                egui::vec2(col_width, SPLIT_PANEL_HEADER_HEIGHT),
                                 egui::Layout::top_down(egui::Align::LEFT),
                                 |ui| {
-                                    let mut gutter_scroll = egui::ScrollArea::vertical()
+                                    ui.label(RichText::new("原始文本").strong().color(dim_color));
+                                },
+                            );
+                            let content_height =
+                                (available_size.y - SPLIT_PANEL_HEADER_HEIGHT).max(0.0);
+                            // 计算行号区域的纵向偏移量
+                            // 优先使用来自右面板的同步值，否则使用当前帧的内容偏移量
+                            let gutter_offset_y = sync_left.unwrap_or(self.last_left_offset.get());
+                            ui.horizontal(|ui| {
+                                // 行号区域（固定宽度，隐藏滚动条）
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(gutter_w, content_height),
+                                    egui::Layout::top_down(egui::Align::LEFT),
+                                    |ui| {
+                                        let mut gutter_scroll = egui::ScrollArea::vertical()
                                         .id_salt("split_left_gutter")
                                         .auto_shrink([false, false])
                                         .scroll_bar_visibility(
                                             egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
                                         );
-                                    gutter_scroll =
-                                        gutter_scroll.vertical_scroll_offset(gutter_offset_y);
-                                    gutter_scroll.show(ui, |ui| {
-                                        ui.spacing_mut().item_spacing.y = 0.0;
-                                        for line in &result.split_lines {
-                                            let gutter_bg = match line.left_type {
-                                                DiffType::Removed => {
-                                                    if is_dark_mode {
-                                                        Color32::from_rgba_unmultiplied(
-                                                            80, 40, 45, 200,
-                                                        )
-                                                    } else {
-                                                        Color32::from_rgba_unmultiplied(
-                                                            255, 180, 185, 240,
-                                                        )
-                                                    }
-                                                }
-                                                _ => Color32::TRANSPARENT,
-                                            };
-                                            let symbol = match line.left_type {
-                                                DiffType::Removed => "-",
-                                                _ => " ",
-                                            };
-                                            ui.allocate_ui_with_layout(
-                                                egui::vec2(gutter_w, row_height),
-                                                egui::Layout::left_to_right(egui::Align::Min),
-                                                |ui| {
-                                                    if gutter_bg != Color32::TRANSPARENT {
-                                                        let rect = ui.max_rect();
-                                                        ui.painter()
-                                                            .rect_filled(rect, 0.0, gutter_bg);
-                                                    }
-                                                    let num_text = match line.left_line_number {
-                                                        Some(n) => {
-                                                            format!("{:>w$}", n, w = num_digits)
-                                                        }
-                                                        None => " ".repeat(num_digits),
-                                                    };
-                                                    ui.add_sized(
-                                                        [gutter_w, row_height],
-                                                        egui::Label::new(
-                                                            RichText::new(format!(
-                                                                "{} {} ",
-                                                                num_text, symbol
-                                                            ))
-                                                            .monospace()
-                                                            .color(dim_color),
-                                                        ),
-                                                    );
-                                                },
-                                            );
-                                        }
-                                    });
-                                },
-                            );
-
-                            // 内容区域（可横向和纵向滚动）
-                            let content_width = col_width - gutter_w;
-                            ui.allocate_ui_with_layout(
-                                egui::vec2(content_width, content_height),
-                                egui::Layout::top_down(egui::Align::LEFT),
-                                |ui| {
-                                    let mut content_scroll = egui::ScrollArea::both()
-                                        .id_salt("split_left_content")
-                                        .auto_shrink([false, false]);
-                                    // 应用上一帧右面板的同步偏移量（纵向）
-                                    if let Some(offset_y) = sync_left {
-                                        content_scroll =
-                                            content_scroll.vertical_scroll_offset(offset_y);
-                                        left_sync_applied.set(true);
-                                    }
-                                    // 应用上一帧右面板的同步偏移量（横向）
-                                    if let Some(offset_x) = sync_left_x {
-                                        content_scroll =
-                                            content_scroll.horizontal_scroll_offset(offset_x);
-                                        left_sync_applied_x.set(true);
-                                    }
-                                    let output = content_scroll.show(ui, |ui| {
-                                        ui.spacing_mut().item_spacing.y = 0.0;
-                                        for (line_index, line) in
-                                            result.split_lines.iter().enumerate()
-                                        {
-                                            let line_bg = match line.left_type {
-                                                DiffType::Removed => {
-                                                    if is_dark_mode {
-                                                        Color32::from_rgba_unmultiplied(
-                                                            61, 31, 35, 180,
-                                                        )
-                                                    } else {
-                                                        Color32::from_rgba_unmultiplied(
-                                                            255, 210, 215, 230,
-                                                        )
-                                                    }
-                                                }
-                                                _ => Color32::TRANSPARENT,
-                                            };
-                                            ui.allocate_ui_with_layout(
-                                                egui::vec2(content_width, row_height),
-                                                egui::Layout::left_to_right(egui::Align::Center),
-                                                |ui| {
-                                                    if line_bg != Color32::TRANSPARENT {
-                                                        let mut rect = ui.max_rect();
-                                                        rect.set_width(rect.width().max(2000.0));
-                                                        ui.painter()
-                                                            .rect_filled(rect, 0.0, line_bg);
-                                                    }
-                                                    self.render_cell(
-                                                        ui,
-                                                        line,
-                                                        true,
-                                                        row_height,
-                                                        font_size,
-                                                        &syntax_name,
-                                                        is_dark_mode,
-                                                        text_color,
+                                        gutter_scroll =
+                                            gutter_scroll.vertical_scroll_offset(gutter_offset_y);
+                                        gutter_scroll.show(ui, |ui| {
+                                            ui.spacing_mut().item_spacing.y = 0.0;
+                                            for (line_index, line) in
+                                                result.split_lines.iter().enumerate()
+                                            {
+                                                let is_current_diff_line =
+                                                    Self::is_current_diff_line(
+                                                        result,
+                                                        self.current_diff_index.get(),
                                                         line_index,
                                                     );
-                                                },
-                                            );
+                                                let gutter_bg = if is_current_diff_line {
+                                                    Color32::TRANSPARENT
+                                                } else {
+                                                    match line.left_type {
+                                                        DiffType::Removed => {
+                                                            if is_dark_mode {
+                                                                Color32::from_rgba_unmultiplied(
+                                                                    80, 40, 45, 200,
+                                                                )
+                                                            } else {
+                                                                Color32::from_rgba_unmultiplied(
+                                                                    255, 180, 185, 240,
+                                                                )
+                                                            }
+                                                        }
+                                                        _ => Color32::TRANSPARENT,
+                                                    }
+                                                };
+                                                let symbol = match line.left_type {
+                                                    DiffType::Removed => "-",
+                                                    _ => " ",
+                                                };
+                                                ui.allocate_ui_with_layout(
+                                                    egui::vec2(gutter_w, row_height),
+                                                    egui::Layout::left_to_right(egui::Align::Min),
+                                                    |ui| {
+                                                        if gutter_bg != Color32::TRANSPARENT {
+                                                            let rect = ui.max_rect();
+                                                            ui.painter()
+                                                                .rect_filled(rect, 0.0, gutter_bg);
+                                                        }
+                                                        if is_current_diff_line {
+                                                            let rect = ui.max_rect();
+                                                            ui.painter().rect_filled(
+                                                                rect,
+                                                                0.0,
+                                                                Self::current_diff_color(
+                                                                    is_dark_mode,
+                                                                ),
+                                                            );
+                                                        }
+                                                        let num_text = match line.left_line_number {
+                                                            Some(n) => {
+                                                                format!("{:>w$}", n, w = num_digits)
+                                                            }
+                                                            None => " ".repeat(num_digits),
+                                                        };
+                                                        ui.add_sized(
+                                                            [gutter_w, row_height],
+                                                            egui::Label::new(
+                                                                RichText::new(format!(
+                                                                    "{} {} ",
+                                                                    num_text, symbol
+                                                                ))
+                                                                .monospace()
+                                                                .color(dim_color),
+                                                            ),
+                                                        );
+                                                    },
+                                                );
+                                            }
+                                        });
+                                    },
+                                );
+
+                                // 内容区域（可横向和纵向滚动）
+                                let content_width = col_width - gutter_w;
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(content_width, content_height),
+                                    egui::Layout::top_down(egui::Align::LEFT),
+                                    |ui| {
+                                        let mut content_scroll = egui::ScrollArea::both()
+                                            .id_salt("split_left_content")
+                                            .auto_shrink([false, false]);
+                                        // 应用上一帧右面板的同步偏移量（纵向）
+                                        if let Some(offset_y) = sync_left {
+                                            content_scroll =
+                                                content_scroll.vertical_scroll_offset(offset_y);
+                                            left_sync_applied.set(true);
                                         }
-                                    });
-                                    left_current_offset.set(output.state.offset.y);
-                                    left_current_offset_x.set(output.state.offset.x);
-                                    left_scrollable
-                                        .set(output.content_size.y > output.inner_rect.height());
-                                    // 检测纵向滚动变化
-                                    let left_changed = !left_sync_applied.get()
-                                        && (output.state.offset.y - self.last_left_offset.get())
+                                        // 应用上一帧右面板的同步偏移量（横向）
+                                        if let Some(offset_x) = sync_left_x {
+                                            content_scroll =
+                                                content_scroll.horizontal_scroll_offset(offset_x);
+                                            left_sync_applied_x.set(true);
+                                        }
+                                        let output = content_scroll.show(ui, |ui| {
+                                            let clip_rect = ui
+                                                .clip_rect()
+                                                .shrink(ui.visuals().clip_rect_margin);
+                                            ui.set_clip_rect(clip_rect);
+                                            ui.spacing_mut().item_spacing.y = 0.0;
+                                            for (line_index, line) in
+                                                result.split_lines.iter().enumerate()
+                                            {
+                                                let is_current_diff_line =
+                                                    Self::is_current_diff_line(
+                                                        result,
+                                                        self.current_diff_index.get(),
+                                                        line_index,
+                                                    );
+                                                let line_bg = if is_current_diff_line {
+                                                    Color32::TRANSPARENT
+                                                } else {
+                                                    match line.left_type {
+                                                        DiffType::Removed => {
+                                                            if is_dark_mode {
+                                                                Color32::from_rgba_unmultiplied(
+                                                                    61, 31, 35, 180,
+                                                                )
+                                                            } else {
+                                                                Color32::from_rgba_unmultiplied(
+                                                                    255, 210, 215, 230,
+                                                                )
+                                                            }
+                                                        }
+                                                        _ => Color32::TRANSPARENT,
+                                                    }
+                                                };
+                                                ui.allocate_ui_with_layout(
+                                                    egui::vec2(content_width, row_height),
+                                                    egui::Layout::left_to_right(
+                                                        egui::Align::Center,
+                                                    ),
+                                                    |ui| {
+                                                        if line_bg != Color32::TRANSPARENT {
+                                                            let mut rect = ui.max_rect();
+                                                            rect.set_width(
+                                                                rect.width().max(2000.0),
+                                                            );
+                                                            ui.painter()
+                                                                .rect_filled(rect, 0.0, line_bg);
+                                                        }
+                                                        if is_current_diff_line {
+                                                            let mut rect = ui.max_rect();
+                                                            rect.set_width(
+                                                                rect.width().max(2000.0),
+                                                            );
+                                                            ui.painter().rect_filled(
+                                                                rect,
+                                                                0.0,
+                                                                Self::current_diff_color(
+                                                                    is_dark_mode,
+                                                                ),
+                                                            );
+                                                        }
+                                                        self.render_cell(
+                                                            ui,
+                                                            line,
+                                                            true,
+                                                            row_height,
+                                                            font_size,
+                                                            &syntax_name,
+                                                            is_dark_mode,
+                                                            text_color,
+                                                            line_index,
+                                                        );
+                                                    },
+                                                );
+                                            }
+                                        });
+                                        left_current_offset.set(output.state.offset.y);
+                                        left_current_offset_x.set(output.state.offset.x);
+                                        left_scrollable.set(
+                                            output.content_size.y > output.inner_rect.height(),
+                                        );
+                                        // 检测纵向滚动变化
+                                        let left_changed = !left_sync_applied.get()
+                                            && (output.state.offset.y
+                                                - self.last_left_offset.get())
                                             .abs()
-                                            > 0.5;
-                                    if left_changed {
-                                        self.pending_sync_right.set(Some(output.state.offset.y));
-                                    }
-                                    // 检测横向滚动变化
-                                    let left_changed_x = !left_sync_applied_x.get()
-                                        && (output.state.offset.x - self.last_left_offset_x.get())
+                                                > 0.5;
+                                        if left_changed {
+                                            self.pending_sync_right
+                                                .set(Some(output.state.offset.y));
+                                        }
+                                        // 检测横向滚动变化
+                                        let left_changed_x = !left_sync_applied_x.get()
+                                            && (output.state.offset.x
+                                                - self.last_left_offset_x.get())
                                             .abs()
-                                            > 0.5;
-                                    if left_changed_x {
-                                        self.pending_sync_right_x.set(Some(output.state.offset.x));
-                                    }
-                                },
-                            );
-                        });
-                    },
-                );
+                                                > 0.5;
+                                        if left_changed_x {
+                                            self.pending_sync_right_x
+                                                .set(Some(output.state.offset.x));
+                                        }
+                                    },
+                                );
+                            });
+                        },
+                    );
 
-                ui.separator();
+                    ui.add(
+                        egui::Separator::default()
+                            .vertical()
+                            .spacing(SPLIT_SEPARATOR_WIDTH),
+                    );
 
-                // ===== 右面板（同帧同步左面板的滚动位置） =====
-                ui.allocate_ui_with_layout(
-                    egui::vec2(col_width, available_size.y),
-                    egui::Layout::top_down(egui::Align::LEFT),
-                    |ui| {
-                        ui.label(RichText::new("对比文本").strong().color(dim_color));
-                        let content_height = available_size.y - 30.0;
-                        // 计算行号区域的纵向偏移量
-                        // 优先使用来自左面板的同步值，否则使用当前帧的内容偏移量
-                        let gutter_offset_y = sync_right.unwrap_or(self.last_right_offset.get());
-                        ui.horizontal(|ui| {
-                            // 行号区域（固定宽度，隐藏滚动条）
+                    // ===== 右面板（同帧同步左面板的滚动位置） =====
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(col_width, available_size.y),
+                        egui::Layout::top_down(egui::Align::LEFT),
+                        |ui| {
                             ui.allocate_ui_with_layout(
-                                egui::vec2(gutter_w, content_height),
+                                egui::vec2(col_width, SPLIT_PANEL_HEADER_HEIGHT),
                                 egui::Layout::top_down(egui::Align::LEFT),
                                 |ui| {
-                                    let mut gutter_scroll = egui::ScrollArea::vertical()
+                                    ui.label(RichText::new("对比文本").strong().color(dim_color));
+                                },
+                            );
+                            let content_height =
+                                (available_size.y - SPLIT_PANEL_HEADER_HEIGHT).max(0.0);
+                            // 计算行号区域的纵向偏移量
+                            // 优先使用来自左面板的同步值，否则使用当前帧的内容偏移量
+                            let gutter_offset_y =
+                                sync_right.unwrap_or(self.last_right_offset.get());
+                            ui.horizontal(|ui| {
+                                // 行号区域（固定宽度，隐藏滚动条）
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(gutter_w, content_height),
+                                    egui::Layout::top_down(egui::Align::LEFT),
+                                    |ui| {
+                                        let mut gutter_scroll = egui::ScrollArea::vertical()
                                         .id_salt("split_right_gutter")
                                         .auto_shrink([false, false])
                                         .scroll_bar_visibility(
                                             egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
                                         );
-                                    gutter_scroll =
-                                        gutter_scroll.vertical_scroll_offset(gutter_offset_y);
-                                    gutter_scroll.show(ui, |ui| {
-                                        ui.spacing_mut().item_spacing.y = 0.0;
-                                        for line in &result.split_lines {
-                                            let gutter_bg = match line.right_type {
-                                                DiffType::Added => {
-                                                    if is_dark_mode {
-                                                        Color32::from_rgba_unmultiplied(
-                                                            40, 80, 50, 200,
-                                                        )
-                                                    } else {
-                                                        Color32::from_rgba_unmultiplied(
-                                                            150, 230, 170, 240,
-                                                        )
-                                                    }
-                                                }
-                                                _ => Color32::TRANSPARENT,
-                                            };
-                                            let symbol = match line.right_type {
-                                                DiffType::Added => "+",
-                                                _ => " ",
-                                            };
-                                            ui.allocate_ui_with_layout(
-                                                egui::vec2(gutter_w, row_height),
-                                                egui::Layout::left_to_right(egui::Align::Min),
-                                                |ui| {
-                                                    if gutter_bg != Color32::TRANSPARENT {
-                                                        let rect = ui.max_rect();
-                                                        ui.painter()
-                                                            .rect_filled(rect, 0.0, gutter_bg);
-                                                    }
-                                                    let num_text = match line.right_line_number {
-                                                        Some(n) => {
-                                                            format!("{:>w$}", n, w = num_digits)
-                                                        }
-                                                        None => " ".repeat(num_digits),
-                                                    };
-                                                    ui.add_sized(
-                                                        [gutter_w, row_height],
-                                                        egui::Label::new(
-                                                            RichText::new(format!(
-                                                                "{} {} ",
-                                                                num_text, symbol
-                                                            ))
-                                                            .monospace()
-                                                            .color(dim_color),
-                                                        ),
-                                                    );
-                                                },
-                                            );
-                                        }
-                                    });
-                                },
-                            );
-
-                            // 内容区域（可横向和纵向滚动）
-                            let content_width = col_width - gutter_w;
-                            ui.allocate_ui_with_layout(
-                                egui::vec2(content_width, content_height),
-                                egui::Layout::top_down(egui::Align::LEFT),
-                                |ui| {
-                                    let mut content_scroll = egui::ScrollArea::both()
-                                        .id_salt("split_right_content")
-                                        .auto_shrink([false, false]);
-                                    // 应用上一帧左面板的同步偏移量（纵向）
-                                    if let Some(offset_y) = sync_right {
-                                        content_scroll =
-                                            content_scroll.vertical_scroll_offset(offset_y);
-                                    }
-                                    // 应用上一帧左面板的同步偏移量（横向）
-                                    if let Some(offset_x) = sync_right_x {
-                                        content_scroll =
-                                            content_scroll.horizontal_scroll_offset(offset_x);
-                                    }
-                                    let output = content_scroll.show(ui, |ui| {
-                                        ui.spacing_mut().item_spacing.y = 0.0;
-                                        for (line_index, line) in
-                                            result.split_lines.iter().enumerate()
-                                        {
-                                            let line_bg = match line.right_type {
-                                                DiffType::Added => {
-                                                    if is_dark_mode {
-                                                        Color32::from_rgba_unmultiplied(
-                                                            31, 61, 38, 180,
-                                                        )
-                                                    } else {
-                                                        Color32::from_rgba_unmultiplied(
-                                                            180, 240, 195, 230,
-                                                        )
-                                                    }
-                                                }
-                                                _ => Color32::TRANSPARENT,
-                                            };
-                                            ui.allocate_ui_with_layout(
-                                                egui::vec2(content_width, row_height),
-                                                egui::Layout::left_to_right(egui::Align::Center),
-                                                |ui| {
-                                                    if line_bg != Color32::TRANSPARENT {
-                                                        let mut rect = ui.max_rect();
-                                                        rect.set_width(rect.width().max(2000.0));
-                                                        ui.painter()
-                                                            .rect_filled(rect, 0.0, line_bg);
-                                                    }
-                                                    self.render_cell(
-                                                        ui,
-                                                        line,
-                                                        false,
-                                                        row_height,
-                                                        font_size,
-                                                        &syntax_name,
-                                                        is_dark_mode,
-                                                        text_color,
+                                        gutter_scroll =
+                                            gutter_scroll.vertical_scroll_offset(gutter_offset_y);
+                                        gutter_scroll.show(ui, |ui| {
+                                            ui.spacing_mut().item_spacing.y = 0.0;
+                                            for (line_index, line) in
+                                                result.split_lines.iter().enumerate()
+                                            {
+                                                let is_current_diff_line =
+                                                    Self::is_current_diff_line(
+                                                        result,
+                                                        self.current_diff_index.get(),
                                                         line_index,
                                                     );
-                                                },
-                                            );
+                                                let gutter_bg = if is_current_diff_line {
+                                                    Color32::TRANSPARENT
+                                                } else {
+                                                    match line.right_type {
+                                                        DiffType::Added => {
+                                                            if is_dark_mode {
+                                                                Color32::from_rgba_unmultiplied(
+                                                                    40, 80, 50, 200,
+                                                                )
+                                                            } else {
+                                                                Color32::from_rgba_unmultiplied(
+                                                                    150, 230, 170, 240,
+                                                                )
+                                                            }
+                                                        }
+                                                        _ => Color32::TRANSPARENT,
+                                                    }
+                                                };
+                                                let symbol = match line.right_type {
+                                                    DiffType::Added => "+",
+                                                    _ => " ",
+                                                };
+                                                ui.allocate_ui_with_layout(
+                                                    egui::vec2(gutter_w, row_height),
+                                                    egui::Layout::left_to_right(egui::Align::Min),
+                                                    |ui| {
+                                                        if gutter_bg != Color32::TRANSPARENT {
+                                                            let rect = ui.max_rect();
+                                                            ui.painter()
+                                                                .rect_filled(rect, 0.0, gutter_bg);
+                                                        }
+                                                        if is_current_diff_line {
+                                                            let rect = ui.max_rect();
+                                                            ui.painter().rect_filled(
+                                                                rect,
+                                                                0.0,
+                                                                Self::current_diff_color(
+                                                                    is_dark_mode,
+                                                                ),
+                                                            );
+                                                        }
+                                                        let num_text = match line.right_line_number
+                                                        {
+                                                            Some(n) => {
+                                                                format!("{:>w$}", n, w = num_digits)
+                                                            }
+                                                            None => " ".repeat(num_digits),
+                                                        };
+                                                        ui.add_sized(
+                                                            [gutter_w, row_height],
+                                                            egui::Label::new(
+                                                                RichText::new(format!(
+                                                                    "{} {} ",
+                                                                    num_text, symbol
+                                                                ))
+                                                                .monospace()
+                                                                .color(dim_color),
+                                                            ),
+                                                        );
+                                                    },
+                                                );
+                                            }
+                                        });
+                                    },
+                                );
+
+                                // 内容区域（可横向和纵向滚动）
+                                let content_width = col_width - gutter_w;
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(content_width, content_height),
+                                    egui::Layout::top_down(egui::Align::LEFT),
+                                    |ui| {
+                                        let mut content_scroll = egui::ScrollArea::both()
+                                            .id_salt("split_right_content")
+                                            .auto_shrink([false, false]);
+                                        // 应用上一帧左面板的同步偏移量（纵向）
+                                        if let Some(offset_y) = sync_right {
+                                            content_scroll =
+                                                content_scroll.vertical_scroll_offset(offset_y);
                                         }
-                                    });
-                                    right_current_offset.set(output.state.offset.y);
-                                    right_current_offset_x.set(output.state.offset.x);
-                                    right_scrollable
-                                        .set(output.content_size.y > output.inner_rect.height());
-                                    // 检测纵向滚动变化
-                                    let right_changed = sync_right.is_none()
-                                        && (output.state.offset.y - self.last_right_offset.get())
+                                        // 应用上一帧左面板的同步偏移量（横向）
+                                        if let Some(offset_x) = sync_right_x {
+                                            content_scroll =
+                                                content_scroll.horizontal_scroll_offset(offset_x);
+                                        }
+                                        let output = content_scroll.show(ui, |ui| {
+                                            let clip_rect = ui
+                                                .clip_rect()
+                                                .shrink(ui.visuals().clip_rect_margin);
+                                            ui.set_clip_rect(clip_rect);
+                                            ui.spacing_mut().item_spacing.y = 0.0;
+                                            for (line_index, line) in
+                                                result.split_lines.iter().enumerate()
+                                            {
+                                                let is_current_diff_line =
+                                                    Self::is_current_diff_line(
+                                                        result,
+                                                        self.current_diff_index.get(),
+                                                        line_index,
+                                                    );
+                                                let line_bg = if is_current_diff_line {
+                                                    Color32::TRANSPARENT
+                                                } else {
+                                                    match line.right_type {
+                                                        DiffType::Added => {
+                                                            if is_dark_mode {
+                                                                Color32::from_rgba_unmultiplied(
+                                                                    31, 61, 38, 180,
+                                                                )
+                                                            } else {
+                                                                Color32::from_rgba_unmultiplied(
+                                                                    180, 240, 195, 230,
+                                                                )
+                                                            }
+                                                        }
+                                                        _ => Color32::TRANSPARENT,
+                                                    }
+                                                };
+                                                ui.allocate_ui_with_layout(
+                                                    egui::vec2(content_width, row_height),
+                                                    egui::Layout::left_to_right(
+                                                        egui::Align::Center,
+                                                    ),
+                                                    |ui| {
+                                                        if line_bg != Color32::TRANSPARENT {
+                                                            let mut rect = ui.max_rect();
+                                                            rect.set_width(
+                                                                rect.width().max(2000.0),
+                                                            );
+                                                            ui.painter()
+                                                                .rect_filled(rect, 0.0, line_bg);
+                                                        }
+                                                        if is_current_diff_line {
+                                                            let mut rect = ui.max_rect();
+                                                            rect.set_width(
+                                                                rect.width().max(2000.0),
+                                                            );
+                                                            ui.painter().rect_filled(
+                                                                rect,
+                                                                0.0,
+                                                                Self::current_diff_color(
+                                                                    is_dark_mode,
+                                                                ),
+                                                            );
+                                                        }
+                                                        self.render_cell(
+                                                            ui,
+                                                            line,
+                                                            false,
+                                                            row_height,
+                                                            font_size,
+                                                            &syntax_name,
+                                                            is_dark_mode,
+                                                            text_color,
+                                                            line_index,
+                                                        );
+                                                    },
+                                                );
+                                            }
+                                        });
+                                        right_current_offset.set(output.state.offset.y);
+                                        right_current_offset_x.set(output.state.offset.x);
+                                        right_scrollable.set(
+                                            output.content_size.y > output.inner_rect.height(),
+                                        );
+                                        // 检测纵向滚动变化
+                                        let right_changed = sync_right.is_none()
+                                            && (output.state.offset.y
+                                                - self.last_right_offset.get())
                                             .abs()
-                                            > 0.5;
-                                    if right_changed {
-                                        self.pending_sync_left.set(Some(output.state.offset.y));
-                                    }
-                                    // 检测横向滚动变化
-                                    let right_changed_x = sync_right_x.is_none()
-                                        && (output.state.offset.x - self.last_right_offset_x.get())
+                                                > 0.5;
+                                        if right_changed {
+                                            self.pending_sync_left.set(Some(output.state.offset.y));
+                                        }
+                                        // 检测横向滚动变化
+                                        let right_changed_x = sync_right_x.is_none()
+                                            && (output.state.offset.x
+                                                - self.last_right_offset_x.get())
                                             .abs()
-                                            > 0.5;
-                                    if right_changed_x {
-                                        self.pending_sync_left_x.set(Some(output.state.offset.x));
-                                    }
-                                },
-                            );
-                        });
-                    },
-                );
-            });
+                                                > 0.5;
+                                        if right_changed_x {
+                                            self.pending_sync_left_x
+                                                .set(Some(output.state.offset.x));
+                                        }
+                                    },
+                                );
+                            });
+                        },
+                    );
+
+                    ui.spacing_mut().item_spacing = original_item_spacing;
+                },
+            );
+
             // 纵向边界补正：当滚动到顶部时，强制另一边面板也对齐
             // 仅当两侧面板都可滚动时才触发补正，避免短内容面板误判
             let left_offset = left_current_offset.get();
@@ -792,6 +1020,198 @@ impl DiffViewerUi {
             self.last_left_offset_x.set(left_offset_x);
             self.last_right_offset_x.set(right_offset_x);
         });
+    }
+
+    /// 跳转到上一个或下一个差异块
+    fn navigate_to_diff(&self, result: &DiffResult, previous: bool) {
+        let Some(last_index) = result.diff_hunks.len().checked_sub(1) else {
+            return;
+        };
+
+        let current_index = self.current_diff_index.get();
+        let target_index = match (previous, current_index) {
+            (true, Some(index)) => index.checked_sub(1),
+            (true, None) => None,
+            (false, Some(index)) => index.checked_add(1).filter(|index| *index <= last_index),
+            (false, None) => Some(0),
+        };
+
+        if let Some(index) = target_index {
+            self.current_diff_index.set(Some(index));
+            self.clear_pending_scroll_sync();
+            self.pending_navigation_row
+                .set(Some(result.diff_hunks[index].start_line));
+        }
+    }
+
+    /// 绘制 Split 视图右侧的差异概览条
+    #[allow(clippy::too_many_arguments)]
+    fn render_diff_overview(
+        ui: &mut egui::Ui,
+        result: &DiffResult,
+        width: f32,
+        height: f32,
+        content_header_height: f32,
+        row_height: f32,
+        scroll_offset: f32,
+        is_dark_mode: bool,
+        current_diff_index: Option<usize>,
+    ) -> Option<usize> {
+        let mut clicked_hunk = None;
+        ui.allocate_ui_with_layout(
+            egui::vec2(width, height),
+            egui::Layout::top_down(egui::Align::Center),
+            |ui| {
+                let (outer_rect, response) =
+                    ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
+                let rect = outer_rect.shrink2(egui::vec2(3.0, 0.0));
+                let content_rect = rect;
+                let overview_height = content_rect.height();
+                let painter = ui.painter();
+                let track_color = if is_dark_mode {
+                    Color32::from_rgb(45, 45, 50)
+                } else {
+                    Color32::from_rgb(235, 235, 238)
+                };
+                painter.rect_filled(rect, 2.0, track_color);
+
+                let total_lines = result.split_lines.len().max(1);
+                let total_lines_f32 = Self::usize_to_f32(total_lines);
+                for (hunk_index, hunk) in result.diff_hunks.iter().enumerate() {
+                    let start_line = hunk.start_line.min(total_lines - 1);
+                    let end_line = hunk.end_line.min(total_lines - 1);
+                    let start_y = content_rect.min.y
+                        + Self::usize_to_f32(start_line) / total_lines_f32 * content_rect.height();
+                    let end_y = content_rect.min.y
+                        + Self::usize_to_f32(end_line + 1) / total_lines_f32
+                            * content_rect.height();
+                    let marker_rect = egui::Rect::from_min_max(
+                        egui::pos2(content_rect.min.x + 2.0, start_y),
+                        egui::pos2(content_rect.max.x - 2.0, end_y.max(start_y + 2.0)),
+                    );
+
+                    let has_removed = result.split_lines[start_line..=end_line]
+                        .iter()
+                        .any(|line| line.left_type == DiffType::Removed);
+                    let has_added = result.split_lines[start_line..=end_line]
+                        .iter()
+                        .any(|line| line.right_type == DiffType::Added);
+                    let marker_color = match (has_removed, has_added) {
+                        (true, true) => Color32::from_rgb(220, 155, 45),
+                        (true, false) => Color32::from_rgb(205, 75, 80),
+                        (false, true) => Color32::from_rgb(65, 175, 90),
+                        (false, false) => Color32::TRANSPARENT,
+                    };
+                    painter.rect_filled(marker_rect, 1.0, marker_color);
+
+                    if current_diff_index == Some(hunk_index) {
+                        painter.rect_filled(
+                            marker_rect.shrink(1.0),
+                            1.0,
+                            Color32::from_rgba_unmultiplied(255, 255, 255, 150),
+                        );
+                    }
+                }
+
+                let content_height = total_lines_f32 * row_height;
+                let viewport_height = (height - content_header_height).max(0.0);
+                if content_height > viewport_height && overview_height > 0.0 {
+                    let thumb_min_height = 4.0_f32.min(overview_height);
+                    let thumb_height = (overview_height * viewport_height / content_height)
+                        .max(thumb_min_height)
+                        .min(overview_height);
+                    let max_scroll = content_height - viewport_height;
+                    let thumb_y = content_rect.min.y
+                        + (scroll_offset.clamp(0.0, max_scroll) / max_scroll)
+                            * (overview_height - thumb_height);
+                    painter.rect_filled(
+                        egui::Rect::from_min_size(
+                            egui::pos2(content_rect.min.x, thumb_y),
+                            egui::vec2(content_rect.width(), thumb_height.min(overview_height)),
+                        ),
+                        1.0,
+                        if is_dark_mode {
+                            Color32::from_rgba_unmultiplied(190, 190, 195, 100)
+                        } else {
+                            Color32::from_rgba_unmultiplied(100, 100, 110, 90)
+                        },
+                    );
+                }
+
+                if response.clicked() && content_rect.height() > 0.0 {
+                    if let Some(pointer_pos) = response.interact_pointer_pos() {
+                        let ratio = ((pointer_pos.y - content_rect.min.y) / content_rect.height())
+                            .clamp(0.0, 1.0);
+                        let clicked_line = Self::f32_to_usize(ratio * total_lines_f32);
+                        clicked_hunk =
+                            Self::find_nearest_diff_hunk(&result.diff_hunks, clicked_line);
+                    }
+                }
+            },
+        );
+        clicked_hunk
+    }
+
+    /// 根据概览条点击的行索引查找最近的差异块
+    fn find_nearest_diff_hunk(hunks: &[DiffHunk], line_index: usize) -> Option<usize> {
+        let mut nearest_index = None;
+        let mut nearest_distance = usize::MAX;
+
+        for (hunk_index, hunk) in hunks.iter().enumerate() {
+            let distance = if line_index < hunk.start_line {
+                hunk.start_line - line_index
+            } else if line_index > hunk.end_line {
+                line_index - hunk.end_line
+            } else {
+                0
+            };
+
+            if distance < nearest_distance {
+                nearest_index = Some(hunk_index);
+                nearest_distance = distance;
+            }
+        }
+
+        nearest_index
+    }
+
+    /// 判断行索引是否属于当前选中的差异块
+    fn is_current_diff_line(
+        result: &DiffResult,
+        current_diff_index: Option<usize>,
+        line_index: usize,
+    ) -> bool {
+        current_diff_index
+            .and_then(|index| result.diff_hunks.get(index))
+            .map(|hunk| line_index >= hunk.start_line && line_index <= hunk.end_line)
+            .unwrap_or(false)
+    }
+
+    /// 返回当前差异块的选中背景色
+    fn current_diff_color(is_dark_mode: bool) -> Color32 {
+        if is_dark_mode {
+            Color32::from_rgba_unmultiplied(70, 125, 215, 60)
+        } else {
+            Color32::from_rgba_unmultiplied(95, 160, 245, 100)
+        }
+    }
+
+    /// 将行索引转换为界面计算使用的浮点数
+    fn usize_to_f32(value: usize) -> f32 {
+        value.to_string().parse::<f32>().unwrap_or(f32::MAX)
+    }
+
+    /// 将概览条计算得到的浮点行索引安全转换为 usize
+    fn f32_to_usize(value: f32) -> usize {
+        if !value.is_finite() || value <= 0.0 {
+            return 0;
+        }
+
+        value
+            .floor()
+            .to_string()
+            .parse::<usize>()
+            .unwrap_or(usize::MAX)
     }
 
     fn render_cell(
@@ -1567,5 +1987,105 @@ impl DiffViewerUi {
         self.left_highlight_cache.borrow_mut().take();
         self.right_highlight_cache.borrow_mut().take();
         self.unified_line_cache.borrow_mut().clear();
+    }
+
+    /// 清理用户滚动产生的待同步偏移，避免覆盖差异导航目标
+    fn clear_pending_scroll_sync(&self) {
+        self.pending_sync_left.set(None);
+        self.pending_sync_right.set(None);
+        self.pending_sync_left_x.set(None);
+        self.pending_sync_right_x.set(None);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_hunks() -> Vec<DiffHunk> {
+        vec![
+            DiffHunk {
+                start_line: 2,
+                end_line: 3,
+            },
+            DiffHunk {
+                start_line: 8,
+                end_line: 9,
+            },
+        ]
+    }
+
+    #[test]
+    fn test_find_nearest_diff_hunk_inside_hunk() {
+        assert_eq!(
+            DiffViewerUi::find_nearest_diff_hunk(&test_hunks(), 3),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn test_find_nearest_diff_hunk_between_hunks() {
+        assert_eq!(
+            DiffViewerUi::find_nearest_diff_hunk(&test_hunks(), 5),
+            Some(0)
+        );
+        assert_eq!(
+            DiffViewerUi::find_nearest_diff_hunk(&test_hunks(), 6),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn test_find_nearest_diff_hunk_at_boundaries() {
+        assert_eq!(
+            DiffViewerUi::find_nearest_diff_hunk(&test_hunks(), 0),
+            Some(0)
+        );
+        assert_eq!(
+            DiffViewerUi::find_nearest_diff_hunk(&test_hunks(), 20),
+            Some(1)
+        );
+        assert_eq!(DiffViewerUi::find_nearest_diff_hunk(&[], 0), None);
+    }
+
+    #[test]
+    fn test_navigate_to_diff_updates_selection_and_clears_pending_sync() {
+        let viewer = DiffViewerUi::new();
+        let result = differ::compute_diff(
+            "same\nold1\nseparator\nold2\nend",
+            "same\nnew1\nseparator\nnew2\nend",
+        );
+
+        viewer.pending_sync_left.set(Some(20.0));
+        viewer.pending_sync_right.set(Some(20.0));
+        viewer.navigate_to_diff(&result, false);
+        assert_eq!(viewer.current_diff_index.get(), Some(0));
+        assert_eq!(viewer.pending_navigation_row.get(), Some(1));
+        assert_eq!(viewer.pending_sync_left.get(), None);
+        assert_eq!(viewer.pending_sync_right.get(), None);
+
+        viewer.navigate_to_diff(&result, false);
+        assert_eq!(viewer.current_diff_index.get(), Some(1));
+        viewer.navigate_to_diff(&result, false);
+        assert_eq!(viewer.current_diff_index.get(), Some(1));
+
+        viewer.navigate_to_diff(&result, true);
+        assert_eq!(viewer.current_diff_index.get(), Some(0));
+        viewer.current_diff_index.set(None);
+        viewer.navigate_to_diff(&result, true);
+        assert_eq!(viewer.current_diff_index.get(), None);
+    }
+
+    #[test]
+    fn test_is_current_diff_line_matches_only_selected_hunk() {
+        let result = differ::compute_diff(
+            "same\nold1\nseparator\nold2\nend",
+            "same\nnew1\nseparator\nnew2\nend",
+        );
+
+        assert!(DiffViewerUi::is_current_diff_line(&result, Some(0), 1));
+        assert!(!DiffViewerUi::is_current_diff_line(&result, Some(0), 3));
+        assert!(DiffViewerUi::is_current_diff_line(&result, Some(1), 3));
+        assert!(!DiffViewerUi::is_current_diff_line(&result, None, 1));
     }
 }

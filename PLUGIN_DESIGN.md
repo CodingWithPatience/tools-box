@@ -27,6 +27,8 @@
 | 编辑区语法高亮 | 编辑输入区域支持实时语法高亮，支持 25+ 种语言，带哈希缓存优化 | P1 |
 | 横向滚动条 | 编辑区禁用自动换行，支持横向滚动查看长行代码 | P1 |
 | 编辑区行号 | 编辑区左侧固定行号面板，通过 ScrollArea 偏移同步垂直位置，不随水平滚动 | P1 |
+| Split 差异概览条 | 通过右侧 SidePanel 显示差异块位置和当前滚动视口 | P1 |
+| Split 差异导航 | 通过上下箭头按钮及概览条点击跳转差异块，并高亮当前差异块 | P1 |
 
 ### 1.2 界面设计
 
@@ -160,11 +162,19 @@ pub struct SplitLine {
     pub right_type: DiffType,             // 右侧差异类型
 }
 
+/// Split 视图中的连续差异块
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiffHunk {
+    pub start_line: usize,                // 起始行索引（从 0 开始）
+    pub end_line: usize,                  // 结束行索引（包含当前行）
+}
+
 /// 差异结果
 #[derive(Debug, Clone)]
 pub struct DiffResult {
     pub unified_lines: Vec<DiffLine>,      // Unified 视图数据
     pub split_lines: Vec<SplitLine>,       // Split 视图数据
+    pub diff_hunks: Vec<DiffHunk>,         // Split 视图连续差异块
     pub added_count: usize,                // 新增行数
     pub removed_count: usize,              // 删除行数
     pub modified_count: usize,             // 修改行数
@@ -271,6 +281,10 @@ src/plugins/diff_viewer/
 | 1.4.18 | Split 视图横向滚动 | 双栏各自独立 ScrollArea::both()，支持横向滚动且行号固定 | ✅ |
 | 1.4.19 | Split 视图滚动同步 | 左右面板垂直滚动位置同步，保持内容对齐 | ✅ |
 | 1.4.20 | Unified 视图固定行号 | Unified 视图左侧固定行号面板（双行号），不随水平滚动 | ✅ |
+| 1.4.21 | Split 差异概览条 | 通过右侧 SidePanel 自绘概览条，显示差异块、差异颜色和当前滚动视口 | ✅ |
+| 1.4.22 | Split 差异导航 | 仅显示上下箭头，支持点击概览条跳转并同步左右面板，同时高亮当前差异块 | ✅ |
+| 1.4.23 | 当前差异高亮优化 | 暗色主题降低蓝色高亮不透明度，浅色主题统一左右面板的当前差异背景 | ✅ |
+| 1.4.24 | Split 布局细节优化 | 概览条使用完整轨道映射滚动位置，收紧内容裁剪区域避免覆盖滚动条 | ✅ |
 
 ### 1.5 依赖库
 
@@ -658,12 +672,14 @@ CREATE INDEX idx_api_history_executed_at ON api_history(executed_at);
 | 6.8 | 实现同步滚动 | Split 视图左右面板同步滚动 | ✅ |
 | 6.9 | 添加视图切换 | Split/Unified 视图切换按钮 | ✅ |
 | 6.10 | 实现辅助功能 | 交换、清空、复制差异 | ✅ |
+| 6.11 | 增加 Split 差异概览 | 通过右侧 SidePanel 显示连续差异块及滚动视口 | ✅ |
+| 6.12 | 增加差异导航 | 上下箭头和概览条点击跳转上一个/下一个差异块，并明确高亮当前差异块 | ✅ |
 
 **阶段六产出文件：**
 - `src/plugins/diff_viewer/mod.rs` — 插件入口
 - `src/plugins/diff_viewer/ui.rs` — UI 渲染（包含 Split 和 Unified 两种视图）
 - `src/plugins/diff_viewer/differ.rs` — 差异计算核心（生成 split_lines 和 unified_lines）
-- `src/plugins/diff_viewer/models.rs` — 数据结构（包含 SplitLine、DiffLine 等）
+- `src/plugins/diff_viewer/models.rs` — 数据结构（包含 SplitLine、DiffLine、DiffHunk 等）
 - `Cargo.toml` — 新增 `similar` 依赖
 - `src/plugins/mod.rs` — 注册新插件
 
@@ -726,6 +742,10 @@ CREATE INDEX idx_api_history_executed_at ON api_history(executed_at);
 - [ ] Unified 视图显示正确
 - [ ] 视图切换功能正常
 - [ ] 行号显示正确
+- [x] Split 视图差异概览条显示差异块位置
+- [x] Split 视图上一个/下一个差异导航
+- [x] 点击概览条跳转差异块并保持左右面板同步
+- [x] 当前差异块在左右面板中高亮，并在概览条中明确标识
 
 ### 5.2 API 工具测试
 

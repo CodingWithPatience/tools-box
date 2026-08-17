@@ -1,6 +1,6 @@
 use similar::{ChangeTag, TextDiff};
 
-use super::models::{DiffLine, DiffResult, DiffType, SplitLine, TextSegment};
+use super::models::{DiffHunk, DiffLine, DiffResult, DiffType, SplitLine, TextSegment};
 
 /// 计算两段文本的差异
 pub fn compute_diff(left: &str, right: &str) -> DiffResult {
@@ -8,6 +8,7 @@ pub fn compute_diff(left: &str, right: &str) -> DiffResult {
 
     let unified_lines = build_unified_lines(&diff);
     let split_lines = build_split_lines(&diff);
+    let diff_hunks = build_diff_hunks(&split_lines);
 
     let mut added_count = 0;
     let mut removed_count = 0;
@@ -26,10 +27,41 @@ pub fn compute_diff(left: &str, right: &str) -> DiffResult {
     DiffResult {
         unified_lines,
         split_lines,
+        diff_hunks,
         added_count,
         removed_count,
         similarity,
     }
+}
+
+/// 将 Split 视图中的连续差异行合并为差异块
+fn build_diff_hunks(lines: &[SplitLine]) -> Vec<DiffHunk> {
+    let mut hunks = Vec::new();
+    let mut start_line = None;
+
+    for (line_index, line) in lines.iter().enumerate() {
+        let is_changed = line.left_type != DiffType::Equal || line.right_type != DiffType::Equal;
+
+        if is_changed {
+            if start_line.is_none() {
+                start_line = Some(line_index);
+            }
+        } else if let Some(start) = start_line.take() {
+            hunks.push(DiffHunk {
+                start_line: start,
+                end_line: line_index - 1,
+            });
+        }
+    }
+
+    if let Some(start) = start_line {
+        hunks.push(DiffHunk {
+            start_line: start,
+            end_line: lines.len() - 1,
+        });
+    }
+
+    hunks
 }
 
 /// 计算两行文本的字符级差异
@@ -385,6 +417,13 @@ mod tests {
 
         assert_eq!(result.added_count, 1);
         assert_eq!(result.removed_count, 0);
+        assert_eq!(
+            result.diff_hunks,
+            vec![DiffHunk {
+                start_line: 0,
+                end_line: 0,
+            }]
+        );
     }
 
     #[test]
@@ -395,5 +434,43 @@ mod tests {
 
         // Split 视图应该有 3 行（a 相同，b->d 修改，c 相同）
         assert_eq!(result.split_lines.len(), 3);
+    }
+
+    #[test]
+    fn test_diff_hunks_group_consecutive_changes() {
+        let left = "same\nold1\nold2\nseparator\nold3\nend";
+        let right = "same\nnew1\nnew2\nseparator\nnew3\nend";
+        let result = compute_diff(left, right);
+
+        assert_eq!(
+            result.diff_hunks,
+            vec![
+                DiffHunk {
+                    start_line: 1,
+                    end_line: 2,
+                },
+                DiffHunk {
+                    start_line: 4,
+                    end_line: 4,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_diff_hunks_empty_for_same_text() {
+        let result = compute_diff("same\ntext", "same\ntext");
+
+        assert!(result.diff_hunks.is_empty());
+    }
+
+    #[test]
+    fn test_diff_hunks_for_pure_deletion_at_end() {
+        let result = compute_diff("same\nremoved", "same");
+
+        assert_eq!(result.diff_hunks.len(), 1);
+        let hunk = &result.diff_hunks[0];
+        assert!(hunk.start_line <= hunk.end_line);
+        assert_eq!(hunk.end_line, result.split_lines.len() - 1);
     }
 }

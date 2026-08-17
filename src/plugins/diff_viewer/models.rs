@@ -65,6 +65,15 @@ pub struct SplitLine {
     pub right_segments: Vec<TextSegment>,
 }
 
+/// Split 视图中的连续差异块
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiffHunk {
+    /// 差异块起始行索引（从 0 开始）
+    pub start_line: usize,
+    /// 差异块结束行索引（从 0 开始，包含当前行）
+    pub end_line: usize,
+}
+
 /// 差异结果
 #[derive(Debug, Clone)]
 pub struct DiffResult {
@@ -72,6 +81,8 @@ pub struct DiffResult {
     pub unified_lines: Vec<DiffLine>,
     /// Split 视图数据
     pub split_lines: Vec<SplitLine>,
+    /// Split 视图中的连续差异块
+    pub diff_hunks: Vec<DiffHunk>,
     /// 新增行数
     pub added_count: usize,
     /// 删除行数
@@ -79,4 +90,3 @@ pub struct DiffResult {
     /// 相似度 (0.0 - 1.0)
     pub similarity: f64,
 }
-
