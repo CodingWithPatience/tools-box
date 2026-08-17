@@ -63,6 +63,7 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |cc| {
             app::setup_chinese_fonts(&cc.egui_ctx);
+            plugins::note_taker::markdown::install_markdown_image_loader(&cc.egui_ctx);
 
             // 设置全局 egui Context，用于热键和托盘事件唤醒事件循环
             tray::set_egui_ctx(cc.egui_ctx.clone());

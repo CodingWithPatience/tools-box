@@ -2032,6 +2032,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -4216,6 +4218,7 @@ dependencies = [
  "egui",
  "env_logger",
  "hmac",
+ "image",
  "log",
  "pbkdf2",
  "pulldown-cmark",
@@ -4231,6 +4234,7 @@ dependencies = [
  "ssh2",
  "syntect",
  "thiserror 2.0.18",
+ "tokio",
  "urlencoding",
  "uuid",
  "vt100",

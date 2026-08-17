@@ -1,3 +1,6 @@
+use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver};
+
 use egui::{Color32, RichText, Ui};
 
 use super::markdown::MarkdownRenderer;
@@ -49,6 +52,8 @@ pub struct NoteTakerUi {
     editing_folder_id: Option<i64>,
     /// 错误信息
     error: Option<String>,
+    /// Markdown 导出结果接收器
+    export_receiver: Option<Receiver<Result<PathBuf, String>>>,
     /// Markdown 渲染器
     markdown_renderer: MarkdownRenderer,
     /// 左侧面板宽度
@@ -76,6 +81,7 @@ impl NoteTakerUi {
             folder_form_parent_id: None,
             editing_folder_id: None,
             error: None,
+            export_receiver: None,
             markdown_renderer: MarkdownRenderer::new(),
             left_panel_width: 200.0, // 默认宽度
         }
@@ -132,6 +138,8 @@ impl NoteTakerUi {
 
     /// 渲染主界面
     pub fn render(&mut self, ui: &mut Ui, conn: &rusqlite::Connection) {
+        self.poll_export_result();
+
         // 处理待执行的操作
         let mut action = None;
 
@@ -423,31 +431,41 @@ impl NoteTakerUi {
                     .desired_width(title_width),
             );
 
-            // 视图切换按钮
+            // 预留足够空间给操作按钮，保持工具栏单行显示。
             if ui
                 .selectable_label(self.view_mode == NoteViewMode::Edit, "编辑")
                 .clicked()
             {
                 self.set_view_mode(NoteViewMode::Edit);
+                ui.memory_mut(|memory| memory.close_popup());
             }
             if ui
                 .selectable_label(self.view_mode == NoteViewMode::Preview, "预览")
                 .clicked()
             {
                 self.set_view_mode(NoteViewMode::Preview);
+                ui.memory_mut(|memory| memory.close_popup());
             }
             if ui
                 .selectable_label(self.view_mode == NoteViewMode::Split, "分栏")
                 .clicked()
             {
                 self.set_view_mode(NoteViewMode::Split);
+                ui.memory_mut(|memory| memory.close_popup());
             }
             if ui
-                .button("复制 Markdown")
+                .button("复制")
                 .on_hover_text("复制当前笔记的 Markdown 原文")
                 .clicked()
             {
                 ui.ctx().copy_text(self.form.content.clone());
+            }
+            if ui
+                .button("导出")
+                .on_hover_text("将当前笔记导出为 Markdown 文件")
+                .clicked()
+            {
+                self.export_markdown(ui.ctx());
             }
         });
         ui.add_space(5.0);
@@ -497,7 +515,10 @@ impl NoteTakerUi {
                     .stroke(preview_stroke)
                     .inner_margin(egui::Margin::symmetric(8, 6))
                     .show(ui, |ui| {
-                        let has_heading_selector = self.render_heading_selector(ui);
+                        let heading_menu_max_height =
+                            (ui.ctx().screen_rect().height() * 0.5).max(1.0);
+                        let has_heading_selector =
+                            self.render_heading_selector(ui, heading_menu_max_height);
                         let selector_height = if has_heading_selector { 30.0 } else { 0.0 };
                         let preview_height = (content_height - selector_height - 12.0).max(120.0);
                         ui.set_min_height(content_height - 12.0);
@@ -558,7 +579,10 @@ impl NoteTakerUi {
                         .stroke(preview_stroke)
                         .inner_margin(egui::Margin::symmetric(8, 6))
                         .show(&mut columns[1], |ui| {
-                            let has_heading_selector = self.render_heading_selector(ui);
+                            let heading_menu_max_height =
+                                (ui.ctx().screen_rect().height() * 0.5).max(1.0);
+                            let has_heading_selector =
+                                self.render_heading_selector(ui, heading_menu_max_height);
                             let selector_height = if has_heading_selector { 30.0 } else { 0.0 };
                             let preview_height =
                                 (content_height - selector_height - 12.0).max(120.0);
@@ -777,7 +801,7 @@ impl NoteTakerUi {
         self.pending_scroll_sync = Some(offset);
     }
 
-    fn render_heading_selector(&mut self, ui: &mut Ui) -> bool {
+    fn render_heading_selector(&mut self, ui: &mut Ui, max_menu_height: f32) -> bool {
         if self.view_mode == NoteViewMode::Edit {
             return false;
         }
@@ -787,26 +811,69 @@ impl NoteTakerUi {
             return false;
         }
 
+        let selector_id = match self.view_mode {
+            NoteViewMode::Preview => "note_heading_navigation_preview",
+            NoteViewMode::Split => "note_heading_navigation_split",
+            NoteViewMode::Edit => "note_heading_navigation_edit",
+        };
+        let popup_id = ui.make_persistent_id(selector_id);
+
         ui.horizontal(|ui| {
             ui.label("目录:");
-            egui::ComboBox::from_id_salt("note_heading_navigation")
-                .selected_text("选择标题")
-                .show_ui(ui, |ui| {
-                    for (index, heading) in headings.iter().enumerate() {
-                        let indent = "  ".repeat(usize::from(heading.level.saturating_sub(1)));
-                        let title = if heading.title.is_empty() {
-                            "（无标题）"
-                        } else {
-                            heading.title.as_str()
-                        };
-                        if ui
-                            .selectable_label(false, format!("{indent}{title}"))
-                            .clicked()
-                        {
-                            self.pending_heading_index = Some(index);
-                        }
-                    }
-                });
+            let is_popup_open = ui.memory(|memory| memory.is_popup_open(popup_id));
+            let selector_text = if is_popup_open {
+                "选择标题 ▲"
+            } else {
+                "选择标题 ▼"
+            };
+            let selector_response = ui.button(selector_text);
+            if selector_response.clicked() {
+                ui.memory_mut(|memory| memory.toggle_popup(popup_id));
+            }
+
+            let item_height = ui.spacing().interact_size.y;
+            let heading_count = u16::try_from(headings.len()).unwrap_or(u16::MAX);
+            let natural_menu_height =
+                item_height * f32::from(heading_count) + ui.spacing().menu_spacing * 2.0;
+            let popup_height = natural_menu_height.min(max_menu_height);
+            let screen_rect = ui.ctx().screen_rect();
+            let available_below = (screen_rect.bottom() - selector_response.rect.bottom()).max(0.0);
+            let available_above = (selector_response.rect.top() - screen_rect.top()).max(0.0);
+            let above_or_below =
+                if available_below < popup_height && available_above > available_below {
+                    egui::AboveOrBelow::Above
+                } else {
+                    egui::AboveOrBelow::Below
+                };
+
+            egui::popup::popup_above_or_below_widget(
+                ui,
+                popup_id,
+                &selector_response,
+                above_or_below,
+                egui::PopupCloseBehavior::CloseOnClick,
+                |popup_ui| {
+                    egui::ScrollArea::vertical()
+                        .max_height(max_menu_height)
+                        .show(popup_ui, |popup_ui| {
+                            for (index, heading) in headings.iter().enumerate() {
+                                let indent =
+                                    "  ".repeat(usize::from(heading.level.saturating_sub(1)));
+                                let title = if heading.title.is_empty() {
+                                    "（无标题）"
+                                } else {
+                                    heading.title.as_str()
+                                };
+                                if popup_ui
+                                    .selectable_label(false, format!("{indent}{title}"))
+                                    .clicked()
+                                {
+                                    self.pending_heading_index = Some(index);
+                                }
+                            }
+                        });
+                },
+            );
         });
         true
     }
@@ -849,6 +916,81 @@ impl NoteTakerUi {
                 Err(e) => {
                     self.error = Some(format!("保存笔记失败: {}", e));
                 }
+            }
+        }
+    }
+
+    /// 将当前笔记导出为 Markdown 文件。
+    fn export_markdown(&mut self, ctx: &egui::Context) {
+        if self.export_receiver.is_some() {
+            return;
+        }
+
+        let file_name = markdown_export_file_name(&self.form.title);
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Markdown 文件", &["md", "markdown"])
+            .set_file_name(&file_name)
+            .save_file()
+        else {
+            return;
+        };
+        let path = ensure_markdown_export_extension(path);
+
+        let content = self.form.content.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.export_receiver = Some(receiver);
+        self.error = Some("正在导出 Markdown...".to_string());
+
+        let path_for_thread = path.clone();
+        let repaint_context = ctx.clone();
+        let spawn_result = std::thread::Builder::new()
+            .name("markdown-exporter".to_string())
+            .spawn(move || {
+                let result = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| format!("创建导出运行时失败: {error}"))
+                    .and_then(|runtime| {
+                        runtime.block_on(async {
+                            tokio::time::timeout(
+                                std::time::Duration::from_secs(10),
+                                tokio::fs::write(&path_for_thread, content.as_bytes()),
+                            )
+                            .await
+                            .map_err(|_| "写入 Markdown 文件超时".to_string())?
+                            .map_err(|error| format!("写入 Markdown 文件失败: {error}"))
+                        })
+                    })
+                    .map(|()| path_for_thread);
+                let _ = sender.send(result);
+                repaint_context.request_repaint();
+            });
+
+        if let Err(error) = spawn_result {
+            self.export_receiver = None;
+            self.error = Some(format!("启动 Markdown 导出线程失败: {error}"));
+        }
+    }
+
+    fn poll_export_result(&mut self) {
+        let Some(receiver) = self.export_receiver.as_ref() else {
+            return;
+        };
+
+        match receiver.try_recv() {
+            Ok(Ok(path)) => {
+                self.export_receiver = None;
+                self.error = Some(format!("Markdown 已导出: {}", path.display()));
+                log::info!("导出 Markdown: {}", path.display());
+            }
+            Ok(Err(error)) => {
+                self.export_receiver = None;
+                self.error = Some(error);
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.export_receiver = None;
+                self.error = Some("Markdown 导出线程异常退出".to_string());
             }
         }
     }
@@ -953,6 +1095,83 @@ impl NoteTakerUi {
     }
 }
 
+fn markdown_export_file_name(title: &str) -> String {
+    let mut file_name: String = title
+        .trim()
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                '_'
+            } else {
+                match character {
+                    '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+                    _ => character,
+                }
+            }
+        })
+        .take(80)
+        .collect();
+
+    file_name = file_name.trim_end_matches([' ', '.']).to_string();
+    if file_name.is_empty() {
+        file_name = "未命名笔记".to_string();
+    }
+    if !file_name.to_ascii_lowercase().ends_with(".md") {
+        file_name.push_str(".md");
+    }
+    if is_windows_reserved_file_name(&file_name) {
+        file_name.insert(0, '_');
+    }
+    file_name
+}
+
+fn is_windows_reserved_file_name(file_name: &str) -> bool {
+    let stem = file_name
+        .split_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(file_name)
+        .to_ascii_lowercase();
+    matches!(
+        stem.as_str(),
+        "con"
+            | "prn"
+            | "aux"
+            | "nul"
+            | "com1"
+            | "com2"
+            | "com3"
+            | "com4"
+            | "com5"
+            | "com6"
+            | "com7"
+            | "com8"
+            | "com9"
+            | "lpt1"
+            | "lpt2"
+            | "lpt3"
+            | "lpt4"
+            | "lpt5"
+            | "lpt6"
+            | "lpt7"
+            | "lpt8"
+            | "lpt9"
+    )
+}
+
+fn ensure_markdown_export_extension(mut path: PathBuf) -> PathBuf {
+    let has_markdown_extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| {
+            extension.eq_ignore_ascii_case("md") || extension.eq_ignore_ascii_case("markdown")
+        })
+        .unwrap_or(false);
+    if !has_markdown_extension {
+        path.set_extension("md");
+    }
+    path
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -975,5 +1194,25 @@ mod tests {
     fn should_detect_editor_scroll_changes() {
         assert!(NoteTakerUi::has_scroll_offset_changed(0.0, 1.0));
         assert!(!NoteTakerUi::has_scroll_offset_changed(12.0, 12.0));
+    }
+
+    #[test]
+    fn should_sanitize_markdown_export_file_name() {
+        assert_eq!(
+            markdown_export_file_name("会议: 设计/方案"),
+            "会议_ 设计_方案.md"
+        );
+        assert_eq!(markdown_export_file_name("  "), "未命名笔记.md");
+        assert_eq!(markdown_export_file_name("README.MD"), "README.MD");
+        assert_eq!(markdown_export_file_name("CON"), "_CON.md");
+        assert_eq!(markdown_export_file_name("报告. "), "报告.md");
+        assert_eq!(
+            ensure_markdown_export_extension(PathBuf::from("笔记.txt")),
+            PathBuf::from("笔记.md")
+        );
+        assert_eq!(
+            ensure_markdown_export_extension(PathBuf::from("笔记.markdown")),
+            PathBuf::from("笔记.markdown")
+        );
     }
 }

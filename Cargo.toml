@@ -7,6 +7,7 @@ edition = "2024"
 # GUI framework
 eframe = { version = "0.31", features = ["default"] }
 egui = "0.31"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff"] }
 raw-window-handle = "0.6"
 
 # SQLite database
@@ -50,6 +51,7 @@ similar = "2.6"
 
 # HTTP client (for API tester)
 reqwest = { version = "0.12", features = ["blocking", "json"] }
+tokio = { version = "1.52", features = ["fs", "io-util", "net", "rt", "time"] }
 
 # UUID generation
 uuid = { version = "1", features = ["v4"] }

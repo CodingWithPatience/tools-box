@@ -1,11 +1,19 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::io::Cursor;
+use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
+use egui::load::{ImageLoadResult, ImageLoader, ImagePoll, LoadError, SizeHint};
 use egui::text::{LayoutJob, TextFormat};
-use egui::{Color32, FontId, RichText, Stroke, Ui};
+use egui::{Color32, Context, FontId, RichText, Stroke, Ui};
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag};
+use tokio::io::AsyncReadExt;
 
 use crate::utils::highlight::SyntaxHighlighter;
 
@@ -574,6 +582,394 @@ struct ParsedDocumentCache {
     document: Rc<MarkdownDocument>,
 }
 
+const MAX_MARKDOWN_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
+const MAX_MARKDOWN_IMAGE_CACHE_ENTRIES: usize = 64;
+const MAX_MARKDOWN_IMAGE_CACHE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_MARKDOWN_IMAGE_DIMENSION: u32 = 8192;
+const MAX_MARKDOWN_IMAGE_ACTIVE: usize = 8;
+const MARKDOWN_IMAGE_LOAD_TIMEOUT: Duration = Duration::from_secs(10);
+
+enum MarkdownImageState {
+    Pending(u64),
+    Ready(Arc<egui::ColorImage>),
+    Failed { error: String, retry_at: Instant },
+}
+
+/// 安装 Markdown 图片加载器。
+///
+/// 加载器支持 `file://`、`http://` 和 `https://` 图片地址，并在后台线程执行
+/// 文件读取、网络请求和图片解码，避免阻塞 egui UI 线程。
+pub fn install_markdown_image_loader(ctx: &Context) {
+    ctx.add_image_loader(Arc::new(MarkdownImageLoader::default()));
+}
+
+#[derive(Default)]
+struct MarkdownImageLoader {
+    cache: Arc<Mutex<HashMap<String, MarkdownImageState>>>,
+    next_request_id: AtomicU64,
+    active_requests: Arc<AtomicUsize>,
+}
+
+struct ActiveImageRequestGuard(Arc<AtomicUsize>);
+
+impl Drop for ActiveImageRequestGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl ImageLoader for MarkdownImageLoader {
+    fn id(&self) -> &str {
+        "tools_box::note_taker::MarkdownImageLoader"
+    }
+
+    fn load(&self, ctx: &Context, uri: &str, _size_hint: SizeHint) -> ImageLoadResult {
+        if !is_supported_markdown_image_uri(uri) {
+            return Err(LoadError::NotSupported);
+        }
+
+        let mut cache = self
+            .cache
+            .lock()
+            .map_err(|_| LoadError::Loading("图片缓存锁已损坏".to_string()))?;
+        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        let is_retry = matches!(
+            cache.get(uri),
+            Some(MarkdownImageState::Failed { retry_at, .. }) if *retry_at <= Instant::now()
+        );
+        let needs_request = cache.get(uri).is_none() || is_retry;
+        if cache.get(uri).is_none() {
+            trim_markdown_image_entries(&mut cache, uri);
+            if cache.len() >= MAX_MARKDOWN_IMAGE_CACHE_ENTRIES {
+                return Err(LoadError::Loading("图片缓存正在处理其他请求".to_string()));
+            }
+        }
+        if needs_request && !self.try_acquire_image_slot() {
+            return Err(LoadError::Loading("图片并发加载数量已达上限".to_string()));
+        }
+        if let Some(state) = cache.get_mut(uri) {
+            match state {
+                MarkdownImageState::Pending(_) => return Ok(ImagePoll::Pending { size: None }),
+                MarkdownImageState::Ready(image) => {
+                    return Ok(ImagePoll::Ready {
+                        image: Arc::clone(image),
+                    });
+                }
+                MarkdownImageState::Failed { error, retry_at } if *retry_at > Instant::now() => {
+                    return Err(LoadError::Loading(error.clone()));
+                }
+                MarkdownImageState::Failed { .. } => {
+                    *state = MarkdownImageState::Pending(request_id);
+                }
+            }
+        } else {
+            cache.insert(uri.to_owned(), MarkdownImageState::Pending(request_id));
+        }
+        drop(cache);
+
+        let cache = Arc::clone(&self.cache);
+        let active_requests = Arc::clone(&self.active_requests);
+        let image_uri = uri.to_owned();
+        let repaint_context = ctx.clone();
+        let spawn_result = thread::Builder::new()
+            .name("markdown-image-loader".to_string())
+            .spawn(move || {
+                let _active_request_guard = ActiveImageRequestGuard(active_requests);
+                let result = load_markdown_image(&image_uri).map(Arc::new);
+                if let Ok(mut cache) = cache.lock() {
+                    let is_current_request = matches!(
+                        cache.get(&image_uri),
+                        Some(MarkdownImageState::Pending(current_id))
+                            if *current_id == request_id
+                    );
+                    if is_current_request {
+                        let state = match result {
+                            Ok(image) => {
+                                trim_markdown_image_cache(&mut cache, &image_uri, &image);
+                                MarkdownImageState::Ready(image)
+                            }
+                            Err(error) => MarkdownImageState::Failed {
+                                error,
+                                retry_at: Instant::now() + Duration::from_secs(30),
+                            },
+                        };
+                        cache.insert(image_uri, state);
+                    }
+                }
+                repaint_context.request_repaint();
+            });
+
+        if let Err(error) = spawn_result {
+            let message = format!("启动图片加载线程失败: {error}");
+            self.active_requests.fetch_sub(1, Ordering::AcqRel);
+            if let Ok(mut cache) = self.cache.lock() {
+                if matches!(
+                    cache.get(uri),
+                    Some(MarkdownImageState::Pending(current_id))
+                        if *current_id == request_id
+                ) {
+                    cache.insert(
+                        uri.to_owned(),
+                        MarkdownImageState::Failed {
+                            error: message.clone(),
+                            retry_at: Instant::now() + Duration::from_secs(30),
+                        },
+                    );
+                }
+            }
+            return Err(LoadError::Loading(message));
+        }
+
+        Ok(ImagePoll::Pending { size: None })
+    }
+
+    fn forget(&self, uri: &str) {
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.remove(uri);
+        }
+    }
+
+    fn forget_all(&self) {
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.clear();
+        }
+    }
+
+    fn byte_size(&self) -> usize {
+        self.cache
+            .lock()
+            .map(|cache| {
+                cache
+                    .values()
+                    .map(|state| match state {
+                        MarkdownImageState::Ready(image) => markdown_image_size(image),
+                        MarkdownImageState::Failed { error, .. } => error.len(),
+                        MarkdownImageState::Pending(_) => 0,
+                    })
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+}
+
+impl MarkdownImageLoader {
+    fn try_acquire_image_slot(&self) -> bool {
+        let mut active = self.active_requests.load(Ordering::Acquire);
+        loop {
+            if active >= MAX_MARKDOWN_IMAGE_ACTIVE {
+                return false;
+            }
+            match self.active_requests.compare_exchange(
+                active,
+                active + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(current) => active = current,
+            }
+        }
+    }
+}
+
+fn markdown_image_size(image: &egui::ColorImage) -> usize {
+    image.pixels.len() * std::mem::size_of::<egui::Color32>()
+}
+
+fn trim_markdown_image_cache(
+    cache: &mut HashMap<String, MarkdownImageState>,
+    current_uri: &str,
+    incoming_image: &egui::ColorImage,
+) {
+    let incoming_size = markdown_image_size(incoming_image);
+    trim_markdown_image_entries(cache, current_uri);
+    while cache_size(cache).saturating_add(incoming_size) > MAX_MARKDOWN_IMAGE_CACHE_BYTES
+        && cache.len() > 1
+    {
+        let Some(key) = cache.iter().find_map(|(key, state)| {
+            if key != current_uri && !matches!(state, MarkdownImageState::Pending(_)) {
+                Some(key.clone())
+            } else {
+                None
+            }
+        }) else {
+            break;
+        };
+        cache.remove(&key);
+    }
+}
+
+fn trim_markdown_image_entries(cache: &mut HashMap<String, MarkdownImageState>, current_uri: &str) {
+    while cache.len() >= MAX_MARKDOWN_IMAGE_CACHE_ENTRIES {
+        let Some(key) = cache.iter().find_map(|(key, state)| {
+            if key != current_uri && !matches!(state, MarkdownImageState::Pending(_)) {
+                Some(key.clone())
+            } else {
+                None
+            }
+        }) else {
+            break;
+        };
+        cache.remove(&key);
+    }
+}
+
+fn cache_size(cache: &HashMap<String, MarkdownImageState>) -> usize {
+    cache
+        .values()
+        .map(|state| match state {
+            MarkdownImageState::Ready(image) => markdown_image_size(image),
+            MarkdownImageState::Failed { error, .. } => error.len(),
+            MarkdownImageState::Pending(_) => 0,
+        })
+        .sum()
+}
+
+fn is_supported_markdown_image_uri(uri: &str) -> bool {
+    uri.get(..7)
+        .map(|scheme| scheme.eq_ignore_ascii_case("file://"))
+        .unwrap_or(false)
+        || uri
+            .get(..7)
+            .map(|scheme| scheme.eq_ignore_ascii_case("http://"))
+            .unwrap_or(false)
+        || uri
+            .get(..8)
+            .map(|scheme| scheme.eq_ignore_ascii_case("https://"))
+            .unwrap_or(false)
+}
+
+fn load_markdown_image(uri: &str) -> Result<egui::ColorImage, String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("创建图片加载运行时失败: {error}"))?;
+    runtime.block_on(load_markdown_image_async(uri))
+}
+
+async fn load_markdown_image_async(uri: &str) -> Result<egui::ColorImage, String> {
+    let bytes = if uri
+        .get(..7)
+        .map(|scheme| scheme.eq_ignore_ascii_case("http://"))
+        .unwrap_or(false)
+        || uri
+            .get(..8)
+            .map(|scheme| scheme.eq_ignore_ascii_case("https://"))
+            .unwrap_or(false)
+    {
+        let client = reqwest::Client::builder()
+            .timeout(MARKDOWN_IMAGE_LOAD_TIMEOUT)
+            .build()
+            .map_err(|error| format!("创建图片 HTTP 客户端失败: {error}"))?;
+        let mut response =
+            tokio::time::timeout(MARKDOWN_IMAGE_LOAD_TIMEOUT, client.get(uri).send())
+                .await
+                .map_err(|_| "下载图片超时".to_string())?
+                .map_err(|error| format!("下载图片失败: {error}"))?
+                .error_for_status()
+                .map_err(|error| format!("图片 HTTP 响应失败: {error}"))?;
+        if response.content_length().unwrap_or(0) > MAX_MARKDOWN_IMAGE_BYTES {
+            return Err("图片大小超过 20 MB 限制".to_string());
+        }
+        let mut bytes = Vec::new();
+        loop {
+            let chunk = tokio::time::timeout(MARKDOWN_IMAGE_LOAD_TIMEOUT, response.chunk())
+                .await
+                .map_err(|_| "读取图片响应超时".to_string())?
+                .map_err(|error| format!("读取图片响应失败: {error}"))?;
+            let Some(chunk) = chunk else {
+                break;
+            };
+            let chunk_size = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+            let current_size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+            if current_size.saturating_add(chunk_size) > MAX_MARKDOWN_IMAGE_BYTES {
+                return Err("图片大小超过 20 MB 限制".to_string());
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        bytes
+    } else {
+        let path = markdown_file_path(uri);
+        let metadata =
+            tokio::time::timeout(MARKDOWN_IMAGE_LOAD_TIMEOUT, tokio::fs::metadata(&path))
+                .await
+                .map_err(|_| "读取图片文件信息超时".to_string())?
+                .map_err(|error| format!("读取图片文件信息失败: {}: {error}", path.display()))?;
+        if metadata.len() > MAX_MARKDOWN_IMAGE_BYTES {
+            return Err("图片大小超过 20 MB 限制".to_string());
+        }
+        let mut file =
+            tokio::time::timeout(MARKDOWN_IMAGE_LOAD_TIMEOUT, tokio::fs::File::open(&path))
+                .await
+                .map_err(|_| "打开图片文件超时".to_string())?
+                .map_err(|error| format!("打开图片文件失败: {}: {error}", path.display()))?;
+        let mut bytes = Vec::new();
+        let mut buffer = vec![0_u8; 8192];
+        loop {
+            let read_size =
+                tokio::time::timeout(MARKDOWN_IMAGE_LOAD_TIMEOUT, file.read(&mut buffer))
+                    .await
+                    .map_err(|_| "读取图片文件超时".to_string())?
+                    .map_err(|error| format!("读取图片文件失败: {}: {error}", path.display()))?;
+            if read_size == 0 {
+                break;
+            }
+
+            let current_size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+            let read_size_u64 = u64::try_from(read_size).unwrap_or(u64::MAX);
+            if current_size.saturating_add(read_size_u64) > MAX_MARKDOWN_IMAGE_BYTES {
+                return Err("图片大小超过 20 MB 限制".to_string());
+            }
+            bytes.extend_from_slice(&buffer[..read_size]);
+        }
+        bytes
+    };
+
+    let mut reader = image::ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|error| format!("识别图片格式失败: {error}"))?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_MARKDOWN_IMAGE_DIMENSION);
+    limits.max_image_height = Some(MAX_MARKDOWN_IMAGE_DIMENSION);
+    limits.max_alloc = Some(u64::try_from(MAX_MARKDOWN_IMAGE_CACHE_BYTES).unwrap_or(u64::MAX));
+    reader.limits(limits);
+    let decoded = reader
+        .decode()
+        .map_err(|error| format!("解码图片失败: {error}"))?;
+    let width = usize::try_from(decoded.width()).map_err(|_| "图片宽度超出支持范围".to_string())?;
+    let height =
+        usize::try_from(decoded.height()).map_err(|_| "图片高度超出支持范围".to_string())?;
+    let image_size = width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(std::mem::size_of::<egui::Color32>()))
+        .ok_or_else(|| "图片解码后的尺寸超出支持范围".to_string())?;
+    if image_size > MAX_MARKDOWN_IMAGE_CACHE_BYTES {
+        return Err("图片解码后的尺寸超过 64 MB 限制".to_string());
+    }
+    let rgba = decoded.to_rgba8();
+    Ok(egui::ColorImage::from_rgba_unmultiplied(
+        [width, height],
+        rgba.as_raw(),
+    ))
+}
+
+fn markdown_file_path(uri: &str) -> PathBuf {
+    let path = if uri.len() >= 7 && uri[..7].eq_ignore_ascii_case("file://") {
+        &uri[7..]
+    } else {
+        uri
+    };
+    let path = urlencoding::decode(path)
+        .map(|decoded| decoded.into_owned())
+        .unwrap_or_else(|_| path.to_owned());
+    let path = if path.starts_with('/') && path.as_bytes().get(2).copied() == Some(b':') {
+        &path[1..]
+    } else {
+        path.as_str()
+    };
+    PathBuf::from(path)
+}
+
 /// 行内布局缓存的渲染上下文。
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct InlineLayoutContext {
@@ -988,6 +1384,62 @@ impl MarkdownRenderer {
         inlines: &[MarkdownInline],
         style: InlineStyle,
     ) -> egui::Response {
+        if inlines
+            .iter()
+            .any(|inline| matches!(inline, MarkdownInline::Image { .. }))
+        {
+            let mut response: Option<egui::Response> = None;
+            let mut text_inlines = Vec::new();
+
+            for inline in inlines {
+                let MarkdownInline::Image {
+                    destination,
+                    title,
+                    alt,
+                } = inline
+                else {
+                    text_inlines.push(inline.clone());
+                    continue;
+                };
+
+                if !text_inlines.is_empty() {
+                    let text_response = self.render_text_inlines(ui, &text_inlines, style);
+                    response = Some(match response {
+                        Some(response) => response.union(text_response),
+                        None => text_response,
+                    });
+                    text_inlines.clear();
+                }
+
+                let image_response = self.render_image(ui, destination, title.as_deref(), alt);
+                response = Some(match response {
+                    Some(response) => response.union(image_response),
+                    None => image_response,
+                });
+            }
+
+            if !text_inlines.is_empty() {
+                let text_response = self.render_text_inlines(ui, &text_inlines, style);
+                response = Some(match response {
+                    Some(response) => response.union(text_response),
+                    None => text_response,
+                });
+            }
+
+            if let Some(response) = response {
+                return response;
+            }
+        }
+
+        self.render_text_inlines(ui, inlines, style)
+    }
+
+    fn render_text_inlines(
+        &self,
+        ui: &mut Ui,
+        inlines: &[MarkdownInline],
+        style: InlineStyle,
+    ) -> egui::Response {
         let context = inline_layout_context(ui);
         let cache_key = inline_layout_cache_key(inlines, style, context);
         if let Some(entry) = self.inline_layout_cache.borrow().get(&cache_key) {
@@ -1014,6 +1466,30 @@ impl MarkdownRenderer {
             },
         );
         ui.add(egui::Label::new(job).wrap())
+    }
+
+    fn render_image(
+        &self,
+        ui: &mut Ui,
+        destination: &str,
+        title: Option<&str>,
+        alt: &str,
+    ) -> egui::Response {
+        let image_uri = markdown_image_uri(destination);
+        let alt_text = if alt.is_empty() { "图片" } else { alt };
+        let max_width = ui.available_width().max(1.0);
+        let response = ui.add(
+            egui::Image::from_uri(image_uri)
+                .max_width(max_width)
+                .maintain_aspect_ratio(true)
+                .alt_text(alt_text),
+        );
+
+        if let Some(title) = title.filter(|title| !title.is_empty()) {
+            response.on_hover_text(title)
+        } else {
+            response
+        }
     }
 
     fn append_inlines_to_job(
@@ -1240,12 +1716,30 @@ fn list_indent(depth: usize) -> f32 {
     f32::from(depth) * 16.0
 }
 
+fn markdown_image_uri(destination: &str) -> String {
+    let destination = destination.trim();
+    let has_uri_scheme = ["data:", "file:", "http:", "https:", "bytes:"]
+        .iter()
+        .any(|scheme| {
+            destination.len() >= scheme.len()
+                && destination
+                    .get(..scheme.len())
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme))
+        });
+
+    if has_uri_scheme {
+        destination.to_owned()
+    } else {
+        format!("file://{destination}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         InlineLayoutContext, InlineStyle, MarkdownBlock, MarkdownDocument, MarkdownInline,
         MarkdownRenderer, MarkdownTableAlignment, SyntaxHighlighter, code_highlight_cache_key,
-        inline_layout_cache_key,
+        inline_layout_cache_key, markdown_image_uri,
     };
 
     fn render_markdown_frame(ctx: &egui::Context, renderer: &mut MarkdownRenderer, width: f32) {
@@ -1381,6 +1875,31 @@ mod tests {
             MarkdownBlock::CodeBlock { language, content }
                 if language.as_deref() == Some("rust") && content.contains("fn main")
         ));
+    }
+
+    #[test]
+    fn should_normalize_relative_image_destination_to_file_uri() {
+        assert_eq!(
+            markdown_image_uri("images/logo.png"),
+            "file://images/logo.png"
+        );
+        assert_eq!(
+            markdown_image_uri("  images/logo.png  "),
+            "file://images/logo.png"
+        );
+        assert_eq!(markdown_image_uri("图片/截图.png"), "file://图片/截图.png");
+    }
+
+    #[test]
+    fn should_preserve_image_uri_with_supported_scheme() {
+        assert_eq!(
+            markdown_image_uri("https://example.com/logo.png"),
+            "https://example.com/logo.png"
+        );
+        assert_eq!(
+            markdown_image_uri("FILE://C:/images/logo.png"),
+            "FILE://C:/images/logo.png"
+        );
     }
 
     #[test]
