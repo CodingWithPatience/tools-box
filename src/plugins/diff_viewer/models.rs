@@ -65,7 +65,7 @@ pub struct SplitLine {
     pub right_segments: Vec<TextSegment>,
 }
 
-/// Split 视图中的连续差异块
+/// 视图中的连续差异块
 #[derive(Debug, Clone, PartialEq)]
 pub struct DiffHunk {
     /// 差异块起始行索引（从 0 开始）
@@ -79,6 +79,8 @@ pub struct DiffHunk {
 pub struct DiffResult {
     /// Unified 视图数据
     pub unified_lines: Vec<DiffLine>,
+    /// Unified 视图中的连续差异块
+    pub unified_diff_hunks: Vec<DiffHunk>,
     /// Split 视图数据
     pub split_lines: Vec<SplitLine>,
     /// Split 视图中的连续差异块

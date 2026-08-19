@@ -2,7 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
-use egui::{Color32, RichText, text::LayoutJob};
+use egui::{text::LayoutJob, Color32, RichText};
 
 use super::differ;
 use super::models::{DiffHunk, DiffResult, DiffType, SplitLine, TextSegment, ViewMode};
@@ -39,6 +39,12 @@ const SUPPORTED_LANGUAGES: &[(&str, &str)] = &[
 type HighlightCache = RefCell<Option<(u64, LayoutJob)>>;
 /// 行级高亮缓存：key 是文本内容的 hash，value 是 LayoutJob
 type LineHighlightCache = RefCell<HashMap<u64, LayoutJob>>;
+
+#[derive(Clone, Copy)]
+struct DiffOverviewLine {
+    has_removed: bool,
+    has_added: bool,
+}
 
 pub struct DiffViewerUi {
     left_text: String,
@@ -356,41 +362,7 @@ impl DiffViewerUi {
             return;
         };
 
-        let hunk_count = result.diff_hunks.len();
-        let current_diff_index = self
-            .current_diff_index
-            .get()
-            .filter(|index| *index < hunk_count);
-        if current_diff_index != self.current_diff_index.get() {
-            self.current_diff_index.set(current_diff_index);
-        }
-
-        ui.horizontal(|ui| {
-            let can_go_previous =
-                hunk_count > 0 && current_diff_index.map(|index| index > 0).unwrap_or(false);
-            let can_go_next = hunk_count > 0
-                && current_diff_index
-                    .map(|index| index + 1 < hunk_count)
-                    .unwrap_or(true);
-
-            let previous_response = ui
-                .add_enabled(can_go_previous, egui::Button::new("↑"))
-                .on_hover_text("上一个差异");
-            if previous_response.clicked() {
-                self.navigate_to_diff(result, true);
-            }
-            let next_response = ui
-                .add_enabled(can_go_next, egui::Button::new("↓"))
-                .on_hover_text("下一个差异");
-            if next_response.clicked() {
-                self.navigate_to_diff(result, false);
-            }
-
-            let position_text = current_diff_index
-                .map(|index| format!("差异 {}/{}", index + 1, hunk_count))
-                .unwrap_or_else(|| format!("共 {} 个差异", hunk_count));
-            ui.label(RichText::new(position_text).color(Color32::from_rgb(100, 100, 100)));
-        });
+        self.render_diff_navigation(ui, &result.diff_hunks);
 
         // 底部统计栏
         let text_style = egui::TextStyle::Small;
@@ -414,6 +386,14 @@ impl DiffViewerUi {
 
         const OVERVIEW_WIDTH: f32 = 32.0;
         const OVERVIEW_HEADER_HEIGHT: f32 = 30.0;
+        let overview_lines: Vec<DiffOverviewLine> = result
+            .split_lines
+            .iter()
+            .map(|line| DiffOverviewLine {
+                has_removed: line.left_type == DiffType::Removed,
+                has_added: line.right_type == DiffType::Added,
+            })
+            .collect();
         let right_current_offset = Cell::new(self.last_right_offset.get());
         egui::SidePanel::right("diff_split_overview")
             .exact_width(OVERVIEW_WIDTH)
@@ -423,7 +403,8 @@ impl DiffViewerUi {
                 let available_size = ui.available_size();
                 if let Some(clicked_hunk) = Self::render_diff_overview(
                     ui,
-                    result,
+                    &result.diff_hunks,
+                    &overview_lines,
                     available_size.x,
                     available_size.y,
                     OVERVIEW_HEADER_HEIGHT,
@@ -552,7 +533,7 @@ impl DiffViewerUi {
                                             {
                                                 let is_current_diff_line =
                                                     Self::is_current_diff_line(
-                                                        result,
+                                                        &result.diff_hunks,
                                                         self.current_diff_index.get(),
                                                         line_index,
                                                     );
@@ -653,7 +634,7 @@ impl DiffViewerUi {
                                             {
                                                 let is_current_diff_line =
                                                     Self::is_current_diff_line(
-                                                        result,
+                                                        &result.diff_hunks,
                                                         self.current_diff_index.get(),
                                                         line_index,
                                                     );
@@ -793,7 +774,7 @@ impl DiffViewerUi {
                                             {
                                                 let is_current_diff_line =
                                                     Self::is_current_diff_line(
-                                                        result,
+                                                        &result.diff_hunks,
                                                         self.current_diff_index.get(),
                                                         line_index,
                                                     );
@@ -893,7 +874,7 @@ impl DiffViewerUi {
                                             {
                                                 let is_current_diff_line =
                                                     Self::is_current_diff_line(
-                                                        result,
+                                                        &result.diff_hunks,
                                                         self.current_diff_index.get(),
                                                         line_index,
                                                     );
@@ -1022,9 +1003,50 @@ impl DiffViewerUi {
         });
     }
 
+    /// 绘制差异导航按钮并返回当前差异块索引
+    fn render_diff_navigation(&self, ui: &mut egui::Ui, hunks: &[DiffHunk]) -> Option<usize> {
+        let hunk_count = hunks.len();
+        let current_diff_index = self
+            .current_diff_index
+            .get()
+            .filter(|index| *index < hunk_count);
+        if current_diff_index != self.current_diff_index.get() {
+            self.current_diff_index.set(current_diff_index);
+        }
+
+        ui.horizontal(|ui| {
+            let can_go_previous =
+                hunk_count > 0 && current_diff_index.map(|index| index > 0).unwrap_or(false);
+            let can_go_next = hunk_count > 0
+                && current_diff_index
+                    .map(|index| index + 1 < hunk_count)
+                    .unwrap_or(true);
+
+            let previous_response = ui
+                .add_enabled(can_go_previous, egui::Button::new("↑"))
+                .on_hover_text("上一个差异");
+            if previous_response.clicked() {
+                self.navigate_to_diff(hunks, true);
+            }
+            let next_response = ui
+                .add_enabled(can_go_next, egui::Button::new("↓"))
+                .on_hover_text("下一个差异");
+            if next_response.clicked() {
+                self.navigate_to_diff(hunks, false);
+            }
+
+            let position_text = current_diff_index
+                .map(|index| format!("差异 {}/{}", index + 1, hunk_count))
+                .unwrap_or_else(|| format!("共 {} 个差异", hunk_count));
+            ui.label(RichText::new(position_text).color(Color32::from_rgb(100, 100, 100)));
+        });
+
+        current_diff_index
+    }
+
     /// 跳转到上一个或下一个差异块
-    fn navigate_to_diff(&self, result: &DiffResult, previous: bool) {
-        let Some(last_index) = result.diff_hunks.len().checked_sub(1) else {
+    fn navigate_to_diff(&self, hunks: &[DiffHunk], previous: bool) {
+        let Some(last_index) = hunks.len().checked_sub(1) else {
             return;
         };
 
@@ -1040,7 +1062,7 @@ impl DiffViewerUi {
             self.current_diff_index.set(Some(index));
             self.clear_pending_scroll_sync();
             self.pending_navigation_row
-                .set(Some(result.diff_hunks[index].start_line));
+                .set(Some(hunks[index].start_line));
         }
     }
 
@@ -1048,7 +1070,8 @@ impl DiffViewerUi {
     #[allow(clippy::too_many_arguments)]
     fn render_diff_overview(
         ui: &mut egui::Ui,
-        result: &DiffResult,
+        hunks: &[DiffHunk],
+        lines: &[DiffOverviewLine],
         width: f32,
         height: f32,
         content_header_height: f32,
@@ -1075,9 +1098,9 @@ impl DiffViewerUi {
                 };
                 painter.rect_filled(rect, 2.0, track_color);
 
-                let total_lines = result.split_lines.len().max(1);
+                let total_lines = lines.len().max(1);
                 let total_lines_f32 = Self::usize_to_f32(total_lines);
-                for (hunk_index, hunk) in result.diff_hunks.iter().enumerate() {
+                for (hunk_index, hunk) in hunks.iter().enumerate() {
                     let start_line = hunk.start_line.min(total_lines - 1);
                     let end_line = hunk.end_line.min(total_lines - 1);
                     let start_y = content_rect.min.y
@@ -1090,12 +1113,12 @@ impl DiffViewerUi {
                         egui::pos2(content_rect.max.x - 2.0, end_y.max(start_y + 2.0)),
                     );
 
-                    let has_removed = result.split_lines[start_line..=end_line]
+                    let has_removed = lines[start_line..=end_line]
                         .iter()
-                        .any(|line| line.left_type == DiffType::Removed);
-                    let has_added = result.split_lines[start_line..=end_line]
+                        .any(|line| line.has_removed);
+                    let has_added = lines[start_line..=end_line]
                         .iter()
-                        .any(|line| line.right_type == DiffType::Added);
+                        .any(|line| line.has_added);
                     let marker_color = match (has_removed, has_added) {
                         (true, true) => Color32::from_rgb(220, 155, 45),
                         (true, false) => Color32::from_rgb(205, 75, 80),
@@ -1143,8 +1166,7 @@ impl DiffViewerUi {
                         let ratio = ((pointer_pos.y - content_rect.min.y) / content_rect.height())
                             .clamp(0.0, 1.0);
                         let clicked_line = Self::f32_to_usize(ratio * total_lines_f32);
-                        clicked_hunk =
-                            Self::find_nearest_diff_hunk(&result.diff_hunks, clicked_line);
+                        clicked_hunk = Self::find_nearest_diff_hunk(hunks, clicked_line);
                     }
                 }
             },
@@ -1177,12 +1199,12 @@ impl DiffViewerUi {
 
     /// 判断行索引是否属于当前选中的差异块
     fn is_current_diff_line(
-        result: &DiffResult,
+        hunks: &[DiffHunk],
         current_diff_index: Option<usize>,
         line_index: usize,
     ) -> bool {
         current_diff_index
-            .and_then(|index| result.diff_hunks.get(index))
+            .and_then(|index| hunks.get(index))
             .map(|hunk| line_index >= hunk.start_line && line_index <= hunk.end_line)
             .unwrap_or(false)
     }
@@ -1451,6 +1473,7 @@ impl DiffViewerUi {
             return;
         };
 
+        let current_diff_index = self.render_diff_navigation(ui, &result.unified_diff_hunks);
         let text_style = egui::TextStyle::Small;
         let stats_height = ui.text_style_height(&text_style) + 16.0;
         let text_color = ui.visuals().text_color();
@@ -1472,6 +1495,42 @@ impl DiffViewerUi {
                         .color(dim_color),
                     );
                 });
+            });
+
+        const OVERVIEW_WIDTH: f32 = 32.0;
+        const UNIFIED_CONTENT_HEADER_HEIGHT: f32 = 10.0;
+        let overview_lines: Vec<DiffOverviewLine> = result
+            .unified_lines
+            .iter()
+            .map(|line| DiffOverviewLine {
+                has_removed: line.diff_type == DiffType::Removed,
+                has_added: line.diff_type == DiffType::Added,
+            })
+            .collect();
+        let unified_current_offset = Cell::new(self.last_unified_offset.get());
+        egui::SidePanel::right("diff_unified_overview")
+            .exact_width(OVERVIEW_WIDTH)
+            .resizable(false)
+            .frame(egui::Frame::NONE)
+            .show_inside(ui, |ui| {
+                let available_size = ui.available_size();
+                if let Some(clicked_hunk) = Self::render_diff_overview(
+                    ui,
+                    &result.unified_diff_hunks,
+                    &overview_lines,
+                    available_size.x,
+                    available_size.y,
+                    UNIFIED_CONTENT_HEADER_HEIGHT,
+                    18.0,
+                    unified_current_offset.get(),
+                    ui.visuals().dark_mode,
+                    self.current_diff_index.get(),
+                ) {
+                    self.current_diff_index.set(Some(clicked_hunk));
+                    self.clear_pending_scroll_sync();
+                    self.pending_navigation_row
+                        .set(Some(result.unified_diff_hunks[clicked_hunk].start_line));
+                }
             });
 
         ui.vertical(|ui| {
@@ -1505,10 +1564,20 @@ impl DiffViewerUi {
             let available_width = ui.available_width();
             let content_width = (available_width - gutter_w).max(100.0);
 
-            // 先渲染内容区域获取纵向偏移量，再用它同步行号
+            let navigation_offset = self.pending_navigation_row.get().map(|row| {
+                self.pending_navigation_row.set(None);
+                let content_total_height =
+                    Self::usize_to_f32(result.unified_lines.len()) * row_height;
+                let max_scroll = (content_total_height - available_height).max(0.0);
+                (Self::usize_to_f32(row) * row_height - available_height * 0.35)
+                    .clamp(0.0, max_scroll)
+            });
             // 使用一个 Cell 来存储内容区域的纵向偏移量
-            let content_offset_y: Cell<f32> = Cell::new(self.last_unified_offset.get());
+            let content_offset_y: Cell<f32> =
+                Cell::new(navigation_offset.unwrap_or(self.last_unified_offset.get()));
 
+            let original_item_spacing = ui.spacing().item_spacing;
+            ui.spacing_mut().item_spacing.x = 0.0;
             ui.horizontal(|ui| {
                 // 行号区域（固定宽度，隐藏滚动条）
                 ui.allocate_ui_with_layout(
@@ -1526,25 +1595,41 @@ impl DiffViewerUi {
                             gutter_scroll.vertical_scroll_offset(content_offset_y.get());
                         gutter_scroll.show(ui, |ui| {
                             ui.spacing_mut().item_spacing.y = 0.0;
-                            for line in &result.unified_lines {
-                                let (gutter_bg, symbol) = match line.diff_type {
-                                    DiffType::Removed => {
-                                        let gutter_bg = if is_dark_mode {
-                                            Color32::from_rgba_unmultiplied(80, 40, 45, 200)
-                                        } else {
-                                            Color32::from_rgba_unmultiplied(255, 180, 185, 240)
-                                        };
-                                        (gutter_bg, "-")
+                            for (line_index, line) in result.unified_lines.iter().enumerate() {
+                                let is_current_diff_line = Self::is_current_diff_line(
+                                    &result.unified_diff_hunks,
+                                    current_diff_index,
+                                    line_index,
+                                );
+                                let (gutter_bg, symbol) = if is_current_diff_line {
+                                    (
+                                        Color32::TRANSPARENT,
+                                        match line.diff_type {
+                                            DiffType::Removed => "-",
+                                            DiffType::Added => "+",
+                                            DiffType::Equal => " ",
+                                        },
+                                    )
+                                } else {
+                                    match line.diff_type {
+                                        DiffType::Removed => {
+                                            let gutter_bg = if is_dark_mode {
+                                                Color32::from_rgba_unmultiplied(80, 40, 45, 200)
+                                            } else {
+                                                Color32::from_rgba_unmultiplied(255, 180, 185, 240)
+                                            };
+                                            (gutter_bg, "-")
+                                        }
+                                        DiffType::Added => {
+                                            let gutter_bg = if is_dark_mode {
+                                                Color32::from_rgba_unmultiplied(40, 80, 50, 200)
+                                            } else {
+                                                Color32::from_rgba_unmultiplied(150, 230, 170, 240)
+                                            };
+                                            (gutter_bg, "+")
+                                        }
+                                        DiffType::Equal => (Color32::TRANSPARENT, " "),
                                     }
-                                    DiffType::Added => {
-                                        let gutter_bg = if is_dark_mode {
-                                            Color32::from_rgba_unmultiplied(40, 80, 50, 200)
-                                        } else {
-                                            Color32::from_rgba_unmultiplied(150, 230, 170, 240)
-                                        };
-                                        (gutter_bg, "+")
-                                    }
-                                    DiffType::Equal => (Color32::TRANSPARENT, " "),
                                 };
                                 ui.allocate_ui_with_layout(
                                     egui::vec2(gutter_w, row_height),
@@ -1553,6 +1638,14 @@ impl DiffViewerUi {
                                         if gutter_bg != Color32::TRANSPARENT {
                                             let rect = ui.max_rect();
                                             ui.painter().rect_filled(rect, 0.0, gutter_bg);
+                                        }
+                                        if is_current_diff_line {
+                                            let rect = ui.max_rect();
+                                            ui.painter().rect_filled(
+                                                rect,
+                                                0.0,
+                                                Self::current_diff_color(is_dark_mode),
+                                            );
                                         }
                                         let left_num = match line.line_number_left {
                                             Some(n) => format!("{:>w$}", n, w = num_digits),
@@ -1585,14 +1678,26 @@ impl DiffViewerUi {
                     egui::vec2(content_width, available_height),
                     egui::Layout::top_down(egui::Align::LEFT),
                     |ui| {
-                        let output = egui::ScrollArea::both()
+                        let mut content_scroll = egui::ScrollArea::both()
                             .auto_shrink([false, false])
-                            .id_salt("unified_content")
-                            .show(ui, |ui| {
-                                ui.spacing_mut().item_spacing.y = 0.0;
+                            .id_salt("unified_content");
+                        content_scroll =
+                            content_scroll.vertical_scroll_offset(content_offset_y.get());
+                        let output = content_scroll.show(ui, |ui| {
+                            let clip_rect = ui.clip_rect().shrink(ui.visuals().clip_rect_margin);
+                            ui.set_clip_rect(clip_rect);
+                            ui.spacing_mut().item_spacing.y = 0.0;
 
-                                for line in &result.unified_lines {
-                                    let line_bg = match line.diff_type {
+                            for (line_index, line) in result.unified_lines.iter().enumerate() {
+                                let is_current_diff_line = Self::is_current_diff_line(
+                                    &result.unified_diff_hunks,
+                                    current_diff_index,
+                                    line_index,
+                                );
+                                let line_bg = if is_current_diff_line {
+                                    Color32::TRANSPARENT
+                                } else {
+                                    match line.diff_type {
                                         DiffType::Removed => {
                                             if is_dark_mode {
                                                 Color32::from_rgba_unmultiplied(61, 31, 35, 180)
@@ -1608,28 +1713,61 @@ impl DiffViewerUi {
                                             }
                                         }
                                         DiffType::Equal => Color32::TRANSPARENT,
-                                    };
+                                    }
+                                };
 
-                                    let is_whole_line_change = line.segments.is_empty()
-                                        || (line.diff_type != DiffType::Equal
-                                            && line
-                                                .segments
-                                                .iter()
-                                                .all(|s| s.diff_type != DiffType::Equal));
+                                let is_whole_line_change = line.segments.is_empty()
+                                    || (line.diff_type != DiffType::Equal
+                                        && line
+                                            .segments
+                                            .iter()
+                                            .all(|s| s.diff_type != DiffType::Equal));
 
-                                    ui.allocate_ui_with_layout(
-                                        egui::vec2(content_width, row_height),
-                                        egui::Layout::left_to_right(egui::Align::Center),
-                                        |ui| {
-                                            if line_bg != Color32::TRANSPARENT {
-                                                let mut bg_rect = ui.max_rect();
-                                                bg_rect.set_width(bg_rect.width().max(2000.0));
-                                                ui.painter().rect_filled(bg_rect, 0.0, line_bg);
-                                            }
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(content_width, row_height),
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| {
+                                        if line_bg != Color32::TRANSPARENT {
+                                            let mut bg_rect = ui.max_rect();
+                                            bg_rect.set_width(bg_rect.width().max(2000.0));
+                                            ui.painter().rect_filled(bg_rect, 0.0, line_bg);
+                                        }
+                                        if is_current_diff_line {
+                                            let mut current_rect = ui.max_rect();
+                                            current_rect
+                                                .set_width(current_rect.width().max(2000.0));
+                                            ui.painter().rect_filled(
+                                                current_rect,
+                                                0.0,
+                                                Self::current_diff_color(is_dark_mode),
+                                            );
+                                        }
 
-                                            if line.diff_type == DiffType::Equal
-                                                && syntax_name.is_some()
-                                            {
+                                        if line.diff_type == DiffType::Equal
+                                            && syntax_name.is_some()
+                                        {
+                                            let mut job = self.get_line_highlight_job(
+                                                &line.content,
+                                                syntax_name.as_deref(),
+                                                font_size,
+                                                is_dark_mode,
+                                            );
+                                            job.wrap.max_width = f32::INFINITY;
+                                            ui.label(job);
+                                        } else if !is_whole_line_change && !line.segments.is_empty()
+                                        {
+                                            // 修改行：使用缓存的 LayoutJob
+                                            let job = self.get_diff_line_job(
+                                                &line.content,
+                                                &line.segments,
+                                                syntax_name.as_deref(),
+                                                font_size,
+                                                is_dark_mode,
+                                                text_color,
+                                            );
+                                            ui.label(job);
+                                        } else {
+                                            if syntax_name.is_some() {
                                                 let mut job = self.get_line_highlight_job(
                                                     &line.content,
                                                     syntax_name.as_deref(),
@@ -1638,64 +1776,38 @@ impl DiffViewerUi {
                                                 );
                                                 job.wrap.max_width = f32::INFINITY;
                                                 ui.label(job);
-                                            } else if !is_whole_line_change
-                                                && !line.segments.is_empty()
-                                            {
-                                                // 修改行：使用缓存的 LayoutJob
-                                                let job = self.get_diff_line_job(
+                                            } else {
+                                                let color = match line.diff_type {
+                                                    DiffType::Added => Color32::from_rgb(0, 150, 0),
+                                                    DiffType::Removed => {
+                                                        Color32::from_rgb(180, 0, 0)
+                                                    }
+                                                    _ => text_color,
+                                                };
+                                                let mut job = LayoutJob::default();
+                                                job.wrap.max_width = f32::INFINITY;
+                                                job.append(
                                                     &line.content,
-                                                    &line.segments,
-                                                    syntax_name.as_deref(),
-                                                    font_size,
-                                                    is_dark_mode,
-                                                    text_color,
+                                                    0.0,
+                                                    egui::TextFormat {
+                                                        font_id: egui::FontId::monospace(font_size),
+                                                        color,
+                                                        ..Default::default()
+                                                    },
                                                 );
                                                 ui.label(job);
-                                            } else {
-                                                if syntax_name.is_some() {
-                                                    let mut job = self.get_line_highlight_job(
-                                                        &line.content,
-                                                        syntax_name.as_deref(),
-                                                        font_size,
-                                                        is_dark_mode,
-                                                    );
-                                                    job.wrap.max_width = f32::INFINITY;
-                                                    ui.label(job);
-                                                } else {
-                                                    let color = match line.diff_type {
-                                                        DiffType::Added => {
-                                                            Color32::from_rgb(0, 150, 0)
-                                                        }
-                                                        DiffType::Removed => {
-                                                            Color32::from_rgb(180, 0, 0)
-                                                        }
-                                                        _ => text_color,
-                                                    };
-                                                    let mut job = LayoutJob::default();
-                                                    job.wrap.max_width = f32::INFINITY;
-                                                    job.append(
-                                                        &line.content,
-                                                        0.0,
-                                                        egui::TextFormat {
-                                                            font_id: egui::FontId::monospace(
-                                                                font_size,
-                                                            ),
-                                                            color,
-                                                            ..Default::default()
-                                                        },
-                                                    );
-                                                    ui.label(job);
-                                                }
                                             }
-                                        },
-                                    );
-                                }
-                            });
+                                        }
+                                    },
+                                );
+                            }
+                        });
                         // 更新 Unified 视图的纵向偏移量，用于下一帧同步行号
                         self.last_unified_offset.set(output.state.offset.y);
                     },
                 );
             });
+            ui.spacing_mut().item_spacing = original_item_spacing;
         });
     }
 
@@ -2058,21 +2170,21 @@ mod tests {
 
         viewer.pending_sync_left.set(Some(20.0));
         viewer.pending_sync_right.set(Some(20.0));
-        viewer.navigate_to_diff(&result, false);
+        viewer.navigate_to_diff(&result.diff_hunks, false);
         assert_eq!(viewer.current_diff_index.get(), Some(0));
         assert_eq!(viewer.pending_navigation_row.get(), Some(1));
         assert_eq!(viewer.pending_sync_left.get(), None);
         assert_eq!(viewer.pending_sync_right.get(), None);
 
-        viewer.navigate_to_diff(&result, false);
+        viewer.navigate_to_diff(&result.diff_hunks, false);
         assert_eq!(viewer.current_diff_index.get(), Some(1));
-        viewer.navigate_to_diff(&result, false);
+        viewer.navigate_to_diff(&result.diff_hunks, false);
         assert_eq!(viewer.current_diff_index.get(), Some(1));
 
-        viewer.navigate_to_diff(&result, true);
+        viewer.navigate_to_diff(&result.diff_hunks, true);
         assert_eq!(viewer.current_diff_index.get(), Some(0));
         viewer.current_diff_index.set(None);
-        viewer.navigate_to_diff(&result, true);
+        viewer.navigate_to_diff(&result.diff_hunks, true);
         assert_eq!(viewer.current_diff_index.get(), None);
     }
 
@@ -2083,9 +2195,40 @@ mod tests {
             "same\nnew1\nseparator\nnew2\nend",
         );
 
-        assert!(DiffViewerUi::is_current_diff_line(&result, Some(0), 1));
-        assert!(!DiffViewerUi::is_current_diff_line(&result, Some(0), 3));
-        assert!(DiffViewerUi::is_current_diff_line(&result, Some(1), 3));
-        assert!(!DiffViewerUi::is_current_diff_line(&result, None, 1));
+        assert!(DiffViewerUi::is_current_diff_line(
+            &result.diff_hunks,
+            Some(0),
+            1
+        ));
+        assert!(!DiffViewerUi::is_current_diff_line(
+            &result.diff_hunks,
+            Some(0),
+            3
+        ));
+        assert!(DiffViewerUi::is_current_diff_line(
+            &result.diff_hunks,
+            Some(1),
+            3
+        ));
+        assert!(!DiffViewerUi::is_current_diff_line(
+            &result.diff_hunks,
+            None,
+            1
+        ));
+        assert!(DiffViewerUi::is_current_diff_line(
+            &result.unified_diff_hunks,
+            Some(0),
+            1
+        ));
+        assert!(!DiffViewerUi::is_current_diff_line(
+            &result.unified_diff_hunks,
+            Some(0),
+            4
+        ));
+        assert!(DiffViewerUi::is_current_diff_line(
+            &result.unified_diff_hunks,
+            Some(1),
+            4
+        ));
     }
 }

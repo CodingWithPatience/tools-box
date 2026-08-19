@@ -8,6 +8,7 @@ pub fn compute_diff(left: &str, right: &str) -> DiffResult {
 
     let unified_lines = build_unified_lines(&diff);
     let split_lines = build_split_lines(&diff);
+    let unified_diff_hunks = build_unified_diff_hunks(&unified_lines);
     let diff_hunks = build_diff_hunks(&split_lines);
 
     let mut added_count = 0;
@@ -26,12 +27,41 @@ pub fn compute_diff(left: &str, right: &str) -> DiffResult {
 
     DiffResult {
         unified_lines,
+        unified_diff_hunks,
         split_lines,
         diff_hunks,
         added_count,
         removed_count,
         similarity,
     }
+}
+
+/// 将 Unified 视图中的连续差异行合并为差异块
+fn build_unified_diff_hunks(lines: &[DiffLine]) -> Vec<DiffHunk> {
+    let mut hunks = Vec::new();
+    let mut start_line = None;
+
+    for (line_index, line) in lines.iter().enumerate() {
+        if line.diff_type != DiffType::Equal {
+            if start_line.is_none() {
+                start_line = Some(line_index);
+            }
+        } else if let Some(start) = start_line.take() {
+            hunks.push(DiffHunk {
+                start_line: start,
+                end_line: line_index - 1,
+            });
+        }
+    }
+
+    if let Some(start) = start_line {
+        hunks.push(DiffHunk {
+            start_line: start,
+            end_line: lines.len() - 1,
+        });
+    }
+
+    hunks
 }
 
 /// 将 Split 视图中的连续差异行合并为差异块
@@ -455,6 +485,19 @@ mod tests {
                 },
             ]
         );
+        assert_eq!(
+            result.unified_diff_hunks,
+            vec![
+                DiffHunk {
+                    start_line: 1,
+                    end_line: 4,
+                },
+                DiffHunk {
+                    start_line: 6,
+                    end_line: 7,
+                },
+            ]
+        );
     }
 
     #[test]
@@ -462,6 +505,7 @@ mod tests {
         let result = compute_diff("same\ntext", "same\ntext");
 
         assert!(result.diff_hunks.is_empty());
+        assert!(result.unified_diff_hunks.is_empty());
     }
 
     #[test]

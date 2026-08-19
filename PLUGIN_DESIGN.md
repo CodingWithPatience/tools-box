@@ -29,6 +29,8 @@
 | 编辑区行号 | 编辑区左侧固定行号面板，通过 ScrollArea 偏移同步垂直位置，不随水平滚动 | P1 |
 | Split 差异概览条 | 通过右侧 SidePanel 显示差异块位置和当前滚动视口 | P1 |
 | Split 差异导航 | 通过上下箭头按钮及概览条点击跳转差异块，并高亮当前差异块 | P1 |
+| Unified 差异概览条 | 通过右侧 SidePanel 显示 Unified 差异块位置和当前滚动视口 | P1 |
+| Unified 差异导航 | 通过上下箭头按钮及概览条点击跳转差异块，并高亮当前差异块 | P1 |
 
 ### 1.2 界面设计
 
@@ -162,7 +164,7 @@ pub struct SplitLine {
     pub right_type: DiffType,             // 右侧差异类型
 }
 
-/// Split 视图中的连续差异块
+/// 视图中的连续差异块
 #[derive(Debug, Clone, PartialEq)]
 pub struct DiffHunk {
     pub start_line: usize,                // 起始行索引（从 0 开始）
@@ -173,6 +175,7 @@ pub struct DiffHunk {
 #[derive(Debug, Clone)]
 pub struct DiffResult {
     pub unified_lines: Vec<DiffLine>,      // Unified 视图数据
+    pub unified_diff_hunks: Vec<DiffHunk>, // Unified 视图连续差异块
     pub split_lines: Vec<SplitLine>,       // Split 视图数据
     pub diff_hunks: Vec<DiffHunk>,         // Split 视图连续差异块
     pub added_count: usize,                // 新增行数
@@ -285,6 +288,7 @@ src/plugins/diff_viewer/
 | 1.4.22 | Split 差异导航 | 仅显示上下箭头，支持点击概览条跳转并同步左右面板，同时高亮当前差异块 | ✅ |
 | 1.4.23 | 当前差异高亮优化 | 暗色主题降低蓝色高亮不透明度，浅色主题统一左右面板的当前差异背景 | ✅ |
 | 1.4.24 | Split 布局细节优化 | 概览条使用完整轨道映射滚动位置，收紧内容裁剪区域避免覆盖滚动条 | ✅ |
+| 1.4.25 | Unified 差异导航与概览 | Unified 视图支持上下箭头、当前差异高亮、概览条点击跳转和滚动视口显示 | ✅ |
 
 ### 1.5 依赖库
 
@@ -674,12 +678,13 @@ CREATE INDEX idx_api_history_executed_at ON api_history(executed_at);
 | 6.10 | 实现辅助功能 | 交换、清空、复制差异 | ✅ |
 | 6.11 | 增加 Split 差异概览 | 通过右侧 SidePanel 显示连续差异块及滚动视口 | ✅ |
 | 6.12 | 增加差异导航 | 上下箭头和概览条点击跳转上一个/下一个差异块，并明确高亮当前差异块 | ✅ |
+| 6.13 | 完善 Unified 差异辅助功能 | Unified 视图增加上下箭头、当前差异高亮、概览条和点击跳转 | ✅ |
 
 **阶段六产出文件：**
 - `src/plugins/diff_viewer/mod.rs` — 插件入口
 - `src/plugins/diff_viewer/ui.rs` — UI 渲染（包含 Split 和 Unified 两种视图）
 - `src/plugins/diff_viewer/differ.rs` — 差异计算核心（生成 split_lines 和 unified_lines）
-- `src/plugins/diff_viewer/models.rs` — 数据结构（包含 SplitLine、DiffLine、DiffHunk 等）
+- `src/plugins/diff_viewer/models.rs` — 数据结构（包含 SplitLine、DiffLine、DiffHunk、Unified 差异块等）
 - `Cargo.toml` — 新增 `similar` 依赖
 - `src/plugins/mod.rs` — 注册新插件
 
@@ -746,6 +751,9 @@ CREATE INDEX idx_api_history_executed_at ON api_history(executed_at);
 - [x] Split 视图上一个/下一个差异导航
 - [x] 点击概览条跳转差异块并保持左右面板同步
 - [x] 当前差异块在左右面板中高亮，并在概览条中明确标识
+- [x] Unified 视图上一个/下一个差异导航
+- [x] Unified 视图当前差异高亮和差异概览条
+- [x] Unified 视图点击概览条跳转并同步滚动位置
 
 ### 5.2 API 工具测试
 
