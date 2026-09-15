@@ -1,4 +1,6 @@
+use anyhow::{Context, Result};
 use rusqlite::Connection;
+use std::collections::HashSet;
 
 use super::parser;
 use super::store::*;
@@ -16,6 +18,17 @@ enum UiState {
     EditEntry(i64, i64), // (env_id, entry_id)
 }
 
+/// 待用户确认的 hosts 应用（存在主机名冲突时）
+#[derive(Debug, Clone)]
+struct PendingApply {
+    /// 待写入的环境分组
+    groups: Vec<parser::HostsGroup>,
+    /// 参与本次应用的环境名称
+    env_names: Vec<String>,
+    /// 检测到的主机名冲突
+    conflicts: Vec<parser::HostnameConflict>,
+}
+
 /// Hosts 管理器 UI
 pub struct HostsManagerUi {
     state: UiState,
@@ -26,6 +39,8 @@ pub struct HostsManagerUi {
     entry_form: HostsEntryForm,
     error_msg: Option<String>,
     success_msg: Option<String>,
+    /// 警告提示（如主机名冲突）
+    warning_msg: Option<String>,
     /// 新增环境弹窗是否打开
     add_env_dialog_open: bool,
     /// 新增条目弹窗是否打开
@@ -34,6 +49,8 @@ pub struct HostsManagerUi {
     pending_delete_env_id: Option<i64>,
     /// 待删除的条目 ID（用于确认弹窗）
     pending_delete_entry_id: Option<i64>,
+    /// 待确认的应用（存在主机名冲突时）
+    pending_apply: Option<PendingApply>,
 }
 
 impl HostsManagerUi {
@@ -47,15 +64,22 @@ impl HostsManagerUi {
             entry_form: HostsEntryForm::new(),
             error_msg: None,
             success_msg: None,
+            warning_msg: None,
             add_env_dialog_open: false,
             add_entry_dialog_open: false,
             pending_delete_env_id: None,
             pending_delete_entry_id: None,
+            pending_apply: None,
         }
     }
 
     /// 渲染主界面
     pub fn render(&mut self, ui: &mut egui::Ui, conn: &Connection) {
+        // 离开环境列表时丢弃待确认内容，避免之后写入过期快照
+        if self.state != UiState::EnvironmentList {
+            self.pending_apply = None;
+        }
+
         match self.state.clone() {
             UiState::EnvironmentList => self.render_environment_list(ui, conn),
             UiState::EditEnvironment(id) => self.render_edit_environment(ui, conn, id),
@@ -68,13 +92,19 @@ impl HostsManagerUi {
 
     /// 渲染消息提示
     fn render_messages(&mut self, ui: &mut egui::Ui) {
-        if let Some(err) = &self.error_msg.clone() {
+        if let Some(err) = &self.error_msg {
             ui.colored_label(egui::Color32::from_rgb(220, 50, 50), format!("⚠ {}", err));
         }
-        if let Some(success) = &self.success_msg.clone() {
+        if let Some(success) = &self.success_msg {
             ui.colored_label(
                 egui::Color32::from_rgb(50, 180, 50),
                 format!("✓ {}", success),
+            );
+        }
+        if let Some(warning) = &self.warning_msg {
+            ui.colored_label(
+                egui::Color32::from_rgb(230, 150, 40),
+                format!("⚠ {}", warning),
             );
         }
     }
@@ -83,18 +113,26 @@ impl HostsManagerUi {
     fn clear_messages(&mut self) {
         self.error_msg = None;
         self.success_msg = None;
+        self.warning_msg = None;
     }
 
     /// 设置错误消息
     fn set_error(&mut self, msg: String) {
         self.error_msg = Some(msg);
         self.success_msg = None;
+        self.warning_msg = None;
     }
 
     /// 设置成功消息
     fn set_success(&mut self, msg: String) {
         self.success_msg = Some(msg);
         self.error_msg = None;
+        self.warning_msg = None;
+    }
+
+    /// 设置警告消息（不影响已有的成功/错误提示）
+    fn set_warning(&mut self, msg: String) {
+        self.warning_msg = Some(msg);
     }
 
     /// 加载环境列表
@@ -145,7 +183,11 @@ impl HostsManagerUi {
                 self.clear_messages();
             }
 
-            if ui.button("💾 应用到系统").clicked() {
+            let active_count = self.environments.iter().filter(|env| env.is_active).count();
+            if ui
+                .button(format!("💾 应用到系统（{} 个环境）", active_count))
+                .clicked()
+            {
                 self.apply_hosts(conn);
             }
         });
@@ -227,35 +269,50 @@ impl HostsManagerUi {
         // 底部提示
         ui.separator();
         ui.horizontal(|ui| {
+            let active_count = self.environments.iter().filter(|env| env.is_active).count();
+            ui.label(format!(
+                "已启用 {} 个环境（可同时启用多个环境）",
+                active_count
+            ));
             ui.label("⚠ 应用环境需要管理员权限运行程序");
         });
 
         // 弹窗渲染
         self.render_add_environment_dialog(ui, conn);
         self.render_delete_env_confirm_dialog(ui, conn);
+        self.render_apply_confirm_dialog(ui, conn);
     }
 
-    /// 切换环境激活状态
+    /// 切换环境激活状态（多个环境可同时生效）
     fn toggle_environment(&mut self, conn: &Connection, env_id: i64) {
         let store = HostsStore::new(conn);
 
         // 检查当前是否已激活
-        let is_active = self
-            .environments
-            .iter()
-            .find(|e| e.id == env_id)
-            .map(|e| e.is_active)
-            .unwrap_or(false);
+        let Some(env) = self.environments.iter().find(|e| e.id == env_id) else {
+            self.set_error("环境不存在，请刷新列表后重试".to_string());
+            self.load_environments(conn);
+            return;
+        };
+        let env_name = env.name.clone();
+        let is_active = env.is_active;
 
-        let new_active_id = if is_active { None } else { Some(env_id) };
-
-        match store.set_active_environment(new_active_id) {
+        match store.set_environment_active(env_id, !is_active) {
             Ok(()) => {
+                log::info!(
+                    "环境 '{}'（id={}）已{}",
+                    env_name,
+                    env_id,
+                    if is_active { "禁用" } else { "启用" }
+                );
                 self.load_environments(conn);
                 if is_active {
-                    self.set_success("已禁用环境".to_string());
+                    self.set_success(format!("已禁用环境 '{}'", env_name));
                 } else {
-                    self.set_success("已启用环境".to_string());
+                    let active_count = self.environments.iter().filter(|env| env.is_active).count();
+                    self.set_success(format!(
+                        "已启用环境 '{}'（当前共 {} 个环境生效）",
+                        env_name, active_count
+                    ));
                 }
             }
             Err(e) => {
@@ -417,8 +474,8 @@ impl HostsManagerUi {
     fn save_new_environment(&mut self, conn: &Connection) {
         self.clear_messages();
 
-        if !self.env_form.is_valid() {
-            self.set_error("请输入环境名称".to_string());
+        if let Some(err) = self.env_form.validation_error() {
+            self.set_error(err);
             return;
         }
 
@@ -470,8 +527,8 @@ impl HostsManagerUi {
     fn save_edited_environment(&mut self, conn: &Connection, env_id: i64) {
         self.clear_messages();
 
-        if !self.env_form.is_valid() {
-            self.set_error("请输入环境名称".to_string());
+        if let Some(err) = self.env_form.validation_error() {
+            self.set_error(err);
             return;
         }
 
@@ -687,13 +744,15 @@ impl HostsManagerUi {
     fn save_new_entry(&mut self, conn: &Connection, env_id: i64) {
         self.clear_messages();
 
-        if !self.entry_form.is_valid() {
-            self.set_error("请输入 IP 地址和主机名".to_string());
-            return;
-        }
+        let entry = match self.entry_form.to_new_entry() {
+            Ok(entry) => entry,
+            Err(e) => {
+                self.set_error(e.to_string());
+                return;
+            }
+        };
 
         let store = HostsStore::new(conn);
-        let entry = self.entry_form.to_new_entry();
 
         match store.add_entry(env_id, &entry) {
             Ok(_) => {
@@ -745,24 +804,17 @@ impl HostsManagerUi {
     fn save_edited_entry(&mut self, conn: &Connection, env_id: i64, entry_id: i64) {
         self.clear_messages();
 
-        if !self.entry_form.is_valid() {
-            self.set_error("请输入 IP 地址和主机名".to_string());
-            return;
-        }
-
-        let store = HostsStore::new(conn);
-        let comment = if self.entry_form.comment.is_empty() {
-            None
-        } else {
-            Some(self.entry_form.comment.clone())
+        let entry = match self.entry_form.to_new_entry() {
+            Ok(entry) => entry,
+            Err(e) => {
+                self.set_error(e.to_string());
+                return;
+            }
         };
 
-        match store.update_entry(
-            entry_id,
-            &self.entry_form.ip_address,
-            &self.entry_form.hostname,
-            &comment,
-        ) {
+        let store = HostsStore::new(conn);
+
+        match store.update_entry(entry_id, &entry.ip_address, &entry.hostname, &entry.comment) {
             Ok(()) => {
                 self.set_success("条目已更新".to_string());
                 self.state = UiState::EntryList(env_id);
@@ -798,93 +850,302 @@ impl HostsManagerUi {
     fn import_from_system(&mut self, conn: &Connection, env_id: i64) {
         self.clear_messages();
 
-        match parser::read_system_hosts() {
-            Ok(content) => {
-                let hosts_lines = parser::parse_hosts(&content);
-                let store = HostsStore::new(conn);
-
-                let mut imported = 0;
-                for line in &hosts_lines {
-                    let entry = NewHostsEntry {
-                        ip_address: line.ip.clone(),
-                        hostname: line.hostname.clone(),
-                        comment: line.comment.clone(),
-                    };
-
-                    if store.add_entry(env_id, &entry).is_ok() {
-                        imported += 1;
-                    }
-                }
-
-                self.load_entries(conn, env_id);
-                self.set_success(format!("已导入 {} 条记录", imported));
-            }
+        let content = match parser::read_system_hosts() {
+            Ok(content) => content,
             Err(e) => {
                 self.set_error(format!("读取系统 hosts 失败: {}", e));
+                return;
             }
+        };
+
+        // 跳过 Tools Box 管理的区域，避免把本工具写入的条目重复导入
+        let content = match parser::remove_tools_box_section(&content) {
+            Ok(cleaned) => cleaned,
+            Err(e) => {
+                self.set_error(format!("解析系统 hosts 失败: {}", e));
+                return;
+            }
+        };
+
+        let store = HostsStore::new(conn);
+        let existing = match store.get_entries_by_env(env_id) {
+            Ok(entries) => entries,
+            Err(e) => {
+                self.set_error(format!("读取环境条目失败: {}", e));
+                return;
+            }
+        };
+
+        // 已存在的 (IP, 主机名) 不再重复导入，主机名比较不区分大小写
+        let mut known: HashSet<(String, String)> = existing
+            .iter()
+            .map(|entry| {
+                (
+                    entry.ip_address.trim().to_string(),
+                    entry.hostname.trim().to_ascii_lowercase(),
+                )
+            })
+            .collect();
+
+        let hosts_lines = parser::parse_hosts(&content);
+        let mut imported = 0;
+        let mut skipped = 0;
+        let mut failed = 0;
+
+        // 只导入启用状态的条目（被注释掉的条目不导入）
+        for line in hosts_lines.iter().filter(|line| line.is_active) {
+            let key = (
+                line.ip.trim().to_string(),
+                line.hostname.to_ascii_lowercase(),
+            );
+            if !known.insert(key) {
+                skipped += 1;
+                continue;
+            }
+
+            let entry = NewHostsEntry {
+                ip_address: line.ip.clone(),
+                hostname: line.hostname.clone(),
+                comment: line.comment.clone(),
+            };
+
+            match store.add_entry(env_id, &entry) {
+                Ok(_) => imported += 1,
+                Err(e) => {
+                    log::warn!("导入条目 {} 失败: {}", line.hostname, e);
+                    failed += 1;
+                }
+            }
+        }
+
+        self.load_entries(conn, env_id);
+        if self.error_msg.is_some() {
+            return;
+        }
+        self.set_success(format!("已导入 {} 条记录", imported));
+
+        let mut warnings = Vec::new();
+        if skipped > 0 {
+            warnings.push(format!("{} 条已存在，未重复导入", skipped));
+        }
+        if failed > 0 {
+            warnings.push(format!("{} 条导入失败", failed));
+        }
+        if !warnings.is_empty() {
+            self.set_warning(warnings.join("；"));
         }
     }
 
     /// 应用 hosts 到系统
+    ///
+    /// 所有已启用的环境会被合并写入同一个管理区域；
+    /// 检测到主机名冲突时先弹窗让用户确认
     fn apply_hosts(&mut self, conn: &Connection) {
         self.clear_messages();
+        self.pending_apply = None;
 
-        // 获取当前激活的环境
-        let store = HostsStore::new(conn);
-        let active_env = match store.get_active_environment() {
-            Ok(env) => env,
+        let groups = match load_active_groups(conn) {
+            Ok(groups) => groups,
             Err(e) => {
-                self.set_error(format!("获取激活环境失败: {}", e));
+                self.set_error(format!("获取启用环境失败: {}", e));
                 return;
             }
         };
 
-        let env = match active_env {
-            Some(env) => env,
-            None => {
-                self.set_error("请先选择一个环境".to_string());
-                return;
-            }
-        };
+        if groups.is_empty() {
+            self.set_error("请先启用至少一个环境".to_string());
+            return;
+        }
 
-        // 获取环境条目
-        let entries = match store.get_entries_by_env(env.id) {
-            Ok(entries) => entries,
+        let env_names: Vec<String> = groups.iter().map(|group| group.name.clone()).collect();
+
+        // 检测主机名冲突（同名主机映射到不同 IP）
+        let conflicts = parser::find_hostname_conflicts(&groups);
+        if !conflicts.is_empty() {
+            log::warn!("主机名冲突: {}", format_conflicts(&conflicts));
+            self.pending_apply = Some(PendingApply {
+                groups,
+                env_names,
+                conflicts,
+            });
+            return;
+        }
+
+        self.write_hosts(&groups, &env_names, &[]);
+    }
+
+    /// 确认应用：核对配置是否在弹窗期间发生变化，避免写入过期快照
+    fn confirm_apply(&mut self, conn: &Connection, pending: &PendingApply) {
+        let groups = match load_active_groups(conn) {
+            Ok(groups) => groups,
             Err(e) => {
-                self.set_error(format!("获取环境条目失败: {}", e));
+                self.set_error(format!("获取启用环境失败: {}", e));
                 return;
             }
         };
 
-        // 转换为 parser 格式
-        let env_entries: Vec<parser::HostsLine> = entries
-            .iter()
-            .map(|e| parser::HostsLine {
-                ip: e.ip_address.clone(),
-                hostname: e.hostname.clone(),
-                comment: e.comment.clone(),
-                is_active: e.is_enabled,
-            })
-            .collect();
+        if groups != pending.groups {
+            log::info!("环境配置已变化，取消本次应用");
+            self.set_warning("环境配置已变化，请重新点击【应用到系统】".to_string());
+            return;
+        }
 
-        // 备份当前 hosts
+        self.write_hosts(&pending.groups, &pending.env_names, &pending.conflicts);
+    }
+
+    /// 备份并写入系统 hosts 文件
+    fn write_hosts(
+        &mut self,
+        groups: &[parser::HostsGroup],
+        applied: &[String],
+        conflicts: &[parser::HostnameConflict],
+    ) {
+        // 备份失败时中止写入，避免覆盖后无法恢复
         match parser::backup_hosts() {
             Ok(path) => {
                 log::info!("已备份 hosts 到: {}", path.display());
             }
             Err(e) => {
-                log::warn!("备份 hosts 失败: {}", e);
+                log::error!("备份 hosts 失败，已取消应用: {}", e);
+                self.set_error(format!("备份系统 hosts 失败，已取消应用: {}", e));
+                return;
             }
         }
 
         // 以追加方式更新系统 hosts
-        match parser::append_to_system_hosts(&env_entries) {
+        match parser::append_to_system_hosts(groups) {
             Ok(()) => {
-                self.set_success(format!("已应用环境 '{}' 到系统 hosts", env.name));
+                let entry_count: usize = groups
+                    .iter()
+                    .map(|group| group.entries.iter().filter(|entry| entry.is_active).count())
+                    .sum();
+
+                log::info!(
+                    "已应用 {} 个环境（{} 条启用条目）到系统 hosts",
+                    applied.len(),
+                    entry_count
+                );
+
+                if entry_count == 0 {
+                    self.set_warning(format!(
+                        "已更新 {} 个环境的管理区域，但没有启用条目（环境为空或条目已全部禁用）: {}",
+                        applied.len(),
+                        applied.join("、")
+                    ));
+                } else {
+                    self.set_success(format!(
+                        "已应用 {} 个环境共 {} 条启用条目到系统 hosts: {}",
+                        applied.len(),
+                        entry_count,
+                        applied.join("、")
+                    ));
+                }
+
+                if !conflicts.is_empty() {
+                    // 追加到已有警告之后，避免两条提示互相覆盖
+                    let conflict_warning = format!(
+                        "存在主机名冲突，同名条目以 hosts 文件中先出现的映射为准: {}",
+                        format_conflicts(conflicts)
+                    );
+                    let warning = match &self.warning_msg {
+                        Some(existing) => format!("{}；{}", existing, conflict_warning),
+                        None => conflict_warning,
+                    };
+                    self.set_warning(warning);
+                }
             }
             Err(e) => {
-                self.set_error(format!("写入系统 hosts 失败（需要管理员权限）: {}", e));
+                self.set_error(format!("写入系统 hosts 失败: {}", e));
             }
         }
     }
+
+    /// 渲染主机名冲突确认弹窗
+    fn render_apply_confirm_dialog(&mut self, ui: &mut egui::Ui, conn: &Connection) {
+        let Some(pending) = self.pending_apply.take() else {
+            return;
+        };
+
+        let mut open = true;
+        let mut confirmed = false;
+        let mut cancelled = false;
+
+        egui::Window::new("⚠ 主机名冲突")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(420.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ui.ctx(), |ui| {
+                ui.label("以下主机名被映射到多个不同 IP，实际生效结果取决于解析顺序：");
+                ui.add_space(6.0);
+
+                egui::ScrollArea::vertical()
+                    .id_salt("hosts_conflict_scroll")
+                    .max_height(160.0)
+                    .show(ui, |ui| {
+                        for conflict in &pending.conflicts {
+                            ui.label(format!("• {}", conflict.describe()));
+                        }
+                    });
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("仍然应用").clicked() {
+                        confirmed = true;
+                    }
+                    if ui.button("取消").clicked() {
+                        cancelled = true;
+                    }
+                });
+            });
+
+        if confirmed {
+            self.confirm_apply(conn, &pending);
+        } else if cancelled || !open {
+            self.set_warning("已取消应用（存在主机名冲突）".to_string());
+        } else {
+            // 弹窗仍处于打开状态，保留待确认内容以便下一帧继续显示
+            self.pending_apply = Some(pending);
+        }
+    }
+}
+
+/// 读取所有已启用环境及其条目
+fn load_active_groups(conn: &Connection) -> Result<Vec<parser::HostsGroup>> {
+    let store = HostsStore::new(conn);
+    let active_envs = store.get_active_environments()?;
+
+    let mut groups = Vec::with_capacity(active_envs.len());
+    for env in &active_envs {
+        let entries = store
+            .get_entries_by_env(env.id)
+            .with_context(|| format!("获取环境 '{}' 的条目失败", env.name))?;
+
+        groups.push(parser::HostsGroup {
+            name: env.name.clone(),
+            entries: entries.iter().map(to_hosts_line).collect(),
+        });
+    }
+
+    Ok(groups)
+}
+
+/// 将数据库条目转换为 hosts 文本行
+fn to_hosts_line(entry: &DbHostsEntry) -> parser::HostsLine {
+    parser::HostsLine {
+        ip: entry.ip_address.clone(),
+        hostname: entry.hostname.clone(),
+        comment: entry.comment.clone(),
+        is_active: entry.is_enabled,
+    }
+}
+
+/// 格式化主机名冲突提示
+fn format_conflicts(conflicts: &[parser::HostnameConflict]) -> String {
+    conflicts
+        .iter()
+        .map(parser::HostnameConflict::describe)
+        .collect::<Vec<String>>()
+        .join("；")
 }
