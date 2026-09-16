@@ -18,6 +18,95 @@ use super::terminal::TerminalEmulator;
 const TERMINAL_BOTTOM_PADDING: f32 = 6.0;
 /// 等待系统剪贴板 Paste 事件的最长时间
 const TERMINAL_PASTE_TIMEOUT_SECONDS: f64 = 2.0;
+/// Backspace 键序列（DEL）
+const TERMINAL_BACKSPACE_SEQUENCE: &[u8] = b"\x7f";
+/// Ctrl+Backspace 键序列（Ctrl+W）
+///
+/// 等价于远端的 Ctrl+W：readline（bash）、zsh、fish 在默认的 emacs 编辑模式下
+/// 都绑定为删除光标前一个单词；vi 编辑模式下该键为其他含义，不做转换
+const TERMINAL_WORD_DELETE_SEQUENCE: &[u8] = b"\x17";
+
+/// 会话标签切换方向
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TabSwitchDirection {
+    /// 下一个标签
+    Next,
+    /// 上一个标签
+    Previous,
+}
+
+/// 判断按键是否为会话标签切换快捷键（Ctrl+Tab / Ctrl+Shift+Tab）
+fn tab_switch_direction(key: egui::Key, modifiers: egui::Modifiers) -> Option<TabSwitchDirection> {
+    if key != egui::Key::Tab || !modifiers.ctrl {
+        return None;
+    }
+
+    Some(if modifiers.shift {
+        TabSwitchDirection::Previous
+    } else {
+        TabSwitchDirection::Next
+    })
+}
+
+/// 从输入事件中查找会话标签切换快捷键
+fn tab_switch_shortcut_from_events(
+    events: &[egui::Event],
+) -> Option<(egui::Modifiers, TabSwitchDirection)> {
+    events.iter().find_map(|event| {
+        let egui::Event::Key {
+            key,
+            pressed: true,
+            modifiers,
+            ..
+        } = event
+        else {
+            return None;
+        };
+
+        tab_switch_direction(*key, *modifiers).map(|direction| (*modifiers, direction))
+    })
+}
+
+/// 计算循环切换后的标签索引
+///
+/// 索引循环回绕；`current` 越界时按最后一个标签处理，标签数为 0 时返回 `None`
+fn switched_tab_index(
+    current: usize,
+    tab_count: usize,
+    direction: TabSwitchDirection,
+) -> Option<usize> {
+    if tab_count == 0 {
+        return None;
+    }
+
+    let current = current.min(tab_count - 1);
+    Some(match direction {
+        TabSwitchDirection::Next => (current + 1) % tab_count,
+        TabSwitchDirection::Previous => (current + tab_count - 1) % tab_count,
+    })
+}
+
+/// 终端删除键序列；Ctrl+Backspace 删除光标前一个单词
+fn terminal_backspace_sequence(ctrl: bool) -> &'static [u8] {
+    if ctrl {
+        TERMINAL_WORD_DELETE_SEQUENCE
+    } else {
+        TERMINAL_BACKSPACE_SEQUENCE
+    }
+}
+
+/// 终端方向键序列；Ctrl+左右箭头按单词移动（xterm 的 CSI 1;5 形式）
+fn terminal_arrow_sequence(key: egui::Key, ctrl: bool) -> Option<&'static [u8]> {
+    match (key, ctrl) {
+        (egui::Key::ArrowUp, _) => Some(b"\x1b[A"),
+        (egui::Key::ArrowDown, _) => Some(b"\x1b[B"),
+        (egui::Key::ArrowRight, false) => Some(b"\x1b[C"),
+        (egui::Key::ArrowRight, true) => Some(b"\x1b[1;5C"),
+        (egui::Key::ArrowLeft, false) => Some(b"\x1b[D"),
+        (egui::Key::ArrowLeft, true) => Some(b"\x1b[1;5D"),
+        _ => None,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TerminalClipboardAction {
@@ -241,6 +330,36 @@ impl SshClientUi {
         if let Some(tab) = self.current_tab_mut() {
             tab.terminal_paste_deadline = None;
             tab.status_msg = "剪贴板为空，未执行粘贴".to_string();
+        }
+    }
+
+    /// 处理会话标签切换快捷键（Ctrl+Tab 下一个 / Ctrl+Shift+Tab 上一个）
+    ///
+    /// 长按会按系统按键重复速率连续切换；消费按键只为阻止 Tab 被发送到远程，
+    /// 阻止 egui 焦点导航依赖终端自身设置的 focus lock filter
+    fn handle_tab_switch_shortcut(&mut self, ctx: &egui::Context) {
+        let Some(current) = self.active_tab_index else {
+            return;
+        };
+
+        let Some((modifiers, direction)) =
+            ctx.input(|i| tab_switch_shortcut_from_events(&i.events))
+        else {
+            return;
+        };
+
+        // 消费按键，避免 Tab 被当作终端输入发送到远程
+        ctx.input_mut(|i| i.consume_key(modifiers, egui::Key::Tab));
+
+        let Some(next) = switched_tab_index(current, self.tabs.len(), direction) else {
+            return;
+        };
+
+        if next != current {
+            self.active_tab_index = Some(next);
+            if let Some(tab) = self.tabs.get(next) {
+                log::info!("SSH 会话标签已切换到: {}", tab.name);
+            }
         }
     }
 
@@ -470,6 +589,9 @@ impl SshClientUi {
         self.poll_sftp_output();
 
         if self.is_terminal_view() {
+            // 会话标签切换快捷键需在终端输入处理之前消费，避免 Tab 被发送到远程
+            self.handle_tab_switch_shortcut(ui.ctx());
+
             // 获取全局字体大小
             let global_font_size = ui
                 .style()
@@ -1643,7 +1765,9 @@ impl SshClientUi {
                             continue;
                         }
                         if key == egui::Key::Backspace {
-                            let _ = tx.send(SshInput::KeyInput(vec![0x7f]));
+                            // Ctrl+Backspace 删除光标前一个单词
+                            let sequence = terminal_backspace_sequence(modifiers.ctrl);
+                            let _ = tx.send(SshInput::KeyInput(sequence.to_vec()));
                             i.consume_key(modifiers, key);
                             had_input = true;
                             continue;
@@ -1660,26 +1784,9 @@ impl SshClientUi {
                             had_input = true;
                             continue;
                         }
-                        if key == egui::Key::ArrowUp {
-                            let _ = tx.send(SshInput::KeyInput(b"\x1b[A".to_vec()));
-                            i.consume_key(modifiers, key);
-                            had_input = true;
-                            continue;
-                        }
-                        if key == egui::Key::ArrowDown {
-                            let _ = tx.send(SshInput::KeyInput(b"\x1b[B".to_vec()));
-                            i.consume_key(modifiers, key);
-                            had_input = true;
-                            continue;
-                        }
-                        if key == egui::Key::ArrowRight {
-                            let _ = tx.send(SshInput::KeyInput(b"\x1b[C".to_vec()));
-                            i.consume_key(modifiers, key);
-                            had_input = true;
-                            continue;
-                        }
-                        if key == egui::Key::ArrowLeft {
-                            let _ = tx.send(SshInput::KeyInput(b"\x1b[D".to_vec()));
+                        if let Some(sequence) = terminal_arrow_sequence(key, modifiers.ctrl) {
+                            // Ctrl+左右箭头按单词移动
+                            let _ = tx.send(SshInput::KeyInput(sequence.to_vec()));
                             i.consume_key(modifiers, key);
                             had_input = true;
                             continue;
@@ -2618,14 +2725,241 @@ mod tests {
     use std::sync::mpsc;
 
     use super::{
-        SshClientUi, TERMINAL_BOTTOM_PADDING, TerminalClipboardAction,
+        SshClientUi, TERMINAL_BACKSPACE_SEQUENCE, TERMINAL_BOTTOM_PADDING,
+        TERMINAL_WORD_DELETE_SEQUENCE, TabSwitchDirection, TerminalClipboardAction,
         accepted_terminal_paste_text, analyze_terminal_clipboard_events, has_active_transfer,
-        remote_parent_path, send_remote_directory_request, send_terminal_paste,
-        terminal_clipboard_action, terminal_content_rows, terminal_cursor_display_row,
-        terminal_cursor_in_view, terminal_cursor_rect, terminal_ime_cursor_rect,
-        terminal_position_from_pointer,
+        remote_parent_path, send_remote_directory_request, send_terminal_paste, switched_tab_index,
+        tab_switch_direction, tab_switch_shortcut_from_events, terminal_arrow_sequence,
+        terminal_backspace_sequence, terminal_clipboard_action, terminal_content_rows,
+        terminal_cursor_display_row, terminal_cursor_in_view, terminal_cursor_rect,
+        terminal_ime_cursor_rect, terminal_position_from_pointer,
     };
     use crate::plugins::ssh_client::models::{SessionTab, SftpRequest, SshInput};
+
+    /// 构造带指定修饰键的按键事件
+    fn key_event(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    #[test]
+    fn tab_switch_shortcut_requires_ctrl_tab() {
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            ..Default::default()
+        };
+        let ctrl_shift = egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            tab_switch_direction(egui::Key::Tab, ctrl),
+            Some(TabSwitchDirection::Next)
+        );
+        assert_eq!(
+            tab_switch_direction(egui::Key::Tab, ctrl_shift),
+            Some(TabSwitchDirection::Previous)
+        );
+
+        // 单独的 Tab / Shift+Tab 仍交给终端处理，不做标签切换
+        assert_eq!(
+            tab_switch_direction(egui::Key::Tab, egui::Modifiers::NONE),
+            None
+        );
+        assert_eq!(
+            tab_switch_direction(
+                egui::Key::Tab,
+                egui::Modifiers {
+                    shift: true,
+                    ..Default::default()
+                }
+            ),
+            None
+        );
+        assert_eq!(tab_switch_direction(egui::Key::A, ctrl), None);
+    }
+
+    #[test]
+    fn switched_tab_index_wraps_around() {
+        assert_eq!(switched_tab_index(0, 3, TabSwitchDirection::Next), Some(1));
+        assert_eq!(switched_tab_index(2, 3, TabSwitchDirection::Next), Some(0));
+        assert_eq!(
+            switched_tab_index(0, 3, TabSwitchDirection::Previous),
+            Some(2)
+        );
+        assert_eq!(
+            switched_tab_index(1, 3, TabSwitchDirection::Previous),
+            Some(0)
+        );
+
+        // 单标签时保持原索引
+        assert_eq!(switched_tab_index(0, 1, TabSwitchDirection::Next), Some(0));
+
+        // 索引越界时收敛到最后一个标签，再按方向循环切换
+        assert_eq!(switched_tab_index(9, 2, TabSwitchDirection::Next), Some(0));
+        assert_eq!(
+            switched_tab_index(9, 2, TabSwitchDirection::Previous),
+            Some(0)
+        );
+
+        assert_eq!(switched_tab_index(0, 0, TabSwitchDirection::Next), None);
+    }
+
+    #[test]
+    fn terminal_arrows_send_word_movement_with_ctrl() {
+        assert_eq!(
+            terminal_arrow_sequence(egui::Key::ArrowLeft, false),
+            Some(&b"\x1b[D"[..])
+        );
+        assert_eq!(
+            terminal_arrow_sequence(egui::Key::ArrowRight, false),
+            Some(&b"\x1b[C"[..])
+        );
+        assert_eq!(
+            terminal_arrow_sequence(egui::Key::ArrowLeft, true),
+            Some(&b"\x1b[1;5D"[..])
+        );
+        assert_eq!(
+            terminal_arrow_sequence(egui::Key::ArrowRight, true),
+            Some(&b"\x1b[1;5C"[..])
+        );
+
+        // Ctrl+上下箭头保持原有行为
+        assert_eq!(
+            terminal_arrow_sequence(egui::Key::ArrowUp, true),
+            Some(&b"\x1b[A"[..])
+        );
+        assert_eq!(
+            terminal_arrow_sequence(egui::Key::ArrowDown, true),
+            Some(&b"\x1b[B"[..])
+        );
+        assert_eq!(terminal_arrow_sequence(egui::Key::A, true), None);
+    }
+
+    #[test]
+    fn terminal_backspace_deletes_word_with_ctrl() {
+        assert_eq!(
+            terminal_backspace_sequence(false),
+            TERMINAL_BACKSPACE_SEQUENCE
+        );
+        assert_eq!(
+            terminal_backspace_sequence(true),
+            TERMINAL_WORD_DELETE_SEQUENCE
+        );
+        assert_eq!(terminal_backspace_sequence(true), b"\x17");
+    }
+
+    #[test]
+    fn tab_switch_listener_ignores_other_keys() {
+        // 只有 Ctrl+Tab 事件会被识别为标签切换
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            ..Default::default()
+        };
+        let ctrl_shift = egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Default::default()
+        };
+
+        let events = vec![
+            key_event(egui::Key::A, ctrl),
+            key_event(egui::Key::Tab, egui::Modifiers::NONE),
+            key_event(egui::Key::Tab, ctrl),
+        ];
+        assert_eq!(
+            tab_switch_shortcut_from_events(&events),
+            Some((ctrl, TabSwitchDirection::Next))
+        );
+
+        let events = vec![key_event(egui::Key::Tab, ctrl_shift)];
+        assert_eq!(
+            tab_switch_shortcut_from_events(&events),
+            Some((ctrl_shift, TabSwitchDirection::Previous))
+        );
+
+        // 没有 Ctrl+Tab 时不应触发标签切换
+        let events = vec![
+            key_event(egui::Key::Tab, egui::Modifiers::NONE),
+            key_event(egui::Key::Enter, ctrl),
+        ];
+        assert_eq!(tab_switch_shortcut_from_events(&events), None);
+    }
+
+    #[test]
+    fn tab_switch_shortcut_ignores_release_and_accepts_repeat() {
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            ..Default::default()
+        };
+
+        // 松开按键不应触发切换
+        let released = vec![egui::Event::Key {
+            key: egui::Key::Tab,
+            physical_key: Some(egui::Key::Tab),
+            pressed: false,
+            repeat: false,
+            modifiers: ctrl,
+        }];
+        assert_eq!(tab_switch_shortcut_from_events(&released), None);
+
+        // 长按产生的重复事件同样触发切换（连续翻页）
+        let repeated = vec![egui::Event::Key {
+            key: egui::Key::Tab,
+            physical_key: Some(egui::Key::Tab),
+            pressed: true,
+            repeat: true,
+            modifiers: ctrl,
+        }];
+        assert_eq!(
+            tab_switch_shortcut_from_events(&repeated),
+            Some((ctrl, TabSwitchDirection::Next))
+        );
+    }
+
+    #[test]
+    fn tab_switch_shortcut_is_consumed_before_terminal_input() {
+        let ctx = egui::Context::default();
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            ..Default::default()
+        };
+
+        let mut raw_input = egui::RawInput::default();
+        raw_input.events.push(key_event(egui::Key::Tab, ctrl));
+        raw_input
+            .events
+            .push(key_event(egui::Key::A, egui::Modifiers::NONE));
+
+        let mut tab_removed = false;
+        let mut remaining_events = 0;
+        let _ = ctx.run(raw_input, |ctx| {
+            // 与 handle_tab_switch_shortcut 中相同的消费方式
+            ctx.input_mut(|i| i.consume_key(ctrl, egui::Key::Tab));
+            ctx.input(|i| {
+                tab_removed = !i.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        egui::Event::Key {
+                            key: egui::Key::Tab,
+                            ..
+                        }
+                    )
+                });
+                remaining_events = i.events.len();
+            });
+        });
+
+        assert!(tab_removed, "Ctrl+Tab 应被消费，不再发送到远端");
+        assert_eq!(remaining_events, 1, "其他按键事件不应被一并消费");
+    }
 
     fn clipboard_key_event(key: egui::Key, pressed: bool, repeat: bool) -> egui::Event {
         egui::Event::Key {

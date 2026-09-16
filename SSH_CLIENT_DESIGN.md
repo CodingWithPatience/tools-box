@@ -22,8 +22,9 @@
 | SFTP 文件上传 | 上传本地文件到远程服务器 | P1 | ✅ |
 | SFTP 文件下载 | 从远程服务器下载文件到本地 | P1 | ✅ |
 | 终端字体大小调节 | 支持 Ctrl+滚轮 调整终端字体大小 | P2 | ✅ |
+| 终端单词级编辑 | Ctrl+左右箭头按单词移动光标，Ctrl+Backspace 删除前一个单词 | P2 | ✅ |
 | 终端日志 | 会话日志记录到本地文件 | P2 | ⬜ |
-| 多标签会话 | 同时连接多台服务器，标签切换 | P2 | ✅ |
+| 多标签会话 | 同时连接多台服务器，标签切换（支持 Ctrl+Tab / Ctrl+Shift+Tab） | P2 | ✅ |
 
 ---
 
@@ -197,7 +198,8 @@ egui 键盘事件处理策略：
 |---------|---------|
 | 可打印字符 (a-z, 0-9, 符号) | 直接发送对应字节到 SSH channel |
 | Enter | 发送 `\r` (0x0D) |
-| Backspace | 发送 `\x7f` (DEL) 或 `\x08` (BS) |
+| Backspace | 发送 `\x7f` (DEL) |
+| Ctrl+Backspace | 发送 `\x17` (Ctrl+W)，由远端 shell 删除光标前一个单词 |
 | Tab | 发送 `\t` (0x09) |
 | Ctrl+C | 发送 `\x03` |
 | Ctrl+Shift+C | 复制鼠标选中文本；无选区时复制当前可见终端内容 |
@@ -205,10 +207,18 @@ egui 键盘事件处理策略：
 | 系统 Copy/Paste 事件 | 根据 patched `egui-winit` 产生的事件类型区分 `Ctrl+C` 与 `Ctrl+Shift+C/V`；仅接受快捷键或右键请求产生的 Paste |
 | Ctrl+D | 发送 `\x04` |
 | Ctrl+Z | 发送 `\x1a` |
+| Ctrl+L | 发送 `\x0c` |
+| Escape | 发送 `\x1b` |
 | 方向键 | 发送 ANSI 转义序列 (`\x1b[A` 等) |
+| Ctrl+左右箭头 | 发送 `\x1b[1;5D` / `\x1b[1;5C`，按单词移动光标 |
 | Ctrl+滚轮 | 调整终端字体大小（不发送到 SSH） |
+| Ctrl+Tab / Ctrl+Shift+Tab | 切换到下一个 / 上一个会话标签（循环，不发送到 SSH） |
+
+说明：Ctrl+Backspace 与 Ctrl+左右箭头的单词级操作依赖远端 shell 处于默认的 emacs 编辑模式（bash/readline、zsh、fish 默认绑定）；vi 编辑模式下不生效。方向键仅识别 Ctrl，Shift/Alt 组合不会改变发送的序列（与改动前一致）。
 
 输入捕获策略：终端区域获得 egui focus 后，通过 `ui.input(|i| i.events.iter())` 捕获所有键盘事件，过滤掉全局快捷键（如 Ctrl+1~9 切换插件），其余转发到 SSH。
+
+会话标签切换快捷键在终端输入处理之前消费，因此 `Ctrl+Tab` 不会把 `Tab` 发送到远端；`Ctrl+Tab` 与 `Ctrl+Shift+Tab` 在会话视图的终端、SFTP 子标签下均可用，单标签时保持当前标签不变，长按按系统按键重复速率连续切换。消费事件只负责阻止 `Tab` 进入终端输入；阻止 egui 焦点导航依赖终端自身设置的 focus lock filter，因此在未渲染终端的 SFTP 子标签下，焦点仍可能在面板内移动。
 
 复制粘贴快捷键在普通终端控制键之前分流。项目通过本地 `egui-winit 0.31.1` 最小补丁，使 Windows 的 `Ctrl+Shift+C/V` 保留包含触发时修饰键的 Key 事件，避免依赖帧末按键状态推断；普通 `Ctrl+C/V` 仍使用平台 Copy/Paste 事件。因此 `Ctrl+C` 始终发送远端中断信号，`Ctrl+Shift+C` 执行复制，普通 `Ctrl+V` 不向远端发送内容，只有 `Ctrl+Shift+V` 才显式请求粘贴。右键粘贴同样通过 egui `ViewportCommand::RequestPaste` 读取操作系统剪贴板，可接收浏览器、编辑器等其他程序复制的文本；会话标签使用 2 秒截止时间等待平台返回 Paste，收到首个事件或超时后结束请求。无快捷键授权且无待处理请求的 Paste 事件不会进入终端。SSH 模块不直接执行剪贴板 I/O。
 
@@ -453,6 +463,8 @@ src/plugins/ssh_client/
 | 2.5 | 键盘输入转发 | 捕获键盘事件 → channel.write() | `ui.rs` 输入处理 | ✅ |
 | 2.6 | 连接状态 UI | 连接中/已连接/断开 状态指示 | `ui.rs` | ✅ |
 | 2.7 | 终端复制粘贴 | 鼠标拖选、快捷键及右键菜单 | `terminal.rs` + `models.rs` + `ui.rs` | ✅ |
+| 2.8 | 终端单词级编辑 | Ctrl+左右箭头按单词移动、Ctrl+Backspace 删除前一个单词 | `ui.rs` | ✅ |
+| 2.9 | 会话标签快捷键 | Ctrl+Tab / Ctrl+Shift+Tab 循环切换标签，不向远端发送 Tab | `ui.rs` | ✅ |
 
 ### 第三阶段：SFTP + 增强功能（步骤 8-10）
 
@@ -482,6 +494,8 @@ src/plugins/ssh_client/
 | 终端宽字符 | emoji 等宽字符占位正确 |
 | 终端复制快捷键 | Ctrl+Shift+C 复制选区，无选区时复制可见内容；Ctrl+C 仍发送中断信号 |
 | 终端粘贴快捷键 | Ctrl+Shift+V 和系统 Paste 事件只向远端发送一次剪贴板文本 |
+| 终端单词级编辑 | Ctrl+左右箭头按单词移动光标；Ctrl+Backspace 删除光标前一个单词 |
+| 会话标签快捷键 | Ctrl+Tab 下一个标签、Ctrl+Shift+Tab 上一个标签，循环切换且不向远端发送 Tab |
 | 终端鼠标选区 | 正向、反向、跨行拖选及越界钳制正确 |
 | 终端底部光标 | 普通窗口与最大化窗口中最后一行光标均有安全间距并正常闪烁 |
 | SFTP 上传 | 本地文件成功传输到远程 |
@@ -548,6 +562,20 @@ vt100 = "0.15"                                        # ANSI 终端解析
 - 补充同帧 Key+Paste 去重、跨帧待处理 Paste、原生 Copy/Paste 事件分流、普通 `Ctrl+V` 拒绝、空剪贴板状态、快捷键按下/释放/repeat、输入队列异常、鼠标单元格映射、分数像素行高、scrollback 饱和、IME 光标钳制、最后一行光标画布边界、正反向选区、跨行文本、宽字符和边界钳制测试；SSH 客户端相关测试 47 项全部通过。
 
 验证说明：2026-08-16 最终执行 `cargo test --all-targets`，共 141 项测试，结果为 140 项通过、0 项失败、1 项因需要交互式 Windows 会话而忽略；SSH 客户端相关测试 47 项全部通过，本地 `egui-winit` 补丁专用测试 2 项全部通过。`cargo build` 与独立目标目录的 release 构建均通过。
+
+### 11.3 会话标签切换与终端单词级编辑（2026-09-16）
+
+完成结果：
+
+- 会话标签支持 `Ctrl+Tab` 切换到下一个标签、`Ctrl+Shift+Tab` 切换到上一个标签，索引循环回绕，单标签时保持不变。
+- 标签切换快捷键在终端输入处理之前消费，`Tab` 不会被当作终端输入发送到远端；终端与 SFTP 子标签下均可使用，长按按系统按键重复速率连续切换。
+- 终端支持 `Ctrl+左/右箭头` 按单词移动光标，分别发送 xterm 的 `\x1b[1;5D` 与 `\x1b[1;5C`。
+- 终端支持 `Ctrl+Backspace` 删除光标前一个单词，发送 `\x17`（Ctrl+W），由远端 shell 的默认绑定完成删除；普通 `Backspace` 仍发送 `\x7f`。
+- 补充快捷键识别（含修饰键校验、按下/松开/repeat）、循环切换索引边界、消费后事件列表、方向键转义序列与删除键序列测试。
+
+验证说明：`cargo test` 共 186 项测试，结果为 185 项通过、0 项失败、1 项因需要交互式 Windows 会话而忽略；SSH 客户端相关测试 54 项全部通过。`cargo build` 通过，`cargo check --release` 与独立目标目录的 release 构建均通过（本机 release 二进制被运行中的程序占用，故未覆盖默认目标目录）。`cargo fmt --check` 与 `cargo clippy --all-targets` 对本次新增代码无差异、无告警。
+
+遗留说明：`Ctrl+左右箭头` 与 `Ctrl+Backspace` 依赖远端 shell 的 emacs 编辑模式绑定，尚未在真实 bash/zsh/fish 会话中做真机回归测试。
 
 ---
 
