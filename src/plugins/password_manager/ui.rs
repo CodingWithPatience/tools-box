@@ -26,6 +26,39 @@ enum ExportDialogState {
     SelectFormat,
 }
 
+/// 每页条数默认值
+const DEFAULT_PAGE_SIZE: usize = 20;
+/// 可选的每页条数
+const PAGE_SIZE_OPTIONS: [usize; 4] = [10, 20, 30, 50];
+/// 为分页栏预留的高度（窄窗口下分页栏会换行，按两行预留避免被裁剪）
+const PAGINATION_BAR_RESERVE: f32 = 64.0;
+
+/// 计算总页数（无记录时按 1 页展示）
+fn total_pages(entry_count: usize, page_size: usize) -> usize {
+    if page_size == 0 {
+        return 1;
+    }
+
+    entry_count.div_ceil(page_size).max(1)
+}
+
+/// 将页码收敛到有效范围 `1..=总页数`
+fn clamp_page(page: usize, entry_count: usize, page_size: usize) -> usize {
+    page.clamp(1, total_pages(entry_count, page_size))
+}
+
+/// 计算某页在条目列表中的下标范围 `[start, end)`
+fn page_bounds(entry_count: usize, page_size: usize, page: usize) -> (usize, usize) {
+    if entry_count == 0 || page_size == 0 {
+        return (0, 0);
+    }
+
+    let page = clamp_page(page, entry_count, page_size);
+    let start = (page - 1).saturating_mul(page_size).min(entry_count);
+
+    (start, start.saturating_add(page_size).min(entry_count))
+}
+
 /// 密码管理器 UI
 pub struct PasswordManagerUi {
     state: UiState,
@@ -51,6 +84,10 @@ pub struct PasswordManagerUi {
     generator_dialog_open: bool,
     /// 待删除的密码条目 ID（用于确认弹窗）
     pending_delete_id: Option<i64>,
+    /// 当前页码（从 1 开始）
+    page: usize,
+    /// 每页展示条数
+    page_size: usize,
 }
 
 impl PasswordManagerUi {
@@ -74,6 +111,8 @@ impl PasswordManagerUi {
             add_dialog_open: false,
             generator_dialog_open: false,
             pending_delete_id: None,
+            page: 1,
+            page_size: DEFAULT_PAGE_SIZE,
         }
     }
 
@@ -490,8 +529,8 @@ impl PasswordManagerUi {
         }
         ui.add_space(4.0);
 
-        // 密码列表表格
-        let available_height = ui.available_height() - 40.0;
+        // 密码列表表格（预留分页栏高度：窄窗口下分页栏会自动换行，预留两行避免被裁剪）
+        let available_height = (ui.available_height() - PAGINATION_BAR_RESERVE).max(60.0);
         egui::ScrollArea::vertical()
             .id_salt("password_list_scroll")
             .max_height(available_height)
@@ -499,17 +538,96 @@ impl PasswordManagerUi {
                 self.render_password_table(ui, conn);
             });
 
-        // 底部状态栏
+        // 底部状态栏 + 分页
         ui.separator();
-        ui.horizontal(|ui| {
-            ui.label(format!("共 {} 条记录", self.entries.len()));
-        });
+        self.render_pagination_bar(ui);
 
         // 弹窗渲染
         self.render_export_dialog(ui, conn);
         self.render_add_dialog(ui, conn);
         self.render_generator_dialog(ui);
         self.render_delete_confirm_dialog(ui, conn);
+    }
+
+    /// 设置每页条数（变化时回到第一页）
+    fn set_page_size(&mut self, page_size: usize) {
+        if page_size != self.page_size {
+            self.page_size = page_size;
+            self.page = 1;
+        }
+    }
+
+    /// 渲染分页工具栏（每页条数、翻页、记录数统计）
+    ///
+    /// 使用自动换行布局，窄窗口下统计信息会换到下一行，不会被裁剪
+    fn render_pagination_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            // 每页条数选择（切换后回到第一页）
+            ui.label("每页");
+            let mut page_size = self.page_size;
+            egui::ComboBox::from_id_salt("password_page_size")
+                .selected_text(format!("{} 条", page_size))
+                .width(80.0)
+                .show_ui(ui, |ui| {
+                    for option in PAGE_SIZE_OPTIONS {
+                        ui.selectable_value(&mut page_size, option, format!("{} 条", option));
+                    }
+                });
+            self.set_page_size(page_size);
+
+            ui.separator();
+
+            let entry_count = self.entries.len();
+            let page = clamp_page(self.page, entry_count, self.page_size);
+            let total = total_pages(entry_count, self.page_size);
+            self.page = page;
+
+            if ui
+                .add_enabled(page > 1, egui::Button::new("⏮"))
+                .on_hover_text("首页")
+                .clicked()
+            {
+                self.page = 1;
+            }
+            if ui
+                .add_enabled(page > 1, egui::Button::new("◀"))
+                .on_hover_text("上一页")
+                .clicked()
+            {
+                self.page = page - 1;
+            }
+
+            ui.label(format!("第 {} / {} 页", page, total));
+
+            if ui
+                .add_enabled(page < total, egui::Button::new("▶"))
+                .on_hover_text("下一页")
+                .clicked()
+            {
+                self.page = page + 1;
+            }
+            if ui
+                .add_enabled(page < total, egui::Button::new("⏭"))
+                .on_hover_text("末页")
+                .clicked()
+            {
+                self.page = total;
+            }
+
+            ui.separator();
+
+            let (start, end) = page_bounds(entry_count, self.page_size, page);
+            if entry_count == 0 {
+                ui.label("共 0 条记录");
+            } else {
+                ui.label(format!(
+                    "共 {} 条记录（当前显示 {}-{}）",
+                    entry_count,
+                    start + 1,
+                    end
+                ));
+            }
+        });
     }
 
     /// 渲染删除确认弹窗
@@ -593,9 +711,13 @@ impl PasswordManagerUi {
             });
     }
 
-    /// 渲染密码表格（延迟解密版本）
+    /// 渲染密码表格（延迟解密版本，仅渲染当前页）
     fn render_password_table(&mut self, ui: &mut egui::Ui, _conn: &Connection) {
-        let entries = self.entries.clone();
+        let page_size = self.page_size;
+        let page = clamp_page(self.page, self.entries.len(), page_size);
+        let (start, end) = page_bounds(self.entries.len(), page_size, page);
+        // 只克隆当前页条目，避免每帧复制全部记录
+        let entries = self.entries[start..end].to_vec();
         let key = self.derived_key;
 
         egui::Grid::new("password_table")
@@ -696,6 +818,8 @@ impl PasswordManagerUi {
             Ok(entries) => {
                 self.entries = entries;
                 self.visible_passwords.clear();
+                // 搜索结果变化后回到第一页
+                self.page = 1;
             }
             Err(e) => {
                 self.set_error(format!("搜索失败: {}", e));
@@ -1096,7 +1220,150 @@ impl PasswordManagerUi {
         self.visible_passwords.clear();
         self.search_query.clear();
         self.pending_delete_id = None;
+        self.page = 1;
         self.state = UiState::RequireMasterPassword;
         self.clear_messages();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        DEFAULT_PAGE_SIZE, PAGE_SIZE_OPTIONS, PasswordManagerUi, clamp_page, page_bounds,
+        total_pages,
+    };
+
+    #[test]
+    fn total_pages_rounds_up_and_keeps_at_least_one() {
+        assert_eq!(total_pages(0, DEFAULT_PAGE_SIZE), 1);
+        assert_eq!(total_pages(1, DEFAULT_PAGE_SIZE), 1);
+        assert_eq!(total_pages(20, DEFAULT_PAGE_SIZE), 1);
+        assert_eq!(total_pages(21, DEFAULT_PAGE_SIZE), 2);
+        assert_eq!(total_pages(40, DEFAULT_PAGE_SIZE), 2);
+        assert_eq!(total_pages(50, 10), 5);
+        assert_eq!(total_pages(51, 10), 6);
+        // 每页条数为 0 时退化为单页，避免除零
+        assert_eq!(total_pages(100, 0), 1);
+    }
+
+    #[test]
+    fn clamp_page_keeps_page_within_range() {
+        assert_eq!(clamp_page(0, 100, DEFAULT_PAGE_SIZE), 1);
+        assert_eq!(clamp_page(1, 100, DEFAULT_PAGE_SIZE), 1);
+        assert_eq!(clamp_page(3, 100, DEFAULT_PAGE_SIZE), 3);
+        assert_eq!(clamp_page(99, 100, DEFAULT_PAGE_SIZE), 5);
+        // 无记录时始终为第 1 页
+        assert_eq!(clamp_page(7, 0, DEFAULT_PAGE_SIZE), 1);
+    }
+
+    #[test]
+    fn page_bounds_covers_full_and_partial_pages() {
+        // 默认每页 20 条：45 条记录 → 3 页（20 + 20 + 5）
+        assert_eq!(page_bounds(45, DEFAULT_PAGE_SIZE, 1), (0, 20));
+        assert_eq!(page_bounds(45, DEFAULT_PAGE_SIZE, 2), (20, 40));
+        assert_eq!(page_bounds(45, DEFAULT_PAGE_SIZE, 3), (40, 45));
+        // 越界页码收敛到最后一页
+        assert_eq!(page_bounds(45, DEFAULT_PAGE_SIZE, 9), (40, 45));
+        // 页码为 0 收敛到第一页
+        assert_eq!(page_bounds(45, DEFAULT_PAGE_SIZE, 0), (0, 20));
+        // 每页条数大于记录数
+        assert_eq!(page_bounds(3, 50, 1), (0, 3));
+        // 无记录
+        assert_eq!(page_bounds(0, DEFAULT_PAGE_SIZE, 1), (0, 0));
+        assert_eq!(page_bounds(10, 0, 1), (0, 0));
+    }
+
+    #[test]
+    fn page_size_options_and_default_match_requirements() {
+        assert_eq!(DEFAULT_PAGE_SIZE, 20);
+        assert_eq!(PAGE_SIZE_OPTIONS, [10, 20, 30, 50]);
+
+        let ui = PasswordManagerUi::new();
+        assert_eq!(ui.page_size, DEFAULT_PAGE_SIZE);
+        assert_eq!(ui.page, 1);
+    }
+
+    #[test]
+    fn changing_page_size_returns_to_first_page() {
+        let mut ui = PasswordManagerUi::new();
+        assert_eq!(ui.page_size, DEFAULT_PAGE_SIZE);
+
+        // 只有实际切换每页条数时才回到第一页
+        ui.set_page_size(DEFAULT_PAGE_SIZE);
+        assert_eq!(ui.page, 1);
+
+        ui.page = 3;
+        ui.set_page_size(50);
+        assert_eq!(ui.page_size, 50);
+        assert_eq!(ui.page, 1);
+
+        // 切换后页码始终落在有效范围内
+        for option in PAGE_SIZE_OPTIONS {
+            ui.set_page_size(option);
+            let page = clamp_page(ui.page, 45, ui.page_size);
+            assert_eq!(page, 1);
+            assert!(page_bounds(45, ui.page_size, page).1 <= 45);
+        }
+    }
+
+    #[test]
+    fn pagination_keeps_page_in_range_after_entry_changes() {
+        let mut ui = PasswordManagerUi::new();
+        ui.page_size = 10;
+        ui.page = 5;
+
+        // 记录减少（如删除或搜索命中变少）后页码自动收敛，切片范围仍有效
+        for count in [45, 12, 3, 0] {
+            let page = clamp_page(ui.page, count, ui.page_size);
+            let (start, end) = page_bounds(count, ui.page_size, page);
+            assert!(start <= end && end <= count, "count={count} 范围非法");
+            assert!(page >= 1);
+        }
+    }
+
+    #[test]
+    fn password_table_renders_each_page_without_panic() {
+        use crate::plugins::password_manager::models::EncryptedPasswordEntry;
+
+        let conn = match rusqlite::Connection::open_in_memory() {
+            Ok(conn) => conn,
+            Err(e) => panic!("创建内存数据库失败: {e}"),
+        };
+        let ctx = egui::Context::default();
+        let mut ui_state = PasswordManagerUi::new();
+        ui_state.entries = (1..=45)
+            .map(|id| EncryptedPasswordEntry {
+                id,
+                name: format!("entry-{id:03}"),
+                url: None,
+                username: format!("user-{id}"),
+                encrypted_password: Vec::new(),
+                iv: Vec::new(),
+                notes: None,
+            })
+            .collect();
+
+        // 逐页渲染（含最后一页的部分页），验证分页切片不会越界
+        let total = total_pages(ui_state.entries.len(), ui_state.page_size);
+        for page in 1..=total {
+            ui_state.page = page;
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui_state.render_password_table(ui, &conn);
+                });
+            });
+        }
+
+        // 切换到最小分页数量后同样逐页渲染
+        ui_state.set_page_size(10);
+        let total = total_pages(ui_state.entries.len(), ui_state.page_size);
+        for page in 1..=total {
+            ui_state.page = page;
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui_state.render_password_table(ui, &conn);
+                });
+            });
+        }
     }
 }
