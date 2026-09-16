@@ -184,17 +184,31 @@ egui::ScrollArea 内渲染为只读标签
 - 因此光标与选区位置**不按「列号 × 等宽字符宽度」估算**，而是用 `TerminalEmulator::rendered_cell_text` 按单元格取出实际渲染的文本，再用 `Fonts::glyph_width` 逐字符累加并按像素网格舍入（`TerminalTextLayout::column_offset` / `column_span`，与 epaint 的排版推进一致）。
 - 宽字符的后半单元格不产生渲染宽度（`rendered_cell_text` 返回 `None`），空白单元格以空格占一个等宽字符宽度；鼠标定位按同样的逐单元格宽度反查列号，保证与显示文字对齐。
 
-ANSI 颜色映射表（标准 16 色 + 216 色调色板）：
+ANSI 颜色映射（主题 16 色调色板 + 256 色）：
 
 ```rust
-fn ansi_to_egui(color: vt100::Color) -> Color32 {
+fn ansi_color_to_egui(color: vt100::Color, default: Color32, palette: &[Color32; 16]) -> Color32 {
     match color {
-        vt100::Color::Default => Color32::from_rgb(0xd0, 0xd0, 0xd0),
-        vt100::Color::Idx(i)  => ANSI_PALETTE[i as usize],
+        vt100::Color::Default      => default,
+        vt100::Color::Idx(idx)     => xterm_index_to_egui(idx, palette), // 0..16 调色板 / 16..232 色立方 / 232..256 灰阶
         vt100::Color::Rgb(r, g, b) => Color32::from_rgb(r, g, b),
     }
 }
+
+fn ansi_palette(is_dark_mode: bool) -> &'static [Color32; 16] {
+    if is_dark_mode { &ANSI_PALETTE_DARK } else { &ANSI_PALETTE_LIGHT }
+}
 ```
+
+- 深色与浅色主题各有一套 16 色调色板：经典调色板的蓝色（`#0000AA`）在深色背景（`#1e1e1e`）
+  上对比度仅约 1.25:1，目录等内容几乎无法辨认；深色调色板改用对深色背景友好的取值
+  （基于 One Half Dark，蓝色 `#61AFEF` 对比度约 7:1），亮色变体整体更亮以便区分强调内容。
+- 256 色索引完整解析：`0..16` 取主题调色板，`16..232` 为标准 6×6×6 色立方
+  （通道取值 `0/95/135/175/215/255`），`232..256` 为 24 级灰阶（8 起步、步长 10）。
+  PTY 声明 `xterm-256color`，因此 `ls --color`、vim、tmux 等使用扩展色的输出不再丢色。
+- 取舍说明：扩展色按程序给定值原样呈现（与真实终端一致），若程序使用与背景同色的索引
+  （浅色主题下的 231、深色主题下的 16 等），该内容同样不可见；深色调色板的黑/亮黑为暗色
+  主题惯例取值，不作为正文前景色使用。
 
 ### 3.4 终端输入处理
 
@@ -370,12 +384,15 @@ impl Terminal {
         let mut job = egui::text::LayoutJob::default();
         job.wrap.max_width = f32::INFINITY;
 
+        // 主题调色板每帧解析一次，逐单元格复用
+        let palette = ansi_palette(is_dark_mode);
+
         for row in 0..screen.rows() {
             for col in 0..screen.cols() {
                 let cell = screen.cell(row, col);
                 let text = cell.contents();
-                let fg = ansi_to_egui(cell.fgcolor());
-                let bg = ansi_to_egui(cell.bgcolor());
+                let fg = ansi_color_to_egui(cell.fgcolor(), default_fg, palette);
+                let bg = ansi_color_to_egui(cell.bgcolor(), default_bg, palette);
                 // bold/italic 处理...
 
                 job.append(
@@ -384,7 +401,11 @@ impl Terminal {
                     egui::TextFormat {
                         font_id: egui::FontId::monospace(self.font_size),
                         color: fg,
-                        background: if bg == default_bg { Color32::TRANSPARENT } else { bg },
+                        background: if matches!(cell.bgcolor(), vt100::Color::Default) {
+                            Color32::TRANSPARENT
+                        } else {
+                            bg
+                        },
                         ..Default::default()
                     },
                 );
@@ -517,6 +538,7 @@ src/plugins/ssh_client/
 | 终端粘贴快捷键 | Ctrl+Shift+V 和系统 Paste 事件只向远端发送一次剪贴板文本 |
 | 终端单词级编辑 | Ctrl+左右箭头按单词移动光标；Ctrl+Backspace 删除光标前一个单词 |
 | 终端宽字符定位 | 光标、选区与鼠标定位按真实字形宽度计算，中文输入不偏移 |
+| 终端配色 | 深/浅主题各一套 16 色调色板，支持 256 色索引与灰阶 |
 | 终端滚动与历史 | 滚轮每格滚动 3 行，右侧滚动条支持拖动定位与翻页 |
 | 会话标签快捷键 | Ctrl+Tab 下一个标签、Ctrl+Shift+Tab 上一个标签，循环切换且不向远端发送 Tab |
 | 终端鼠标选区 | 正向、反向、跨行拖选及越界钳制正确 |
@@ -528,6 +550,7 @@ src/plugins/ssh_client/
 | SFTP 传输可靠性 | 取消、断开、重复任务、未知大小、临时文件替换和大小变化检测正确 |
 | 终端滚动 | 滚轮每格 3 行、触控板按比例、偏移钳制到历史行数且窗口正确滑动 |
 | 终端滚动条 | 拖动定位、点击翻页、无历史时不显示 |
+| 终端配色 | 深/浅主题调色板按主题选择，256 色索引解析为色立方与灰阶 |
 | 连接 CRUD | 新增/编辑/删除连接配置持久化正确 |
 | vt100 空屏幕 | 空终端不 panic |
 | 断线处理 | SSH 连接意外断开时 UI 正确提示 |
@@ -641,6 +664,29 @@ vt100 = "0.15"                                        # ANSI 终端解析
 Windows 会话而忽略），其中历史窗口用例在 debug 构建下验证了原下溢路径已修复；`cargo build`、
 `cargo check --release` 通过；`cargo fmt --check` 与 `cargo clippy --all-targets` 对本次新增代码
 无差异、无新增告警。
+
+### 11.6 终端配色：主题调色板与 256 色支持（2026-09-16）
+
+问题：深色主题下目录的蓝色高亮（ANSI 4，`#0000AA`）在 `#1e1e1e` 背景上对比度仅约 1.25:1，几乎无法
+辨认；同时索引色 ≥ 16 一律回退为默认前景色，使用 256 色的输出会丢失颜色。
+
+完成结果：
+
+- 调色板按主题拆分：新增 `ANSI_PALETTE_DARK`（基于 One Half Dark，蓝色 `#61AFEF` 对比度约 7:1，
+  亮色变体整体更亮）与 `ANSI_PALETTE_LIGHT`（保留经典 16 色，适配浅色背景），由
+  `ansi_palette(is_dark_mode)` 选择，`render_to_layout_job` 逐帧取一次并在单元格间复用。
+- 新增 `xterm_index_to_egui`：`0..16` 取主题调色板、`16..232` 按 xterm 标准 6×6×6 色立方
+  （通道取值 `0/95/135/175/215/255`）、`232..256` 为 24 级灰阶（8 起步、步长 10），
+  `ls --color`、vim、tmux 等扩展色输出不再丢色；`Color::Rgb` 直通不变。
+- 未经显式设置背景色的单元格按语义判断（`vt100::Color::Default`）保持透明，避免调色板取值与
+  默认底色相同时误判为「无背景」。
+- 新增 4 个测试（主题调色板选择与亮/暗变体特征、深色主题前景色的 WCAG AA 对比度锁定、
+  256 色索引解析含色立方与灰阶端点、SGR `01;34` 端到端取色与透明背景）；SSH 客户端相关测试
+  72 项全部通过。
+
+验证说明：`cargo test` 共 204 项测试（203 项通过、1 项因需要交互式 Windows 会话而忽略），
+`cargo test ssh_client` 72 项全部通过；`cargo build`、独立目标目录 release 构建通过；
+`cargo fmt --check` 与 `cargo clippy --all-targets` 对本次新增代码无差异、无新增告警。
 
 ---
 

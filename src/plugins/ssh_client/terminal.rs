@@ -201,6 +201,9 @@ impl TerminalEmulator {
         let mut job = LayoutJob::default();
         job.wrap.max_width = f32::INFINITY;
 
+        // 调色板按主题选择，逐单元格复用
+        let palette = ansi_palette(is_dark_mode);
+
         for row in 0..total_rows {
             // 构建当前行，不创建中间 LayoutJob，直接 append 到主 job
             for col in 0..current_cols {
@@ -214,8 +217,8 @@ impl TerminalEmulator {
                         let contents = c.contents();
                         // 空单元格（如 TAB 跳过的位置）用空格填充
                         let text = if contents.is_empty() { " " } else { &contents };
-                        let fg = ansi_color_to_egui(c.fgcolor(), default_fg);
-                        let bg_color = ansi_color_to_egui(c.bgcolor(), default_bg);
+                        let fg = ansi_color_to_egui(c.fgcolor(), default_fg, palette);
+                        let bg_color = ansi_color_to_egui(c.bgcolor(), default_bg, palette);
 
                         job.append(
                             text,
@@ -223,7 +226,9 @@ impl TerminalEmulator {
                             TextFormat {
                                 font_id: FontId::monospace(self.font_size),
                                 color: fg,
-                                background: if bg_color == default_bg {
+                                // 未显式设置背景色的单元格保持透明，避免铺满画布底色；
+                                // 按语义判断而非颜色比较，避免调色板取值与默认底色相同时误判
+                                background: if matches!(c.bgcolor(), vt100::Color::Default) {
                                     Color32::TRANSPARENT
                                 } else {
                                     bg_color
@@ -267,25 +272,80 @@ impl TerminalEmulator {
     }
 }
 
+/// 根据主题选择 ANSI 16 色调色板
+///
+/// 深色背景使用针对对比度优化的暗色调色板，浅色背景使用经典调色板
+fn ansi_palette(is_dark_mode: bool) -> &'static [Color32; 16] {
+    if is_dark_mode {
+        &ANSI_PALETTE_DARK
+    } else {
+        &ANSI_PALETTE_LIGHT
+    }
+}
+
 /// ANSI 颜色 → egui Color32
-fn ansi_color_to_egui(color: vt100::Color, default: Color32) -> Color32 {
+///
+/// `palette` 为当前主题的 16 色调色板，用于解析 0..16 的索引色
+fn ansi_color_to_egui(color: vt100::Color, default: Color32, palette: &[Color32; 16]) -> Color32 {
     match color {
         vt100::Color::Default => default,
-        vt100::Color::Idx(idx) => {
-            let i = usize::from(idx);
-            if i < 16 {
-                ANSI_PALETTE[i]
-            } else {
-                // 超过 16 色的索引色回退到默认前景色
-                default
-            }
-        }
+        vt100::Color::Idx(idx) => xterm_index_to_egui(idx, palette),
         vt100::Color::Rgb(r, g, b) => Color32::from_rgb(r, g, b),
     }
 }
 
-/// ANSI 标准 16 色调色板
-const ANSI_PALETTE: [Color32; 16] = [
+/// 解析 xterm 256 色索引
+///
+/// - `0..16`：主题调色板（ANSI 标准 16 色）
+/// - `16..232`：6×6×6 色立方（每通道取 `XTERM_CUBE_LEVELS`）
+/// - `232..256`：24 级灰阶（8 起步，步长 10）
+fn xterm_index_to_egui(idx: u8, palette: &[Color32; 16]) -> Color32 {
+    match idx {
+        0..=15 => palette[usize::from(idx)],
+        16..=231 => {
+            let cube = usize::from(idx - 16);
+            Color32::from_rgb(
+                XTERM_CUBE_LEVELS[cube / 36],
+                XTERM_CUBE_LEVELS[(cube % 36) / 6],
+                XTERM_CUBE_LEVELS[cube % 6],
+            )
+        }
+        _ => {
+            let level = 8 + (idx - 232) * 10;
+            Color32::from_rgb(level, level, level)
+        }
+    }
+}
+
+/// 6×6×6 色立方每个通道的取值（xterm 标准）
+const XTERM_CUBE_LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+
+/// 暗色主题调色板（基于 One Half Dark）
+///
+/// 经典 ANSI 调色板中的蓝色（`#0000AA`）在深色背景上对比度仅约 1.25:1，
+/// 目录等内容几乎无法辨认，这里替换为对深色背景更友好的取值
+/// （例如蓝色 `#61AFEF` 对比度约 7:1），并让亮色变体整体更亮以便区分
+const ANSI_PALETTE_DARK: [Color32; 16] = [
+    Color32::from_rgb(0x28, 0x2c, 0x34), // 0  Black
+    Color32::from_rgb(0xe0, 0x6c, 0x75), // 1  Red
+    Color32::from_rgb(0x98, 0xc3, 0x79), // 2  Green
+    Color32::from_rgb(0xe5, 0xc0, 0x7b), // 3  Yellow
+    Color32::from_rgb(0x61, 0xaf, 0xef), // 4  Blue
+    Color32::from_rgb(0xc6, 0x78, 0xdd), // 5  Magenta
+    Color32::from_rgb(0x56, 0xb6, 0xc2), // 6  Cyan
+    Color32::from_rgb(0xab, 0xb2, 0xbf), // 7  White
+    Color32::from_rgb(0x5c, 0x63, 0x70), // 8  Bright Black
+    Color32::from_rgb(0xff, 0x8a, 0x93), // 9  Bright Red
+    Color32::from_rgb(0xbe, 0xdc, 0x9a), // 10 Bright Green
+    Color32::from_rgb(0xf5, 0xd9, 0xa3), // 11 Bright Yellow
+    Color32::from_rgb(0x8c, 0xc5, 0xff), // 12 Bright Blue
+    Color32::from_rgb(0xdc, 0x9e, 0xe8), // 13 Bright Magenta
+    Color32::from_rgb(0x7f, 0xd6, 0xe0), // 14 Bright Cyan
+    Color32::from_rgb(0xff, 0xff, 0xff), // 15 Bright White
+];
+
+/// 亮色主题调色板（经典 ANSI 16 色，适配浅色背景）
+const ANSI_PALETTE_LIGHT: [Color32; 16] = [
     Color32::from_rgb(0, 0, 0),       // 0  Black
     Color32::from_rgb(170, 0, 0),     // 1  Red
     Color32::from_rgb(0, 170, 0),     // 2  Green
@@ -306,7 +366,183 @@ const ANSI_PALETTE: [Color32; 16] = [
 
 #[cfg(test)]
 mod tests {
-    use super::TerminalEmulator;
+    use egui::Color32;
+
+    use super::{
+        ANSI_PALETTE_DARK, ANSI_PALETTE_LIGHT, TerminalEmulator, XTERM_CUBE_LEVELS, ansi_palette,
+        xterm_index_to_egui,
+    };
+
+    /// 计算 WCAG 相对对比度（用于锁定深色主题配色可读性）
+    fn contrast_ratio(foreground: Color32, background: Color32) -> f32 {
+        fn linearize(channel: u8) -> f32 {
+            let value = f32::from(channel) / 255.0;
+            if value <= 0.03928 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        }
+
+        let luminance = |color: Color32| {
+            0.2126 * linearize(color.r())
+                + 0.7152 * linearize(color.g())
+                + 0.0722 * linearize(color.b())
+        };
+
+        let first = luminance(foreground);
+        let second = luminance(background);
+        let (lighter, darker) = if first >= second {
+            (first, second)
+        } else {
+            (second, first)
+        };
+
+        (lighter + 0.05) / (darker + 0.05)
+    }
+
+    #[test]
+    fn palette_is_selected_by_theme() {
+        assert_eq!(ansi_palette(true), &ANSI_PALETTE_DARK);
+        assert_eq!(ansi_palette(false), &ANSI_PALETTE_LIGHT);
+
+        // 深色主题的蓝色比经典调色板明显更亮（原 #0000AA 在深色背景上几乎不可读）
+        let dark_blue = ANSI_PALETTE_DARK[4];
+        let light_blue = ANSI_PALETTE_LIGHT[4];
+        assert!(dark_blue.b() > light_blue.b());
+        assert!(dark_blue.r() > light_blue.r());
+        assert!(dark_blue.g() > light_blue.g());
+
+        // 亮色变体整体不暗于普通变体，便于区分强调内容
+        for index in 0..8 {
+            let normal = ANSI_PALETTE_DARK[index];
+            let bright = ANSI_PALETTE_DARK[index + 8];
+            let normal_sum = u32::from(normal.r()) + u32::from(normal.g()) + u32::from(normal.b());
+            let bright_sum = u32::from(bright.r()) + u32::from(bright.g()) + u32::from(bright.b());
+            assert!(
+                bright_sum >= normal_sum,
+                "亮色变体应不暗于普通变体: index={index}"
+            );
+        }
+    }
+
+    #[test]
+    fn dark_palette_blue_is_readable_on_dark_background() {
+        let background = Color32::from_rgb(0x1e, 0x1e, 0x1e);
+
+        // 目录等内容使用 ANSI 4 蓝色，经典取值在深色背景上不可读
+        assert!(contrast_ratio(ANSI_PALETTE_LIGHT[4], background) < 2.0);
+        // 深色调色板达到 WCAG AA 正文对比度，锁定本次修复目标
+        assert!(
+            contrast_ratio(ANSI_PALETTE_DARK[4], background) >= 4.5,
+            "深色主题蓝色对比度不足: {}",
+            contrast_ratio(ANSI_PALETTE_DARK[4], background)
+        );
+
+        // 主要前景色在深色背景上均达到 AA
+        for index in [1, 2, 3, 4, 5, 6, 7] {
+            let color = ANSI_PALETTE_DARK[index];
+            assert!(
+                contrast_ratio(color, background) >= 4.5,
+                "深色主题索引 {index} 对比度不足: {}",
+                contrast_ratio(color, background)
+            );
+        }
+    }
+
+    #[test]
+    fn xterm_index_resolves_palette_cube_and_grayscale() {
+        let palette = &ANSI_PALETTE_DARK;
+
+        // 0..16 取主题调色板
+        assert_eq!(xterm_index_to_egui(0, palette), palette[0]);
+        assert_eq!(xterm_index_to_egui(4, palette), palette[4]);
+        assert_eq!(xterm_index_to_egui(15, palette), palette[15]);
+
+        // 16..232 为 6×6×6 色立方
+        assert_eq!(xterm_index_to_egui(16, palette), Color32::from_rgb(0, 0, 0));
+        assert_eq!(
+            xterm_index_to_egui(17, palette),
+            Color32::from_rgb(0, 0, 95)
+        );
+        assert_eq!(
+            xterm_index_to_egui(21, palette),
+            Color32::from_rgb(0, 0, 255)
+        );
+        assert_eq!(
+            xterm_index_to_egui(196, palette),
+            Color32::from_rgb(255, 0, 0)
+        );
+        assert_eq!(
+            xterm_index_to_egui(231, palette),
+            Color32::from_rgb(255, 255, 255)
+        );
+        // 色立方通道取值符合 xterm 标准
+        assert_eq!(XTERM_CUBE_LEVELS[1], 95);
+        assert_eq!(XTERM_CUBE_LEVELS[5], 255);
+
+        // 232..256 为 24 级灰阶
+        assert_eq!(
+            xterm_index_to_egui(232, palette),
+            Color32::from_rgb(8, 8, 8)
+        );
+        assert_eq!(
+            xterm_index_to_egui(255, palette),
+            Color32::from_rgb(238, 238, 238)
+        );
+
+        // 取一个非端点的色立方取值（39 = (0, 175, 255)）
+        assert_eq!(
+            xterm_index_to_egui(39, palette),
+            Color32::from_rgb(0, 175, 255)
+        );
+
+        // 两套主题调色板只影响 0..16，扩展色与主题无关
+        let light_theme = &ANSI_PALETTE_LIGHT;
+        assert_eq!(xterm_index_to_egui(4, palette), palette[4]);
+        assert_ne!(xterm_index_to_egui(4, palette), light_theme[4]);
+        assert_eq!(
+            xterm_index_to_egui(39, palette),
+            xterm_index_to_egui(39, light_theme)
+        );
+    }
+
+    #[test]
+    fn layout_job_uses_theme_palette_for_directory_blue() {
+        // `ls --color` 用 SGR 01;34（加粗蓝）标记目录；本渲染器不加粗，颜色取索引 4
+        let mut terminal = TerminalEmulator::new(8, 2, 14.0);
+        terminal.process(b"\x1b[01;34mdir\x1b[0m");
+
+        let dark_job = terminal.render_to_layout_job(true);
+        let light_job = terminal.render_to_layout_job(false);
+
+        let has_color = |job: &egui::text::LayoutJob, expected: Color32| {
+            job.sections
+                .iter()
+                .any(|section| section.format.color == expected)
+        };
+        let count_color = |job: &egui::text::LayoutJob, expected: Color32| {
+            job.sections
+                .iter()
+                .filter(|section| section.format.color == expected)
+                .count()
+        };
+
+        assert!(has_color(&dark_job, ANSI_PALETTE_DARK[4]));
+        assert!(has_color(&light_job, ANSI_PALETTE_LIGHT[4]));
+        // 只有 dir 三个字符使用目录蓝色，其余单元格保持默认前景色
+        assert_eq!(count_color(&dark_job, ANSI_PALETTE_DARK[4]), 3);
+        assert_eq!(count_color(&light_job, ANSI_PALETTE_LIGHT[4]), 3);
+
+        // 未显式设置背景色的单元格保持透明（画布底色自行绘制）
+        assert!(
+            dark_job
+                .sections
+                .iter()
+                .filter(|section| section.format.color == ANSI_PALETTE_DARK[4])
+                .all(|section| section.format.background == Color32::TRANSPARENT)
+        );
+    }
 
     #[test]
     fn visible_text_returns_plain_terminal_contents() {
