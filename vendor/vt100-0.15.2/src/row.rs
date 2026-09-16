@@ -41,6 +41,16 @@ impl Row {
         self.cells.get_mut(usize::from(col))
     }
 
+    // Tools Box patch: 判断该行是否为空白填充行（无任何字符且使用默认背景色），
+    // 用于区分窗口放大时补出的空行与真实输出。
+    /// Returns whether the row has no contents and only default attributes.
+    #[must_use]
+    pub fn is_blank(&self) -> bool {
+        self.cells
+            .iter()
+            .all(|cell| !cell.has_contents() && cell.bgcolor() == crate::attrs::Color::Default)
+    }
+
     pub fn insert(&mut self, i: u16, cell: crate::cell::Cell) {
         self.cells.insert(usize::from(i), cell);
         self.wrapped = false;

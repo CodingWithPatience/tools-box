@@ -545,6 +545,152 @@ mod tests {
     }
 
     #[test]
+    fn resize_growth_absorbs_history_rows() {
+        let mut terminal = TerminalEmulator::new(20, 10, 14.0);
+        for index in 0..20 {
+            terminal.process(format!("L{index}\r\n").as_bytes());
+        }
+
+        // 10 行屏幕：历史 11 行，屏幕显示最新的 9 行内容
+        assert_eq!(terminal.scrollback_count(), 11);
+        assert_eq!(terminal.cursor_position().1, 9);
+
+        // 放大到 15 行：从历史行回填 5 行，历史行数随之减少
+        terminal.resize(20, 15);
+        assert_eq!(terminal.scrollback_count(), 6);
+        assert_eq!(terminal.cursor_position().1, 14);
+        // 内容底部对齐：最新一行仍在屏幕上
+        assert!(terminal.visible_text().contains("L19"));
+
+        // 继续放大到 30 行：历史不足时全部回填，滚动条区间归零
+        terminal.resize(20, 30);
+        assert_eq!(terminal.scrollback_count(), 0);
+        let text = terminal.visible_text();
+        assert!(text.starts_with("L0\nL1"));
+        assert!(text.contains("L19"));
+    }
+
+    #[test]
+    fn resize_shrink_pushes_rows_into_history_without_loss() {
+        let mut terminal = TerminalEmulator::new(20, 20, 14.0);
+        for index in 0..19 {
+            terminal.process(format!("L{index}\r\n").as_bytes());
+        }
+        // 19 行内容刚好占满前 19 行，尚未产生历史行
+        assert_eq!(terminal.scrollback_count(), 0);
+
+        // 缩小到 5 行：光标在最后一行，顶部 15 行进入历史行，屏幕保留最新内容
+        terminal.resize(20, 5);
+        assert_eq!(terminal.scrollback_count(), 15);
+        assert_eq!(terminal.cursor_position().1, 4);
+        let text = terminal.visible_text();
+        assert_eq!(text.lines().next(), Some("L15"));
+        assert_eq!(text.lines().last(), Some("L18"));
+
+        // 缩小后的历史行仍可滚动查看，且包含被移出屏幕的早期内容
+        let max_offset = terminal.scrollback_count();
+        terminal.set_scrollback(max_offset);
+        assert!(terminal.visible_text().starts_with("L0\nL1"));
+    }
+
+    #[test]
+    fn resize_restore_does_not_turn_padding_rows_into_history() {
+        let mut terminal = TerminalEmulator::new(20, 10, 14.0);
+        for index in 0..5 {
+            terminal.process(format!("L{index}\r\n").as_bytes());
+        }
+        // 5 行内容 + 光标停在下一行，此时没有历史行
+        assert_eq!(terminal.scrollback_count(), 0);
+        let cursor_row = terminal.cursor_position().1;
+
+        // 放大窗口：空行填充在光标下方，不产生历史行（滚动条保持隐藏）
+        terminal.resize(20, 40);
+        assert_eq!(terminal.scrollback_count(), 0);
+        assert_eq!(terminal.cursor_position().1, cursor_row);
+
+        // 恢复到原尺寸：填充空行不能被当作内容进入历史行
+        terminal.resize(20, 10);
+        assert_eq!(terminal.scrollback_count(), 0);
+        assert_eq!(terminal.cursor_position().1, cursor_row);
+        let text = terminal.visible_text();
+        assert_eq!(text.lines().next(), Some("L0"));
+        assert_eq!(text.lines().nth(4), Some("L4"));
+    }
+
+    #[test]
+    fn resize_shrink_only_scrolls_rows_needed_to_keep_cursor_visible() {
+        let mut terminal = TerminalEmulator::new(20, 20, 14.0);
+        for index in 0..5 {
+            terminal.process(format!("L{index}\r\n").as_bytes());
+        }
+
+        // 光标在第 5 行，缩小到 10 行时光标仍在屏幕内：不上移内容，也不产生历史行
+        terminal.resize(20, 10);
+        assert_eq!(terminal.scrollback_count(), 0);
+        assert_eq!(terminal.cursor_position().1, 5);
+        assert!(terminal.visible_text().starts_with("L0\nL1"));
+
+        // 缩小到 3 行：只需上移 3 行即可让光标留在最后一行
+        terminal.resize(20, 3);
+        assert_eq!(terminal.scrollback_count(), 3);
+        assert_eq!(terminal.cursor_position().1, 2);
+        let text = terminal.visible_text();
+        assert_eq!(text.lines().next(), Some("L3"));
+        assert_eq!(text.lines().last(), Some("L4"));
+    }
+
+    #[test]
+    fn resize_keeps_scrollback_offset_within_history() {
+        let mut terminal = TerminalEmulator::new(20, 10, 14.0);
+        for index in 0..30 {
+            terminal.process(format!("L{index}\r\n").as_bytes());
+        }
+
+        // 光标在最后一行，回滚 5 行查看较早内容
+        terminal.set_scrollback(5);
+        assert_eq!(terminal.scrollback(), 5);
+
+        // 放大回填历史行：偏移不超出新的历史行数
+        terminal.resize(20, 20);
+        assert!(terminal.scrollback() <= terminal.scrollback_count());
+
+        // 缩小：偏移保持不变（视图按「距内容底部的行数」锚定），
+        // 因此视图最后一行的内容与缩放前一致
+        let offset = terminal.scrollback();
+        let before_shrink = terminal.visible_text();
+        terminal.resize(20, 6);
+        assert_eq!(
+            terminal.scrollback(),
+            offset.min(terminal.scrollback_count())
+        );
+        assert_eq!(
+            terminal.visible_text().lines().last(),
+            before_shrink.lines().last()
+        );
+    }
+
+    #[test]
+    fn resize_shrink_keeps_content_below_cursor() {
+        let mut terminal = TerminalEmulator::new(20, 20, 14.0);
+        // 第 0 行与第 15 行各有内容，光标随后移回第 0 行（如 shell 的预测行/光标定位输出）
+        terminal.process(b"TOP\x1b[15;1HBOTTOM\x1b[1;1H");
+        assert!(terminal.visible_text().contains("BOTTOM"));
+
+        // 缩小到 10 行：光标之下的空白填充先丢弃，光标之下的真实内容必须保留
+        terminal.resize(20, 10);
+        assert!(
+            terminal.visible_text().contains("BOTTOM"),
+            "光标之下的真实内容不应丢失: {:?}",
+            terminal.visible_text()
+        );
+
+        // 被移出屏幕的顶部内容进入历史行，仍可回滚查看
+        assert!(terminal.scrollback_count() > 0);
+        terminal.set_scrollback(terminal.scrollback_count());
+        assert!(terminal.visible_text().starts_with("TOP"));
+    }
+
+    #[test]
     fn visible_text_returns_plain_terminal_contents() {
         let mut terminal = TerminalEmulator::new(12, 3, 14.0);
         terminal.process(b"hello\r\nworld");

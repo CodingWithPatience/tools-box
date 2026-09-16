@@ -70,6 +70,10 @@ impl Grid {
             }
         }
 
+        // Tools Box patch: 行数变化时按「填充空行不入历史、内容按需底部对齐」迁移行，
+        // 使历史行数随窗口大小变化、缩小窗口不丢输出。
+        self.resize_rows(size.rows);
+
         if self.scroll_bottom == self.size.rows - 1 {
             self.scroll_bottom = size.rows - 1;
         }
@@ -90,6 +94,71 @@ impl Grid {
         self.row_clamp_top(false);
         self.row_clamp_bottom(false);
         self.col_clamp();
+    }
+
+    // Tools Box patch: 屏幕行数变化时迁移内容。
+    //
+    // 放大时从滚动缓冲区尾部回填历史行到屏幕顶部、缩小时先丢弃光标之下的空白填充行
+    // （放大窗口补出的空行不属于远程内容）再按需把顶部行推入滚动缓冲区。原实现放大只追加
+    // 空行（历史行数不变，滚动条状态失真）、缩小直接截断屏幕底部（丢失最新输出）。
+    /// Resizes the screen to `rows` rows, moving rows between the screen and the
+    /// scrollback buffer so that content stays continuous and the cursor remains visible.
+    fn resize_rows(&mut self, rows: u16) {
+        let old_rows = self.rows.len();
+        let new_rows = usize::from(rows);
+        if new_rows == old_rows {
+            return;
+        }
+
+        if new_rows > old_rows {
+            let growth = new_rows - old_rows;
+            let mut restored = Vec::with_capacity(growth);
+            for _ in 0..growth {
+                match self.scrollback.pop_back() {
+                    Some(row) => restored.push(row),
+                    None => break,
+                }
+            }
+
+            let restored_len = restored.len();
+            if restored_len > 0 {
+                // pop_back 的顺序是「由新到旧」，插入屏幕顶部需要反转回「由旧到新」
+                restored.reverse();
+                for (index, row) in restored.into_iter().enumerate() {
+                    self.rows.insert(index, row);
+                }
+
+                let shift = u16::try_from(restored_len).unwrap_or(u16::MAX);
+                self.pos.row = self.pos.row.saturating_add(shift);
+            }
+        } else {
+            // 1) 先丢弃光标之下的空白填充行，避免把放大窗口补出的空行计入历史行
+            let target = new_rows;
+            while self.rows.len() > target {
+                let last_index = self.rows.len() - 1;
+                if last_index <= usize::from(self.pos.row) || !self.rows[last_index].is_blank() {
+                    break;
+                }
+                self.rows.pop();
+            }
+
+            // 2) 仍需缩小（光标之下还有真实内容）时按底部对齐把顶部行移入历史行
+            let overflow = self.rows.len().saturating_sub(target);
+            for _ in 0..overflow {
+                let row = self.rows.remove(0);
+                self.scrollback.push_back(row);
+                while self.scrollback.len() > self.scrollback_len {
+                    self.scrollback.pop_front();
+                }
+            }
+
+            let shift = u16::try_from(overflow).unwrap_or(u16::MAX);
+            self.pos.row = self.pos.row.saturating_sub(shift);
+        }
+
+        // 滚动偏移以「距内容底部的行数」计量，内容底部（最新一行）没有变化，
+        // 因此偏移保持不变（视图底部锚定），只按新的历史行数收敛
+        self.scrollback_offset = self.scrollback_offset.min(self.scrollback.len());
     }
 
     pub fn pos(&self) -> Pos {
