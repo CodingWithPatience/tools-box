@@ -1172,6 +1172,13 @@ impl SshClientUi {
             ui.set_min_width(content_w);
             ui.set_min_height(terminal_content_height);
 
+            let layout = TerminalTextLayout {
+                char_width,
+                line_height,
+                font_id: &mono_font,
+                pixels_per_point,
+            };
+
             let response = ui.add(
                 egui::Label::new(job)
                     .sense(egui::Sense::click_and_drag())
@@ -1184,28 +1191,34 @@ impl SshClientUi {
             }
             if response.drag_started_by(egui::PointerButton::Primary)
                 && let Some(pointer_pos) = response.interact_pointer_pos()
-                && let Some(position) = terminal_position_from_pointer(
-                    pointer_pos,
-                    text_rect,
-                    char_width,
-                    line_height,
-                    new_cols,
-                    new_rows,
-                )
+                && let Some(position) = ui.fonts(|fonts| {
+                    terminal_position_from_pointer(
+                        pointer_pos,
+                        text_rect,
+                        term,
+                        fonts,
+                        &layout,
+                        new_cols,
+                        new_rows,
+                    )
+                })
             {
                 tab.terminal_selection =
                     Some(TerminalSelection::new(term.normalize_position(position)));
             }
             if response.dragged_by(egui::PointerButton::Primary)
                 && let Some(pointer_pos) = response.interact_pointer_pos()
-                && let Some(position) = terminal_position_from_pointer(
-                    pointer_pos,
-                    text_rect,
-                    char_width,
-                    line_height,
-                    new_cols,
-                    new_rows,
-                )
+                && let Some(position) = ui.fonts(|fonts| {
+                    terminal_position_from_pointer(
+                        pointer_pos,
+                        text_rect,
+                        term,
+                        fonts,
+                        &layout,
+                        new_cols,
+                        new_rows,
+                    )
+                })
                 && let Some(selection) = &mut tab.terminal_selection
             {
                 selection.focus = term.normalize_position(position);
@@ -1215,10 +1228,10 @@ impl SshClientUi {
                 let (_, end) = selection.normalized();
                 paint_terminal_selection(
                     ui,
+                    term,
+                    &layout,
                     text_rect,
                     selection,
-                    char_width,
-                    line_height,
                     new_cols,
                     term.char_width_at(end),
                 );
@@ -1241,15 +1254,20 @@ impl SshClientUi {
 
             // 绘制闪烁光标（考虑滚动偏移）
             let (c_col, c_row) = term.cursor_position();
-            let scrollback = term.scrollback();
-            let cursor_w = term.cursor_char_width();
-            let cursor_display_row = terminal_cursor_display_row(c_row, scrollback);
+            let cursor_display_row = terminal_cursor_display_row(c_row, term.scrollback());
+            // 光标列按渲染宽度计算，宽字符（中文）下与文字对齐
+            let (cursor_col, _) = term.normalize_position((c_col, cursor_display_row));
+            let (cursor_x, cursor_width) = ui.fonts(|fonts| {
+                (
+                    layout.column_offset(term, fonts, cursor_display_row, cursor_col),
+                    layout.cell_width(term, fonts, cursor_display_row, cursor_col),
+                )
+            });
             let cursor_rect = terminal_cursor_rect(
                 text_rect.min,
-                c_col,
+                cursor_x,
                 cursor_display_row,
-                cursor_w,
-                char_width,
+                cursor_width,
                 line_height,
             );
             let terminal_canvas_rect = egui::Rect::from_min_size(
@@ -2431,23 +2449,168 @@ impl SshClientUi {
     }
 }
 
+/// 终端文本排版度量
+///
+/// 光标、选区与鼠标定位共用同一套度量，保证与 egui 实际渲染一致
+#[derive(Debug, Clone, Copy)]
+struct TerminalTextLayout<'a> {
+    /// 等宽字符宽度（已按像素舍入）
+    char_width: f32,
+    /// 行高（已按像素舍入）
+    line_height: f32,
+    /// 终端等宽字体
+    font_id: &'a egui::FontId,
+    /// 屏幕像素比例，用于与 epaint 一致的逐字形像素舍入
+    pixels_per_point: f32,
+}
+
+impl TerminalTextLayout<'_> {
+    /// 计算某行指定列左侧的实际渲染宽度
+    ///
+    /// 宽字符按其自身字形宽度推进、其后的延续单元格不产生宽度，
+    /// 因此中文等宽字符不会累积位置偏差
+    fn column_offset(
+        &self,
+        term: &TerminalEmulator,
+        fonts: &egui::text::Fonts,
+        row: u16,
+        col: u16,
+    ) -> f32 {
+        self.column_span(term, fonts, row, col, col).0
+    }
+
+    /// 单次遍历计算某行两个列位置左侧的实际渲染宽度
+    ///
+    /// 返回 `(start_col 左侧宽度, end_col 左侧宽度)`，要求 `start_col <= end_col`；
+    /// 选区按行取起止位置时只需遍历一次该行前缀
+    fn column_span(
+        &self,
+        term: &TerminalEmulator,
+        fonts: &egui::text::Fonts,
+        row: u16,
+        start_col: u16,
+        end_col: u16,
+    ) -> (f32, f32) {
+        let mut start_offset = 0.0;
+        let mut offset = 0.0;
+
+        for col in 0..end_col {
+            if col == start_col {
+                start_offset = offset;
+            }
+
+            if let Some(text) = term.rendered_cell_text(row, col) {
+                offset = terminal_text_width_from(offset, &text, fonts, self);
+            }
+        }
+
+        if start_col >= end_col {
+            start_offset = offset;
+        }
+
+        (start_offset, offset)
+    }
+
+    /// 计算某单元格的渲染宽度（宽字符后半单元格等不渲染内容的单元格为 0）
+    fn cell_width(
+        &self,
+        term: &TerminalEmulator,
+        fonts: &egui::text::Fonts,
+        row: u16,
+        col: u16,
+    ) -> f32 {
+        match term.rendered_cell_text(row, col) {
+            Some(text) => terminal_text_width(&text, fonts, self),
+            None => 0.0,
+        }
+    }
+}
+
+/// 按 epaint 的排版规则计算文本渲染宽度
+///
+/// 逐字符累加字形宽度，并在每个字形后按像素网格舍入，
+/// 与 epaint 推进排版光标的方式保持一致
+fn terminal_text_width(
+    text: &str,
+    fonts: &egui::text::Fonts,
+    layout: &TerminalTextLayout<'_>,
+) -> f32 {
+    terminal_text_width_from(0.0, text, fonts, layout)
+}
+
+/// 在已有宽度基础上继续累加文本渲染宽度
+fn terminal_text_width_from(
+    mut width: f32,
+    text: &str,
+    fonts: &egui::text::Fonts,
+    layout: &TerminalTextLayout<'_>,
+) -> f32 {
+    for c in text.chars() {
+        width += fonts.glyph_width(layout.font_id, c);
+        width = round_to_pixel(width, layout.pixels_per_point);
+    }
+    width
+}
+
+/// 按像素网格舍入（与 epaint 的 `round_to_pixel` 一致）
+fn round_to_pixel(value: f32, pixels_per_point: f32) -> f32 {
+    if pixels_per_point > 0.0 {
+        (value * pixels_per_point).round() / pixels_per_point
+    } else {
+        value
+    }
+}
+
+/// 根据鼠标位置计算终端单元格坐标
+///
+/// 列位置按该行实际渲染的字形宽度反查，宽字符（中文）不会造成列偏移
 fn terminal_position_from_pointer(
     pointer_pos: egui::Pos2,
     text_rect: egui::Rect,
-    char_width: f32,
-    line_height: f32,
+    term: &TerminalEmulator,
+    fonts: &egui::text::Fonts,
+    layout: &TerminalTextLayout<'_>,
     cols: u16,
     rows: u16,
 ) -> Option<(u16, u16)> {
-    if char_width <= 0.0 || line_height <= 0.0 || cols == 0 || rows == 0 {
+    if layout.char_width <= 0.0 || layout.line_height <= 0.0 || cols == 0 || rows == 0 {
         return None;
     }
 
     let relative_x = (pointer_pos.x - text_rect.left()).max(0.0);
     let relative_y = (pointer_pos.y - text_rect.top()).max(0.0);
-    let col = terminal_axis_position(relative_x, char_width, cols);
-    let row = terminal_axis_position(relative_y, line_height, rows);
+    let row = terminal_axis_position(relative_y, layout.line_height, rows);
+    let col = terminal_column_from_x(term, fonts, layout, row, relative_x, cols);
     Some((col, row))
+}
+
+/// 按渲染宽度反查某行内的列号
+///
+/// 逐单元格累加渲染宽度，返回包含 `x` 的单元格；
+/// `x` 超出该行渲染宽度时取最后一列
+fn terminal_column_from_x(
+    term: &TerminalEmulator,
+    fonts: &egui::text::Fonts,
+    layout: &TerminalTextLayout<'_>,
+    row: u16,
+    x: f32,
+    cols: u16,
+) -> u16 {
+    if cols == 0 {
+        return 0;
+    }
+
+    let mut offset = 0.0;
+
+    for col in 0..cols {
+        let cell_width = layout.cell_width(term, fonts, row, col);
+        if x < offset + cell_width {
+            return col;
+        }
+        offset += cell_width;
+    }
+
+    cols - 1
 }
 
 fn terminal_content_rows(available_height: f32, line_height: f32) -> u16 {
@@ -2469,22 +2632,24 @@ fn terminal_content_rows(available_height: f32, line_height: f32) -> u16 {
     low
 }
 
+/// 构建终端光标矩形
+///
+/// `x` 与 `cursor_width` 由实际渲染宽度计算，宽字符（中文）下与文字对齐
 fn terminal_cursor_rect(
     text_origin: egui::Pos2,
-    col: u16,
+    x: f32,
     row: u16,
-    cursor_cols: u16,
-    char_width: f32,
+    cursor_width: f32,
     line_height: f32,
 ) -> egui::Rect {
     let vertical_inset = 1.0_f32.min(line_height / 4.0);
     let cursor_height = (line_height - vertical_inset * 2.0).max(1.0);
     egui::Rect::from_min_size(
         egui::pos2(
-            text_origin.x + f32::from(col) * char_width,
+            text_origin.x + x,
             text_origin.y + f32::from(row) * line_height + vertical_inset,
         ),
-        egui::vec2(char_width * f32::from(cursor_cols.max(1)), cursor_height),
+        egui::vec2(cursor_width.max(1.0), cursor_height),
     )
 }
 
@@ -2535,12 +2700,16 @@ fn terminal_axis_position(relative: f32, cell_size: f32, cell_count: u16) -> u16
     low.min(cell_count - 1)
 }
 
+/// 绘制终端选区
+///
+/// 每行的起止位置按该行实际渲染宽度计算，宽字符（中文）下与文字对齐；
+/// 位置计算在字体锁内完成、绘制在锁外执行，避免在 `ui.fonts` 闭包内访问画布
 fn paint_terminal_selection(
     ui: &egui::Ui,
+    term: &TerminalEmulator,
+    layout: &TerminalTextLayout<'_>,
     text_rect: egui::Rect,
     selection: TerminalSelection,
-    char_width: f32,
-    line_height: f32,
     cols: u16,
     end_char_width: u16,
 ) {
@@ -2549,23 +2718,35 @@ fn paint_terminal_selection(
     }
 
     let ((start_col, start_row), (end_col, end_row)) = selection.normalized();
+
+    // (行号, 起始 x, 结束 x)
+    let row_spans: Vec<(u16, f32, f32)> = ui.fonts(|fonts| {
+        let mut spans = Vec::with_capacity(usize::from(end_row.saturating_sub(start_row)) + 1);
+
+        for row in start_row..=end_row {
+            let row_start_col = if row == start_row { start_col } else { 0 };
+            let row_end_col = if row == end_row { end_col } else { cols - 1 };
+            let end_width = if row == end_row { end_char_width } else { 1 };
+            let row_end_exclusive = row_end_col.saturating_add(end_width).min(cols);
+
+            let (start_x, end_x) =
+                layout.column_span(term, fonts, row, row_start_col, row_end_exclusive);
+            spans.push((row, start_x, end_x));
+        }
+
+        spans
+    });
+
     let base_color = ui.visuals().selection.bg_fill;
     let selection_color =
         Color32::from_rgba_unmultiplied(base_color.r(), base_color.g(), base_color.b(), 96);
 
-    for row in start_row..=end_row {
-        let row_start_col = if row == start_row { start_col } else { 0 };
-        let row_end_col = if row == end_row { end_col } else { cols - 1 };
+    for (row, start_x, end_x) in row_spans {
         let min = egui::pos2(
-            text_rect.left() + f32::from(row_start_col) * char_width,
-            text_rect.top() + f32::from(row) * line_height,
+            text_rect.left() + start_x,
+            text_rect.top() + f32::from(row) * layout.line_height,
         );
-        let end_width = if row == end_row { end_char_width } else { 1 };
-        let row_end_exclusive = row_end_col.saturating_add(end_width).min(cols);
-        let max = egui::pos2(
-            text_rect.left() + f32::from(row_end_exclusive) * char_width,
-            min.y + line_height,
-        );
+        let max = egui::pos2(text_rect.left() + end_x, min.y + layout.line_height);
         ui.painter()
             .rect_filled(egui::Rect::from_min_max(min, max), 0.0, selection_color);
     }
@@ -2727,14 +2908,57 @@ mod tests {
     use super::{
         SshClientUi, TERMINAL_BACKSPACE_SEQUENCE, TERMINAL_BOTTOM_PADDING,
         TERMINAL_WORD_DELETE_SEQUENCE, TabSwitchDirection, TerminalClipboardAction,
-        accepted_terminal_paste_text, analyze_terminal_clipboard_events, has_active_transfer,
-        remote_parent_path, send_remote_directory_request, send_terminal_paste, switched_tab_index,
-        tab_switch_direction, tab_switch_shortcut_from_events, terminal_arrow_sequence,
-        terminal_backspace_sequence, terminal_clipboard_action, terminal_content_rows,
-        terminal_cursor_display_row, terminal_cursor_in_view, terminal_cursor_rect,
-        terminal_ime_cursor_rect, terminal_position_from_pointer,
+        TerminalEmulator, TerminalTextLayout, accepted_terminal_paste_text,
+        analyze_terminal_clipboard_events, has_active_transfer, paint_terminal_selection,
+        remote_parent_path, round_to_pixel, send_remote_directory_request, send_terminal_paste,
+        switched_tab_index, tab_switch_direction, tab_switch_shortcut_from_events,
+        terminal_arrow_sequence, terminal_backspace_sequence, terminal_clipboard_action,
+        terminal_content_rows, terminal_cursor_display_row, terminal_cursor_in_view,
+        terminal_cursor_rect, terminal_ime_cursor_rect, terminal_position_from_pointer,
     };
-    use crate::plugins::ssh_client::models::{SessionTab, SftpRequest, SshInput};
+    use crate::plugins::ssh_client::models::{
+        SessionTab, SftpRequest, SshInput, TerminalSelection,
+    };
+
+    /// 在测试用 egui 上下文中读取字体度量
+    fn with_terminal_fonts<R>(
+        size: f32,
+        reader: impl FnOnce(&egui::text::Fonts, &egui::FontId) -> R,
+    ) -> R {
+        let ctx = egui::Context::default();
+        let font_id = egui::FontId::monospace(size);
+        let mut result = None;
+        let mut reader = Some(reader);
+
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            let Some(reader) = reader.take() else {
+                return;
+            };
+
+            ctx.fonts(|fonts| {
+                result = Some(reader(fonts, &font_id));
+            });
+        });
+
+        match result {
+            Some(value) => value,
+            None => panic!("未能读取测试字体度量"),
+        }
+    }
+
+    /// 构造终端排版度量（等宽字符宽度取自实际字体）
+    fn test_terminal_layout<'a>(
+        fonts: &egui::text::Fonts,
+        font_id: &'a egui::FontId,
+        line_height: f32,
+    ) -> TerminalTextLayout<'a> {
+        TerminalTextLayout {
+            char_width: fonts.glyph_width(font_id, 'M'),
+            line_height,
+            font_id,
+            pixels_per_point: 1.0,
+        }
+    }
 
     /// 构造带指定修饰键的按键事件
     fn key_event(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
@@ -3125,21 +3349,220 @@ mod tests {
     }
 
     #[test]
+    fn round_to_pixel_matches_epaint_rounding() {
+        assert_eq!(round_to_pixel(10.4, 1.0), 10.0);
+        assert_eq!(round_to_pixel(10.6, 1.0), 11.0);
+        assert_eq!(round_to_pixel(10.25, 2.0), 10.5);
+        // 非法的像素比例下保持原值
+        assert_eq!(round_to_pixel(10.4, 0.0), 10.4);
+    }
+
+    #[test]
     fn terminal_pointer_position_maps_and_clamps_to_cells() {
+        let mut term = TerminalEmulator::new(8, 3, 14.0);
+        term.process(b"abc");
         let rect = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(80.0, 60.0));
 
-        assert_eq!(
-            terminal_position_from_pointer(egui::pos2(35.0, 45.0), rect, 10.0, 20.0, 8, 3,),
-            Some((2, 1))
+        with_terminal_fonts(14.0, |fonts, font_id| {
+            let layout = test_terminal_layout(fonts, font_id, 20.0);
+
+            // 落在第 3 个单元格内部时映射到第 2 列
+            let cell_start = layout.column_offset(&term, fonts, 0, 2);
+            let cell_end = layout.column_offset(&term, fonts, 0, 3);
+            let inside_third_cell = rect.left() + (cell_start + cell_end) / 2.0;
+            assert_eq!(
+                terminal_position_from_pointer(
+                    egui::pos2(inside_third_cell, rect.top() + 25.0),
+                    rect,
+                    &term,
+                    fonts,
+                    &layout,
+                    8,
+                    3,
+                ),
+                Some((2, 1))
+            );
+
+            // 左上角之外钳制到 (0, 0)
+            assert_eq!(
+                terminal_position_from_pointer(
+                    egui::pos2(-100.0, -100.0),
+                    rect,
+                    &term,
+                    fonts,
+                    &layout,
+                    8,
+                    3,
+                ),
+                Some((0, 0))
+            );
+
+            // 右下角之外钳制到最后一行最后一列
+            assert_eq!(
+                terminal_position_from_pointer(
+                    egui::pos2(5000.0, 5000.0),
+                    rect,
+                    &term,
+                    fonts,
+                    &layout,
+                    8,
+                    3,
+                ),
+                Some((7, 2))
+            );
+        });
+    }
+
+    #[test]
+    fn terminal_cjk_columns_follow_rendered_glyph_width() {
+        // 两个汉字 + 两个半角字符：宽字符占用两个单元格
+        let mut term = TerminalEmulator::new(10, 2, 14.0);
+        term.process("中文ab".as_bytes());
+
+        with_terminal_fonts(14.0, |fonts, font_id| {
+            let layout = test_terminal_layout(fonts, font_id, 20.0);
+
+            let first_wide = layout.cell_width(&term, fonts, 0, 0);
+            let second_wide = layout.cell_width(&term, fonts, 0, 2);
+
+            // 第二个汉字左侧的位置等于第一个汉字的真实渲染宽度，
+            // 而不是「2 × 等宽字符宽度」的估算值
+            assert_eq!(layout.column_offset(&term, fonts, 0, 2), first_wide);
+            assert_eq!(
+                layout.column_offset(&term, fonts, 0, 4),
+                first_wide + second_wide
+            );
+
+            // 宽字符后半单元格不产生宽度，与字符起点共用位置
+            assert_eq!(layout.cell_width(&term, fonts, 0, 1), 0.0);
+            assert_eq!(
+                layout.column_offset(&term, fonts, 0, 2),
+                layout.column_offset(&term, fonts, 0, 1)
+            );
+
+            // 鼠标落在第二个汉字内部时映射到该汉字起始列
+            let inside_second_char = layout.column_offset(&term, fonts, 0, 2) + first_wide / 2.0;
+            let rect = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(80.0, 60.0));
+            assert_eq!(
+                terminal_position_from_pointer(
+                    egui::pos2(rect.left() + inside_second_char, rect.top() + 1.0),
+                    rect,
+                    &term,
+                    fonts,
+                    &layout,
+                    10,
+                    2,
+                ),
+                Some((2, 0))
+            );
+        });
+    }
+
+    #[test]
+    fn terminal_cjk_cursor_offset_uses_real_glyph_width() {
+        // 使用应用实际加载的中文字体，复现「光标比中文更偏右」的场景
+        let ctx = egui::Context::default();
+        crate::app::setup_chinese_fonts(&ctx);
+
+        let mut term = TerminalEmulator::new(6, 2, 14.0);
+        term.process("中a".as_bytes());
+        let font_id = egui::FontId::monospace(14.0);
+
+        let mut measured = None;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            ctx.fonts(|fonts| {
+                let layout = test_terminal_layout(fonts, &font_id, 20.0);
+
+                // 与 epaint 实际排版对照：屏幕第二行的第二个字形（半角 a）的 x 位置
+                let job = term.render_to_layout_job(true);
+                let galley = fonts.layout_job(job);
+                let laid_out_x = galley
+                    .rows
+                    .first()
+                    .and_then(|row| row.glyphs.get(1))
+                    .map(|glyph| glyph.pos.x);
+
+                measured = Some((
+                    // 汉字之后的光标位置
+                    layout.column_offset(&term, fonts, 0, 2),
+                    laid_out_x,
+                    // 汉字字形宽度与等宽字符宽度
+                    fonts.glyph_width(&font_id, '中'),
+                    layout.char_width,
+                ));
+            });
+        });
+
+        let Some((offset, laid_out_x, cjk_width, latin_width)) = measured else {
+            panic!("未能读取测试字体度量");
+        };
+
+        // 计算出的列位置与 egui 实际排版出的字形位置一致
+        assert_eq!(Some(round_to_pixel(offset, 1.0)), laid_out_x);
+        // 光标位置等于汉字按像素舍入后的真实渲染宽度（与 epaint 的排版推进一致）
+        assert_eq!(offset, round_to_pixel(cjk_width, 1.0));
+        // 根因：汉字宽度并非两个等宽字符宽度，按「列号 × 等宽字符宽度」估算会持续偏右
+        assert!(
+            cjk_width < latin_width * 2.0,
+            "汉字宽度 {} 应小于两倍等宽字符宽度 {}",
+            cjk_width,
+            latin_width * 2.0
         );
-        assert_eq!(
-            terminal_position_from_pointer(egui::pos2(-100.0, -100.0), rect, 10.0, 20.0, 8, 3,),
-            Some((0, 0))
-        );
-        assert_eq!(
-            terminal_position_from_pointer(egui::pos2(500.0, 500.0), rect, 10.0, 20.0, 8, 3,),
-            Some((7, 2))
-        );
+    }
+
+    #[test]
+    fn terminal_selection_paints_inside_real_frame() {
+        let ctx = egui::Context::default();
+        let mut term = TerminalEmulator::new(10, 2, 14.0);
+        term.process("中文ab".as_bytes());
+
+        let mut selection = TerminalSelection::new((0, 0));
+        selection.focus = (4, 0);
+
+        // 选区绘制内部会读取字体度量，若在字体锁内访问画布会造成界面卡死；
+        // 该用例走完整帧，验证绘制路径能够正常完成
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let font_id = egui::FontId::monospace(14.0);
+                let char_width = ui.fonts(|fonts| fonts.glyph_width(&font_id, 'M'));
+                let layout = TerminalTextLayout {
+                    char_width,
+                    line_height: 20.0,
+                    font_id: &font_id,
+                    pixels_per_point: ui.pixels_per_point(),
+                };
+
+                paint_terminal_selection(
+                    ui,
+                    &term,
+                    &layout,
+                    egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(200.0, 40.0)),
+                    selection,
+                    10,
+                    1,
+                );
+            });
+        });
+
+        assert!(!output.shapes.is_empty(), "选区应绘制出矩形");
+    }
+
+    #[test]
+    fn terminal_blank_cells_keep_monospace_column_positions() {
+        let mut term = TerminalEmulator::new(8, 1, 14.0);
+        term.process(b"ab");
+
+        with_terminal_fonts(14.0, |fonts, font_id| {
+            let layout = test_terminal_layout(fonts, font_id, 20.0);
+            let space_width = layout.cell_width(&term, fonts, 0, 7);
+
+            // 行尾空白单元格仍按一个等宽字符占位
+            assert!(space_width > 0.0);
+            assert_eq!(
+                layout.column_offset(&term, fonts, 0, 8),
+                layout.column_offset(&term, fonts, 0, 2) + space_width * 6.0
+            );
+        });
     }
 
     #[test]
@@ -3156,20 +3579,20 @@ mod tests {
     #[test]
     fn terminal_last_row_cursor_stays_inside_explicit_canvas() {
         let canvas = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(80.0, 100.0));
-        let cursor = terminal_cursor_rect(canvas.min, 0, 4, 1, 10.0, 20.0);
+        let cursor = terminal_cursor_rect(canvas.min, 0.0, 4, 10.0, 20.0);
 
         assert_eq!(cursor.top(), 101.0);
         assert_eq!(cursor.bottom(), 119.0);
         assert!(terminal_cursor_in_view(cursor, canvas));
 
-        let below_canvas = terminal_cursor_rect(canvas.min, 0, 5, 1, 10.0, 20.0);
+        let below_canvas = terminal_cursor_rect(canvas.min, 0.0, 5, 10.0, 20.0);
         assert!(!terminal_cursor_in_view(below_canvas, canvas));
     }
 
     #[test]
     fn terminal_last_row_cursor_handles_fractional_line_height() {
         let canvas = egui::Rect::from_min_size(egui::pos2(10.25, 20.25), egui::vec2(80.0, 97.5));
-        let cursor = terminal_cursor_rect(canvas.min, 0, 4, 1, 9.75, 19.5);
+        let cursor = terminal_cursor_rect(canvas.min, 0.0, 4, 9.75, 19.5);
 
         assert!(terminal_cursor_in_view(cursor, canvas));
         assert!(cursor.bottom() < canvas.bottom());
@@ -3185,11 +3608,25 @@ mod tests {
         assert_eq!(terminal_cursor_display_row(20, usize::MAX), u16::MAX);
 
         let canvas = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(80.0, 100.0));
-        let cursor = terminal_cursor_rect(canvas.min, 0, u16::MAX, 1, 10.0, 20.0);
+        let cursor = terminal_cursor_rect(canvas.min, 0.0, u16::MAX, 10.0, 20.0);
         let ime_cursor = terminal_ime_cursor_rect(cursor, canvas);
 
         assert!(canvas.contains_rect(ime_cursor));
         assert_eq!(ime_cursor.bottom(), canvas.bottom());
+    }
+
+    #[test]
+    fn terminal_cursor_rect_places_cursor_at_rendered_offset() {
+        let origin = egui::pos2(10.0, 20.0);
+        let cursor = terminal_cursor_rect(origin, 24.0, 2, 8.0, 20.0);
+
+        assert_eq!(cursor.left(), 34.0);
+        assert_eq!(cursor.width(), 8.0);
+        assert_eq!(cursor.top(), 61.0);
+
+        // 宽度为 0 或负值时至少保留 1px，避免光标不可见
+        let minimal = terminal_cursor_rect(origin, 0.0, 0, 0.0, 20.0);
+        assert_eq!(minimal.width(), 1.0);
     }
 
     #[test]

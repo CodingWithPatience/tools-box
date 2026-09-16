@@ -99,33 +99,6 @@ impl TerminalEmulator {
         (col, row)
     }
 
-    /// 获取光标位置字符的宽度（1 或 2）
-    /// 宽字符（如中文）返回 2，普通字符返回 1
-    pub fn cursor_char_width(&self) -> u16 {
-        let screen = self.parser.screen();
-        let (row, col) = screen.cursor_position();
-        if let Some(cell) = screen.cell(row, col) {
-            if cell.is_wide() {
-                2
-            } else if cell.is_wide_continuation() {
-                // 光标在宽字符的后半部分，需要获取前一个字符
-                if col > 0 {
-                    if let Some(prev_cell) = screen.cell(row, col - 1) {
-                        if prev_cell.is_wide() { 2 } else { 1 }
-                    } else {
-                        1
-                    }
-                } else {
-                    1
-                }
-            } else {
-                1
-            }
-        } else {
-            1
-        }
-    }
-
     /// 获取当前可见终端的纯文本内容
     pub fn visible_text(&self) -> String {
         self.parser.screen().contents()
@@ -179,6 +152,27 @@ impl TerminalEmulator {
             end_row,
             end_col.saturating_add(1).min(cols),
         )
+    }
+
+    /// 获取指定单元格实际渲染的文本
+    ///
+    /// - 空白单元格返回空格（渲染时以空格填充）
+    /// - 宽字符的后半单元格与越界单元格返回 `None`（不产生渲染内容）
+    pub fn rendered_cell_text(&self, row: u16, col: u16) -> Option<String> {
+        let screen = self.parser.screen();
+        let cell = screen.cell(row, col)?;
+
+        // 宽字符的后半部分不单独渲染
+        if cell.is_wide_continuation() {
+            return None;
+        }
+
+        let contents = cell.contents();
+        if contents.is_empty() {
+            Some(" ".to_string())
+        } else {
+            Some(contents)
+        }
     }
 
     /// 将终端屏幕渲染为 egui::LayoutJob
@@ -358,5 +352,21 @@ mod tests {
 
         assert_eq!(terminal.text_between((3, 0), (3, 0)), "中");
         assert_eq!(terminal.text_between((3, 0), (1, 1)), "中\n文");
+    }
+
+    #[test]
+    fn rendered_cell_text_skips_wide_continuation_cells() {
+        let mut terminal = TerminalEmulator::new(6, 2, 14.0);
+        terminal.process("中ab".as_bytes());
+
+        assert_eq!(terminal.rendered_cell_text(0, 0).as_deref(), Some("中"));
+        // 宽字符后半单元格不产生渲染内容
+        assert_eq!(terminal.rendered_cell_text(0, 1), None);
+        assert_eq!(terminal.rendered_cell_text(0, 2).as_deref(), Some("a"));
+        // 空白单元格以空格占位
+        assert_eq!(terminal.rendered_cell_text(0, 5).as_deref(), Some(" "));
+        // 越界单元格不产生渲染内容
+        assert_eq!(terminal.rendered_cell_text(9, 0), None);
+        assert_eq!(terminal.rendered_cell_text(0, 9), None);
     }
 }

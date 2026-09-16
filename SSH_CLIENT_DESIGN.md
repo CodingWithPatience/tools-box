@@ -178,6 +178,12 @@ egui::LayoutJob (逐行构建)
 egui::ScrollArea 内渲染为只读标签
 ```
 
+位置计算（光标、选区、鼠标定位）说明：
+
+- 终端文本由 egui 按各字体实际字形宽度排版：半角字符取等宽字体宽度，宽字符（中文、Emoji）取该字形的真实宽度，二者不满足「宽字符 = 2 × 等宽字符宽度」。
+- 因此光标与选区位置**不按「列号 × 等宽字符宽度」估算**，而是用 `TerminalEmulator::rendered_cell_text` 按单元格取出实际渲染的文本，再用 `Fonts::glyph_width` 逐字符累加并按像素网格舍入（`TerminalTextLayout::column_offset` / `column_span`，与 epaint 的排版推进一致）。
+- 宽字符的后半单元格不产生渲染宽度（`rendered_cell_text` 返回 `None`），空白单元格以空格占一个等宽字符宽度；鼠标定位按同样的逐单元格宽度反查列号，保证与显示文字对齐。
+
 ANSI 颜色映射表（标准 16 色 + 216 色调色板）：
 
 ```rust
@@ -495,6 +501,7 @@ src/plugins/ssh_client/
 | 终端复制快捷键 | Ctrl+Shift+C 复制选区，无选区时复制可见内容；Ctrl+C 仍发送中断信号 |
 | 终端粘贴快捷键 | Ctrl+Shift+V 和系统 Paste 事件只向远端发送一次剪贴板文本 |
 | 终端单词级编辑 | Ctrl+左右箭头按单词移动光标；Ctrl+Backspace 删除光标前一个单词 |
+| 终端宽字符定位 | 光标、选区与鼠标定位按真实字形宽度计算，中文输入不偏移 |
 | 会话标签快捷键 | Ctrl+Tab 下一个标签、Ctrl+Shift+Tab 上一个标签，循环切换且不向远端发送 Tab |
 | 终端鼠标选区 | 正向、反向、跨行拖选及越界钳制正确 |
 | 终端底部光标 | 普通窗口与最大化窗口中最后一行光标均有安全间距并正常闪烁 |
@@ -576,6 +583,23 @@ vt100 = "0.15"                                        # ANSI 终端解析
 验证说明：`cargo test` 共 186 项测试，结果为 185 项通过、0 项失败、1 项因需要交互式 Windows 会话而忽略；SSH 客户端相关测试 54 项全部通过。`cargo build` 通过，`cargo check --release` 与独立目标目录的 release 构建均通过（本机 release 二进制被运行中的程序占用，故未覆盖默认目标目录）。`cargo fmt --check` 与 `cargo clippy --all-targets` 对本次新增代码无差异、无告警。
 
 遗留说明：`Ctrl+左右箭头` 与 `Ctrl+Backspace` 依赖远端 shell 的 emacs 编辑模式绑定，尚未在真实 bash/zsh/fish 会话中做真机回归测试。
+
+### 11.4 终端宽字符（中文）光标位置修正（2026-09-16）
+
+问题：终端输入中文后，光标位置比文字实际位置偏右，并且随中文字符数量累积；拖选与鼠标定位同样偏移。
+
+原因：`char_width` 取自等宽字体 `M` 的字形宽度，光标、选区与鼠标定位都按「列号 × char_width」计算；而中文字符由 Microsoft YaHei 渲染，其字形宽度并不是两个等宽字符宽度（14px 字号、pixels_per_point = 1 下实测：`M` 为 8.28px，取整后 `char_width` = 8px，两个单元格即 16px；而汉字为 13.64px），因此每个汉字累积约 2.4px 的右偏。
+
+完成结果：
+
+- `terminal.rs` 新增 `rendered_cell_text`，按与渲染一致的取字规则返回单元格实际渲染的文本（空白单元格返回空格、宽字符后半单元格与越界单元格返回 `None`）。
+- `ui.rs` 新增 `TerminalTextLayout` 度量（等宽字符宽度、行高、字体、像素比例）与 `terminal_text_width` / `terminal_text_width_from`：逐字符累加 `Fonts::glyph_width` 并按像素网格舍入，与 epaint 的排版推进逐字等价（新增用例直接与 `fonts.layout_job` 排版出的字形 x 对照）。
+- 光标矩形改为按渲染宽度定位（`column_offset` → `terminal_cursor_rect(x, width)`），宽度取光标所在单元格的字形宽度；选区按行取渲染起止位置（`column_span` 单次遍历该行前缀）；鼠标点击/拖选按逐单元格渲染宽度反查列号。
+- 选区绘制改为「在字体锁内计算各行位置、锁外绘制」，避免在 `ui.fonts` 闭包内访问画布造成界面卡死（新增整帧绘制用例覆盖）。
+- 删除不再使用的 `cursor_char_width`。
+- 新增 6 个用例（像素舍入、指针映射与钳制、宽字符列位置、空白单元格占位、光标矩形坐标、中文字体全链路对照、选区整帧绘制），并扩展 4 个既有用例（单元格取字规则、指针定位签名等）；SSH 客户端相关测试 61 项全部通过。
+
+验证说明：`cargo test` 共 193 项测试，结果为 192 项通过、0 项失败、1 项因需要交互式 Windows 会话而忽略。`cargo build` 通过；`cargo fmt --check` 与 `cargo clippy --all-targets` 对本次新增代码无差异、无新增告警。
 
 ---
 
