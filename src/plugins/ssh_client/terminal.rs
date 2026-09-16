@@ -14,8 +14,6 @@ pub struct TerminalEmulator {
     rows: u16,
     /// 字体大小
     font_size: f32,
-    /// 滚动缓冲区大小
-    scrollback_size: usize,
 }
 
 impl TerminalEmulator {
@@ -27,7 +25,6 @@ impl TerminalEmulator {
             cols,
             rows,
             font_size,
-            scrollback_size: DEFAULT_SCROLLBACK_SIZE,
         }
     }
 
@@ -55,15 +52,17 @@ impl TerminalEmulator {
         self.font_size
     }
 
-    /// 获取滚动缓冲区大小
-    pub fn scrollback_size(&self) -> usize {
-        self.scrollback_size
-    }
-
     /// 获取当前滚动位置（0 表示在最底部）
     pub fn scrollback(&self) -> usize {
         let screen = self.parser.screen();
         screen.scrollback()
+    }
+
+    /// 获取已缓存的历史行数（滚动位置的最大值）
+    ///
+    /// 由本地 `vt100` 补丁提供，用于计算滚动上限与滚动条范围
+    pub fn scrollback_count(&self) -> usize {
+        self.parser.screen().scrollback_count()
     }
 
     /// 设置滚动位置
@@ -352,6 +351,39 @@ mod tests {
 
         assert_eq!(terminal.text_between((3, 0), (3, 0)), "中");
         assert_eq!(terminal.text_between((3, 0), (1, 1)), "中\n文");
+    }
+
+    #[test]
+    fn scrollback_window_slides_through_history() {
+        let mut terminal = TerminalEmulator::new(8, 3, 14.0);
+        for index in 0..10 {
+            terminal.process(format!("L{}\r\n", index).as_bytes());
+        }
+
+        // 当前屏幕：显示最新内容
+        assert_eq!(terminal.scrollback(), 0);
+        assert_eq!(terminal.visible_text(), "L8\nL9");
+
+        // 历史行数即滚动上限
+        let max_offset = terminal.scrollback_count();
+        assert_eq!(max_offset, 8);
+
+        // 偏移不超过屏幕行数时，窗口在屏幕上滑动
+        terminal.set_scrollback(1);
+        assert_eq!(terminal.visible_text(), "L7\nL8\nL9");
+
+        // 偏移超过屏幕行数时，窗口继续向上滑过历史行（本地补丁修复下溢）
+        terminal.set_scrollback(4);
+        assert_eq!(terminal.visible_text(), "L4\nL5\nL6");
+
+        // 偏移达到上限时显示最早的历史内容
+        terminal.set_scrollback(max_offset);
+        assert_eq!(terminal.visible_text(), "L0\nL1\nL2");
+
+        // 超过上限的偏移被钳制
+        terminal.set_scrollback(max_offset + 100);
+        assert_eq!(terminal.scrollback(), max_offset);
+        assert_eq!(terminal.visible_text(), "L0\nL1\nL2");
     }
 
     #[test]

@@ -18,6 +18,24 @@ use super::terminal::TerminalEmulator;
 const TERMINAL_BOTTOM_PADDING: f32 = 6.0;
 /// 等待系统剪贴板 Paste 事件的最长时间
 const TERMINAL_PASTE_TIMEOUT_SECONDS: f64 = 2.0;
+/// 滚轮每格滚动的终端行数
+const TERMINAL_WHEEL_LINES_PER_NOTCH: f32 = 3.0;
+/// 无法读取 egui 滚动速度时使用的每格滚动距离（点）
+const DEFAULT_SCROLL_POINTS_PER_NOTCH: f32 = 40.0;
+/// 单次滚轮事件最多滚动的行数，避免触控板惯性滚动跳跃过大
+const TERMINAL_WHEEL_MAX_LINES: f32 = 300.0;
+/// 终端滚动条宽度
+const TERMINAL_SCROLLBAR_WIDTH: f32 = 8.0;
+/// 终端滚动条与终端内容之间的间距
+const TERMINAL_SCROLLBAR_GAP: f32 = 6.0;
+/// 滚动条轨道上下两端与终端画布之间的内缩
+const TERMINAL_SCROLLBAR_TRACK_INSET: f32 = 2.0;
+/// 滚动条轨道最小高度（小于该值时不显示，避免滑块高度下限超过轨道高度）
+const TERMINAL_SCROLLBAR_MIN_TRACK_HEIGHT: f32 = 24.0;
+/// 滚动条滑块最小高度
+const TERMINAL_SCROLLBAR_MIN_HANDLE_HEIGHT: f32 = 12.0;
+/// 点击终端滚动条空白区域时的页面滚动比例（相对可视行数）
+const TERMINAL_SCROLLBAR_PAGE_FRACTION: f32 = 0.9;
 /// Backspace 键序列（DEL）
 const TERMINAL_BACKSPACE_SEQUENCE: &[u8] = b"\x7f";
 /// Ctrl+Backspace 键序列（Ctrl+W）
@@ -106,6 +124,69 @@ fn terminal_arrow_sequence(key: egui::Key, ctrl: bool) -> Option<&'static [u8]> 
         (egui::Key::ArrowLeft, true) => Some(b"\x1b[1;5D"),
         _ => None,
     }
+}
+
+/// 计算一次滚轮事件应滚动的终端行数
+///
+/// egui 会把一格滚轮换算为 `points_per_notch` 点（原生平台默认 40 点），
+/// 因此按该比例换算为每格 [`TERMINAL_WHEEL_LINES_PER_NOTCH`] 行；
+/// 触控板按滚动距离等比例换算，每次事件至少 1 行、最多 [`TERMINAL_WHEEL_MAX_LINES`] 行
+fn terminal_scroll_lines(scroll_delta: f32, points_per_notch: f32) -> usize {
+    if !scroll_delta.is_finite() || scroll_delta == 0.0 {
+        return 0;
+    }
+
+    let points_per_notch = if points_per_notch.is_finite() && points_per_notch > 0.0 {
+        points_per_notch
+    } else {
+        DEFAULT_SCROLL_POINTS_PER_NOTCH
+    };
+
+    let lines = (scroll_delta.abs() / points_per_notch * TERMINAL_WHEEL_LINES_PER_NOTCH)
+        .round()
+        .clamp(1.0, TERMINAL_WHEEL_MAX_LINES);
+
+    // 已收敛到 1.0..=300.0，转换不会丢失精度
+    lines as usize
+}
+
+/// 计算滚动条滑块的位置与高度（均为 0.0..=1.0 的比例）
+///
+/// 返回 `(滑块顶部位置比例, 滑块高度比例)`；位置 0 表示最早期历史、
+/// 1 表示当前屏幕（滚动偏移为 0）
+fn terminal_scrollbar_ratios(offset: usize, max_offset: usize, visible_rows: u16) -> (f32, f32) {
+    let visible = f32::from(visible_rows);
+    if max_offset == 0 || visible <= 0.0 {
+        return (1.0, 1.0);
+    }
+
+    let max_offset_points = lines_to_f32(max_offset);
+    let total = visible + max_offset_points;
+    let handle = (visible / total).clamp(0.08, 1.0);
+    // 窗口顶部在内容中的行号（0 表示最早的历史行）
+    let start_line = max_offset_points - lines_to_f32(offset.min(max_offset));
+    let position = (start_line / max_offset_points).clamp(0.0, 1.0);
+
+    (position, handle)
+}
+
+/// 将滚动条滑块位置比例换算为滚动偏移（0 表示最底部）
+fn terminal_scrollbar_offset(ratio: f32, max_offset: usize) -> usize {
+    if max_offset == 0 || !ratio.is_finite() {
+        return 0;
+    }
+
+    let max_offset_points = lines_to_f32(max_offset);
+    let clamped = ratio.clamp(0.0, 1.0);
+    let offset = max_offset_points - clamped * max_offset_points;
+
+    // 已裁剪到 0.0..=max_offset 且不超过百万行，转换不会丢失精度
+    offset.round() as usize
+}
+
+/// 滚动行数转浮点（滚动缓冲区有限，裁剪后 f32 可精确表示）
+fn lines_to_f32(lines: usize) -> f32 {
+    lines.min(1_000_000) as f32
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -634,18 +715,21 @@ impl SshClientUi {
                         }
                     }
                 } else if scroll_y != 0.0 {
-                    // 滚轮滚动终端历史
+                    // 滚轮滚动终端历史（每格多行，触控板按滚动距离换算）
+                    let points_per_notch = ui.ctx().options(|options| options.line_scroll_speed);
                     if let Some(tab) = self.current_tab_mut() {
                         if let Some(term) = &mut tab.terminal {
-                            let scrollback = term.scrollback();
-                            let scrollback_size = term.scrollback_size();
-                            if scroll_y > 0.0 && scrollback < scrollback_size {
-                                // 向上滚动
-                                term.set_scrollback(scrollback + 1);
-                                tab.terminal_selection = None;
-                            } else if scroll_y < 0.0 && scrollback > 0 {
-                                // 向下滚动
-                                term.set_scrollback(scrollback - 1);
+                            let lines = terminal_scroll_lines(scroll_y, points_per_notch);
+                            let max_offset = term.scrollback_count();
+                            let current = term.scrollback();
+                            let next = if scroll_y > 0.0 {
+                                current.saturating_add(lines).min(max_offset)
+                            } else {
+                                current.saturating_sub(lines)
+                            };
+
+                            if next != current {
+                                term.set_scrollback(next);
                                 tab.terminal_selection = None;
                             }
                         }
@@ -1185,6 +1269,11 @@ impl SshClientUi {
                     .selectable(false),
             );
             let text_rect = response.rect;
+            // 终端画布：行列固定的文本区域，滚动条与光标可见性都以它为准
+            let terminal_canvas_rect = egui::Rect::from_min_size(
+                text_rect.min,
+                egui::vec2(f32::from(new_cols) * char_width, terminal_content_height),
+            );
 
             if response.clicked_by(egui::PointerButton::Primary) {
                 tab.terminal_selection = None;
@@ -1237,6 +1326,20 @@ impl SshClientUi {
                 );
             }
 
+            // 右侧滚动条：拖动可快速定位历史内容
+            // 以终端画布右缘为基准，放在画布右侧预留的留白内，避免遮挡文字
+            let scrollbar_track = terminal_scrollbar_track(terminal_canvas_rect);
+            if let Some(new_offset) = paint_terminal_scrollbar(
+                ui,
+                scrollbar_track,
+                term.scrollback(),
+                term.scrollback_count(),
+                new_rows,
+            ) {
+                term.set_scrollback(new_offset);
+                tab.terminal_selection = None;
+            }
+
             response.context_menu(|ui| {
                 if ui.button("📋 复制").clicked() {
                     copy_terminal = true;
@@ -1269,10 +1372,6 @@ impl SshClientUi {
                 cursor_display_row,
                 cursor_width,
                 line_height,
-            );
-            let terminal_canvas_rect = egui::Rect::from_min_size(
-                text_rect.min,
-                egui::vec2(f32::from(new_cols) * char_width, terminal_content_height),
             );
 
             // 使用显式终端画布判断可见性，避免最后一行受文本 galley 浮点边界影响
@@ -2700,6 +2799,115 @@ fn terminal_axis_position(relative: f32, cell_size: f32, cell_count: u16) -> u16
     low.min(cell_count - 1)
 }
 
+/// 计算终端滚动条轨道矩形
+///
+/// 以终端画布右缘为基准放在右侧留白内：画布宽度由终端列数决定，
+/// 不随行内容宽度变化，因此滚动条位置稳定且不会遮挡正文
+fn terminal_scrollbar_track(canvas: egui::Rect) -> egui::Rect {
+    let left = canvas.right() + TERMINAL_SCROLLBAR_GAP;
+
+    egui::Rect::from_min_max(
+        egui::pos2(left, canvas.top() + TERMINAL_SCROLLBAR_TRACK_INSET),
+        egui::pos2(
+            left + TERMINAL_SCROLLBAR_WIDTH,
+            canvas.bottom() - TERMINAL_BOTTOM_PADDING,
+        ),
+    )
+}
+
+/// 计算滚动条滑块矩形
+///
+/// 无历史内容或轨道过短（滑块最小高度无法容纳）时返回 `None`
+fn terminal_scrollbar_handle(
+    track: egui::Rect,
+    offset: usize,
+    max_offset: usize,
+    visible_rows: u16,
+) -> Option<egui::Rect> {
+    if max_offset == 0
+        || !track.height().is_finite()
+        || track.height() < TERMINAL_SCROLLBAR_MIN_TRACK_HEIGHT
+    {
+        return None;
+    }
+
+    let (position, handle_ratio) = terminal_scrollbar_ratios(offset, max_offset, visible_rows);
+    let min_height = TERMINAL_SCROLLBAR_MIN_HANDLE_HEIGHT.min(track.height());
+    let handle_height = (track.height() * handle_ratio).clamp(min_height, track.height());
+    let handle_top = track.top() + (track.height() - handle_height) * position;
+
+    Some(egui::Rect::from_min_size(
+        egui::pos2(track.left(), handle_top),
+        egui::vec2(track.width(), handle_height),
+    ))
+}
+
+/// 绘制终端滚动条并返回拖动/点击后的滚动偏移
+///
+/// 拖动滑块按位置比例定位，点击轨道空白处按一页滚动；无历史内容时不显示
+fn paint_terminal_scrollbar(
+    ui: &egui::Ui,
+    track: egui::Rect,
+    offset: usize,
+    max_offset: usize,
+    visible_rows: u16,
+) -> Option<usize> {
+    let handle_rect = terminal_scrollbar_handle(track, offset, max_offset, visible_rows)?;
+
+    let response = ui.interact(
+        track,
+        egui::Id::new("ssh_terminal_scrollbar"),
+        egui::Sense::click_and_drag(),
+    );
+
+    let visuals = ui.style().interact(&response);
+    ui.painter().rect_filled(
+        track,
+        4.0,
+        ui.visuals().widgets.inactive.bg_fill.gamma_multiply(0.25),
+    );
+    ui.painter().rect_filled(handle_rect, 4.0, visuals.bg_fill);
+
+    // 只响应主键，避免右键拖动误改滚动位置
+    if response.dragged_by(egui::PointerButton::Primary) {
+        let pointer = response.interact_pointer_pos()?;
+        // 让滑块中心跟随指针，拖动时不会跳变
+        let travel = (track.height() - handle_rect.height()).max(1.0);
+        let thumb_top = pointer.y - track.top() - handle_rect.height() * 0.5;
+        let ratio = (thumb_top / travel).clamp(0.0, 1.0);
+        return Some(terminal_scrollbar_offset(ratio, max_offset));
+    }
+
+    if response.clicked_by(egui::PointerButton::Primary) {
+        let pointer = response.interact_pointer_pos()?;
+        let page = page_scroll_lines(max_offset, visible_rows);
+
+        if pointer.y < handle_rect.top() {
+            // 点击滑块上方：向上翻页（查看更早内容）
+            return Some(offset.saturating_add(page).min(max_offset));
+        }
+        if pointer.y > handle_rect.bottom() {
+            // 点击滑块下方：向下翻页（返回较新内容）
+            return Some(offset.saturating_sub(page));
+        }
+    }
+
+    None
+}
+
+/// 计算点击滚动条空白处时滚动的行数（按可视行数折算，不超过可用历史）
+fn page_scroll_lines(max_offset: usize, visible_rows: u16) -> usize {
+    if max_offset == 0 {
+        return 0;
+    }
+
+    let page = (f32::from(visible_rows) * TERMINAL_SCROLLBAR_PAGE_FRACTION).round();
+    let page = lines_to_f32(max_offset).min(page.max(1.0));
+
+    // 已裁剪到 1.0..=max_offset，转换不会丢失精度
+    page as usize
+}
+
 /// 绘制终端选区
 ///
 /// 每行的起止位置按该行实际渲染宽度计算，宽字符（中文）下与文字对齐；
@@ -2906,15 +3114,20 @@ mod tests {
     use std::sync::mpsc;
 
     use super::{
-        SshClientUi, TERMINAL_BACKSPACE_SEQUENCE, TERMINAL_BOTTOM_PADDING,
-        TERMINAL_WORD_DELETE_SEQUENCE, TabSwitchDirection, TerminalClipboardAction,
-        TerminalEmulator, TerminalTextLayout, accepted_terminal_paste_text,
-        analyze_terminal_clipboard_events, has_active_transfer, paint_terminal_selection,
-        remote_parent_path, round_to_pixel, send_remote_directory_request, send_terminal_paste,
-        switched_tab_index, tab_switch_direction, tab_switch_shortcut_from_events,
-        terminal_arrow_sequence, terminal_backspace_sequence, terminal_clipboard_action,
-        terminal_content_rows, terminal_cursor_display_row, terminal_cursor_in_view,
-        terminal_cursor_rect, terminal_ime_cursor_rect, terminal_position_from_pointer,
+        DEFAULT_SCROLL_POINTS_PER_NOTCH, SshClientUi, TERMINAL_BACKSPACE_SEQUENCE,
+        TERMINAL_BOTTOM_PADDING, TERMINAL_SCROLLBAR_GAP, TERMINAL_SCROLLBAR_MIN_HANDLE_HEIGHT,
+        TERMINAL_SCROLLBAR_MIN_TRACK_HEIGHT, TERMINAL_SCROLLBAR_TRACK_INSET,
+        TERMINAL_SCROLLBAR_WIDTH, TERMINAL_WHEEL_MAX_LINES, TERMINAL_WORD_DELETE_SEQUENCE,
+        TabSwitchDirection, TerminalClipboardAction, TerminalEmulator, TerminalTextLayout,
+        accepted_terminal_paste_text, analyze_terminal_clipboard_events, has_active_transfer,
+        page_scroll_lines, paint_terminal_selection, remote_parent_path, round_to_pixel,
+        send_remote_directory_request, send_terminal_paste, switched_tab_index,
+        tab_switch_direction, tab_switch_shortcut_from_events, terminal_arrow_sequence,
+        terminal_backspace_sequence, terminal_clipboard_action, terminal_content_rows,
+        terminal_cursor_display_row, terminal_cursor_in_view, terminal_cursor_rect,
+        terminal_ime_cursor_rect, terminal_position_from_pointer, terminal_scroll_lines,
+        terminal_scrollbar_handle, terminal_scrollbar_offset, terminal_scrollbar_ratios,
+        terminal_scrollbar_track,
     };
     use crate::plugins::ssh_client::models::{
         SessionTab, SftpRequest, SshInput, TerminalSelection,
@@ -3508,6 +3721,165 @@ mod tests {
             cjk_width,
             latin_width * 2.0
         );
+    }
+
+    #[test]
+    fn terminal_wheel_scrolls_multiple_lines_per_notch() {
+        // 一格滚轮 = 40 点（egui 原生默认），滚动 3 行
+        assert_eq!(
+            terminal_scroll_lines(40.0, DEFAULT_SCROLL_POINTS_PER_NOTCH),
+            3
+        );
+        assert_eq!(
+            terminal_scroll_lines(-40.0, DEFAULT_SCROLL_POINTS_PER_NOTCH),
+            3
+        );
+        // 触控板小幅滚动至少 1 行
+        assert_eq!(
+            terminal_scroll_lines(8.0, DEFAULT_SCROLL_POINTS_PER_NOTCH),
+            1
+        );
+        assert_eq!(
+            terminal_scroll_lines(-1.0, DEFAULT_SCROLL_POINTS_PER_NOTCH),
+            1
+        );
+        // 按滚动距离等比换算
+        assert_eq!(
+            terminal_scroll_lines(120.0, DEFAULT_SCROLL_POINTS_PER_NOTCH),
+            9
+        );
+        // 惯性滚动不超过上限
+        assert_eq!(
+            terminal_scroll_lines(100_000.0, DEFAULT_SCROLL_POINTS_PER_NOTCH),
+            TERMINAL_WHEEL_MAX_LINES as usize
+        );
+        // 滚轮速度可由 egui 配置改变
+        assert_eq!(terminal_scroll_lines(80.0, 80.0), 3);
+        // 非法的每格距离回退到默认值
+        assert_eq!(terminal_scroll_lines(40.0, 0.0), 3);
+        assert_eq!(terminal_scroll_lines(40.0, f32::NAN), 3);
+        // 无滚动与非法值
+        assert_eq!(
+            terminal_scroll_lines(0.0, DEFAULT_SCROLL_POINTS_PER_NOTCH),
+            0
+        );
+        assert_eq!(
+            terminal_scroll_lines(f32::NAN, DEFAULT_SCROLL_POINTS_PER_NOTCH),
+            0
+        );
+        assert_eq!(
+            terminal_scroll_lines(f32::INFINITY, DEFAULT_SCROLL_POINTS_PER_NOTCH),
+            0
+        );
+    }
+
+    #[test]
+    fn terminal_scrollbar_track_stays_right_of_canvas() {
+        let canvas = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(800.0, 400.0));
+        let track = terminal_scrollbar_track(canvas);
+
+        // 轨道位于终端画布右侧，宽度固定
+        assert_eq!(track.width(), TERMINAL_SCROLLBAR_WIDTH);
+        assert_eq!(track.left(), canvas.right() + TERMINAL_SCROLLBAR_GAP);
+        // 轨道上下留出内缩与底部间距，不超出画布
+        assert_eq!(track.top(), canvas.top() + TERMINAL_SCROLLBAR_TRACK_INSET);
+        assert_eq!(track.bottom(), canvas.bottom() - TERMINAL_BOTTOM_PADDING);
+    }
+
+    #[test]
+    fn terminal_scrollbar_handle_geometry() {
+        let track = egui::Rect::from_min_size(egui::pos2(100.0, 50.0), egui::vec2(8.0, 200.0));
+
+        // 无历史内容时不显示
+        assert_eq!(terminal_scrollbar_handle(track, 0, 0, 20), None);
+        // 轨道过短时不显示（滑块最小高度无法容纳，且不能触发 clamp panic）
+        let short_track = egui::Rect::from_min_size(egui::pos2(100.0, 50.0), egui::vec2(8.0, 8.0));
+        assert_eq!(terminal_scrollbar_handle(short_track, 0, 500, 20), None);
+        // 高度非法时同样不显示
+        let invalid_track =
+            egui::Rect::from_min_size(egui::pos2(100.0, 50.0), egui::vec2(8.0, f32::NAN));
+        assert_eq!(terminal_scrollbar_handle(invalid_track, 0, 500, 20), None);
+        // 恰好达到最小轨道高度时正常显示
+        let min_track = egui::Rect::from_min_size(
+            egui::pos2(100.0, 50.0),
+            egui::vec2(8.0, TERMINAL_SCROLLBAR_MIN_TRACK_HEIGHT),
+        );
+        assert!(terminal_scrollbar_handle(min_track, 0, 500, 20).is_some());
+
+        // 当前屏幕：滑块贴底
+        let bottom = terminal_scrollbar_handle(track, 0, 500, 20);
+        let Some(bottom) = bottom else {
+            panic!("应显示滚动条");
+        };
+        assert_eq!(bottom.bottom(), track.bottom());
+        assert_eq!(bottom.left(), track.left());
+        assert_eq!(bottom.width(), track.width());
+
+        // 最早历史：滑块贴顶
+        let top = terminal_scrollbar_handle(track, 500, 500, 20);
+        let Some(top) = top else {
+            panic!("应显示滚动条");
+        };
+        assert_eq!(top.top(), track.top());
+
+        // 历史很长时滑块高度按比例缩小
+        let handle = terminal_scrollbar_handle(track, 0, 10_000, 20);
+        let Some(handle) = handle else {
+            panic!("应显示滚动条");
+        };
+        assert_eq!(handle.height(), 16.0);
+
+        // 比例缩到最小高度以下时使用下限
+        let medium_track =
+            egui::Rect::from_min_size(egui::pos2(100.0, 50.0), egui::vec2(8.0, 30.0));
+        let handle = terminal_scrollbar_handle(medium_track, 0, 10_000, 20);
+        let Some(handle) = handle else {
+            panic!("应显示滚动条");
+        };
+        assert_eq!(handle.height(), TERMINAL_SCROLLBAR_MIN_HANDLE_HEIGHT);
+    }
+
+    #[test]
+    fn terminal_scrollbar_ratios_follow_scroll_offset() {
+        // 可视 20 行、历史 100 行：滑块占轨道 1/6
+        let handle_ratio = 20.0 / 120.0;
+        // 当前屏幕：滑块位于底部
+        assert_eq!(terminal_scrollbar_ratios(0, 100, 20), (1.0, handle_ratio));
+        // 最早历史：滑块位于顶部
+        assert_eq!(terminal_scrollbar_ratios(100, 100, 20), (0.0, handle_ratio));
+        // 中间位置：滑块居中
+        let (position, handle) = terminal_scrollbar_ratios(50, 100, 20);
+        assert!((position - 0.5).abs() < 0.001);
+        assert!((handle - handle_ratio).abs() < 0.001);
+        // 偏移越界时按上限处理
+        assert_eq!(terminal_scrollbar_ratios(999, 100, 20), (0.0, handle_ratio));
+        // 无历史时不显示
+        assert_eq!(terminal_scrollbar_ratios(0, 0, 20), (1.0, 1.0));
+        // 滑块高度有下限，避免历史很长时过小
+        let (_, tiny_handle) = terminal_scrollbar_ratios(0, 10_000, 20);
+        assert!((tiny_handle - 0.08).abs() < 0.001);
+    }
+
+    #[test]
+    fn terminal_scrollbar_offset_maps_ratio_to_scrollback() {
+        // 滑块在底部对应滚动偏移 0，顶部对应最早历史
+        assert_eq!(terminal_scrollbar_offset(1.0, 500), 0);
+        assert_eq!(terminal_scrollbar_offset(0.0, 500), 500);
+        assert_eq!(terminal_scrollbar_offset(0.5, 500), 250);
+        // 越界与非法值收敛
+        assert_eq!(terminal_scrollbar_offset(-3.0, 500), 500);
+        assert_eq!(terminal_scrollbar_offset(9.0, 500), 0);
+        assert_eq!(terminal_scrollbar_offset(f32::NAN, 500), 0);
+        assert_eq!(terminal_scrollbar_offset(0.5, 0), 0);
+    }
+
+    #[test]
+    fn terminal_scrollbar_page_scrolls_visible_rows() {
+        assert_eq!(page_scroll_lines(1000, 20), 18);
+        // 历史不足一页时按可用行数滚动
+        assert_eq!(page_scroll_lines(5, 20), 5);
+        // 至少滚动 1 行
+        assert_eq!(page_scroll_lines(1, 20), 1);
     }
 
     #[test]

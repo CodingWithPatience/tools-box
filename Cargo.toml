@@ -78,3 +78,5 @@ windows-sys = { version = "0.60", features = [
 [patch.crates-io]
 # Windows 下保留 Ctrl+Shift+C/V 的 Key 事件，供 SSH 终端可靠区分控制键与剪贴板快捷键。
 egui-winit = { path = "vendor/egui-winit-0.31.1" }
+# 修复滚动偏移超过屏幕行数时的无符号下溢，并暴露历史行数供终端滚动条使用。
+vt100 = { path = "vendor/vt100-0.15.2" }
