@@ -98,8 +98,9 @@ src/
 │   │   └── processor.rs    # JSON 处理逻辑（格式化、压缩、转义）
 │   └── hosts_manager/
 │       ├── mod.rs          # Hosts 管理器插件入口
-│       ├── ui.rs           # UI 渲染逻辑
-│       └── parser.rs       # Hosts 文件解析
+│       ├── ui.rs           # UI 渲染逻辑（环境列表、条目管理、应用确认、导入）
+│       ├── store.rs        # 数据库 CRUD（环境与条目、启用状态、字段校验）
+│       └── parser.rs       # Hosts 文件解析/生成、管理区域校验、原子写入、冲突检测
 └── utils/
     ├── mod.rs
     └── clipboard.rs        # 剪贴板工具
@@ -382,6 +383,7 @@ src/
 | 4.5 | 备份机制 | 应用前自动备份，备份失败则中止写入 | ✅ |
 | 4.6 | 应用到系统 | 合并所有已启用环境，写入同一管理区域（原子替换） | ✅ |
 | 4.7 | 冲突检测 | 同名主机映射到不同 IP 时提示并确认 | ✅ |
+| 4.8 | 从系统导入 | 跳过管理区域与禁用条目，按 (IP, 主机名) 去重导入 | ✅ |
 
 **阶段四产出文件：**
 - `src/plugins/hosts_manager/mod.rs` — 插件入口，数据库连接管理
@@ -445,7 +447,7 @@ CREATE INDEX idx_passwords_name ON passwords(name);
 ### 6.2 Hosts 管理器
 
 ```sql
--- Hosts 环境
+-- Hosts 环境（is_active 为 TRUE 的环境可同时存在多个）
 CREATE TABLE hosts_environments (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     name       TEXT NOT NULL UNIQUE,
@@ -454,7 +456,7 @@ CREATE TABLE hosts_environments (
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
--- Hosts 条目
+-- Hosts 条目（is_enabled 为 FALSE 的条目在 hosts 中以注释形式保留）
 CREATE TABLE hosts_entries (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     environment_id INTEGER NOT NULL,
@@ -468,6 +470,8 @@ CREATE TABLE hosts_entries (
 
 CREATE INDEX idx_hosts_entries_env ON hosts_entries(environment_id);
 ```
+
+说明：`hosts_environments.name` 与 `hosts_entries` 的 `(ip_address, hostname, comment)` 在写入前由 `store.rs` 校验（去除首尾空白并回写规范化结果；拒绝控制字符，环境名与 IP/主机名额外拒绝 `#` 与空白字符，备注允许 `#`），避免破坏系统 hosts 结构。
 
 ---
 
@@ -550,6 +554,7 @@ cargo fmt
 [打开插件] → [环境列表]
               ├── [新增环境] → [填写名称] → [添加条目] → [保存]
               ├── [编辑环境] → [修改条目] → [保存]
+              ├── [条目] → [新增/编辑/删除条目] / [从系统导入]（跳过管理区域与禁用条目，去重）
               ├── [启用/禁用环境] → [只更新该环境状态]（可多选）
               └── [应用到系统] → [合并所有已启用环境]
                                   ├── 无冲突 → [备份] → [写入系统 hosts]（临时文件 + 重命名）
@@ -558,4 +563,4 @@ cargo fmt
                                                           └─ [取消]       → [不写入]
 ```
 
-> 写入说明：Unix 下替换成功后恢复原文件权限；系统 hosts 中由用户自行维护的条目不受影响。
+> 写入说明：Unix 下替换成功后恢复原文件权限；目录不可写等场景下原子写入失败会回退为直接覆盖写入（此时依赖应用前的备份兜底）；系统 hosts 中由用户自行维护的条目不受影响。
