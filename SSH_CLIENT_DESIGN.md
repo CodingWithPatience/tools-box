@@ -23,6 +23,7 @@
 | SFTP 文件下载 | 从远程服务器下载文件到本地 | P1 | ✅ |
 | 终端字体大小调节 | 支持 Ctrl+滚轮 调整终端字体大小 | P2 | ✅ |
 | 终端单词级编辑 | Ctrl+左右箭头按单词移动光标，Ctrl+Backspace 删除前一个单词 | P2 | ✅ |
+| 终端编辑键 | Home/End 跳转行首行尾（序列跟随远端 DECCKM），Ctrl+Home/Ctrl+End 跳首尾，Insert/Delete/PageUp/PageDown 与 xterm 对齐 | P2 | ✅ |
 | 终端日志 | 会话日志记录到本地文件 | P2 | ⬜ |
 | 多标签会话 | 同时连接多台服务器，标签切换（支持 Ctrl+Tab / Ctrl+Shift+Tab） | P2 | ✅ |
 
@@ -231,10 +232,20 @@ egui 键盘事件处理策略：
 | Escape | 发送 `\x1b` |
 | 方向键 | 发送 ANSI 转义序列 (`\x1b[A` 等) |
 | Ctrl+左右箭头 | 发送 `\x1b[1;5D` / `\x1b[1;5C`，按单词移动光标 |
+| Home / End | 发送 `\x1b[H` / `\x1b[F`（普通模式）或 `\x1bOH` / `\x1bOF`（应用光标键模式），跳到行首 / 行尾 |
+| Ctrl+Home / Ctrl+End | 发送 `\x1b[1;5H` / `\x1b[1;5F`，跳到输入区 / 文档首尾（vim 插入模式等） |
+| Insert / Delete | 发送 `\x1b[2~` / `\x1b[3~`，序列固定为 CSI 形式，不受 DECCKM 影响 |
+| PageUp / PageDown | 发送 `\x1b[5~` / `\x1b[6~`，翻页由远端程序处理（本地历史仍用滚轮 / 滚动条） |
 | Ctrl+滚轮 | 调整终端字体大小（不发送到 SSH） |
 | Ctrl+Tab / Ctrl+Shift+Tab | 切换到下一个 / 上一个会话标签（循环，不发送到 SSH） |
 
 说明：Ctrl+Backspace 与 Ctrl+左右箭头的单词级操作依赖远端 shell 处于默认的 emacs 编辑模式（bash/readline、zsh、fish 默认绑定）；vi 编辑模式下不生效。方向键仅识别 Ctrl，Shift/Alt 组合不会改变发送的序列（与改动前一致）。
+
+方向键有意保持 CSI 形式、不跟随 DECCKM（多数全屏程序对两种形式都有兜底识别），本次仅让新增的编辑键跟随远端模式，避免影响既有输入行为。
+
+Home/End 的序列形式跟随远端状态：远端程序（vim、less 等）通过 `smkx` 打开应用光标键模式（DECCKM，由 `vt100` 解析 `\x1b[?1h` / `\x1b[?1l` 得到）后发送 SS3 形式，与 xterm 及 terminfo 的 `khome` / `kend` 保持一致；带 Ctrl 修饰键时统一使用 xterm 的 `CSI 1;5` 形式，不受该模式影响。Insert/Delete/PageUp/PageDown 固定使用 `CSI n ~` 形式。编辑键与方向键一致，只区分无修饰键与 Ctrl 组合：Shift/Alt 组合不改变发送的序列（Shift+Home 等同普通 Home），Ctrl+Delete、Ctrl+PageUp 等不映射。
+
+Ctrl+Insert、Shift+Insert、Shift+Delete 不进入编辑键映射：Windows 下 patched `egui-winit` 会在产生 Key 事件之前把它们转换为系统 Copy/Paste/Cut 事件。其中 Ctrl+Insert 产生的 Copy 事件在终端视图按普通 `Ctrl+C` 处理（即向远端发送中断信号 `0x03`），Shift+Insert 的 Paste 事件与 Shift+Delete 的 Cut 事件在终端视图当前无对应处理，均为本次改动前既有行为，未随本次改动调整。
 
 输入捕获策略：终端区域获得 egui focus 后，通过 `ui.input(|i| i.events.iter())` 捕获所有键盘事件，过滤掉全局快捷键（如 Ctrl+1~9 切换插件），其余转发到 SSH。
 
@@ -721,6 +732,45 @@ Windows 会话而忽略），其中历史窗口用例在 debug 构建下验证�
 验证说明：`cargo test` 共 210 项测试（209 项通过、1 项因需要交互式 Windows 会话而忽略），
 `cargo test ssh_client` 78 项全部通过；`cargo build`、独立目标目录 release 构建通过；
 `cargo fmt --check` 与 `cargo clippy --all-targets` 对本次改动无差异、无新增告警。
+
+### 11.8 终端编辑键支持：Home/End 跳转行首行尾（2026-09-22）
+
+问题：终端不响应 Home/End（同样不响应 Insert/Delete/PageUp/PageDown）。按键在本地被完全丢弃，
+远端既收不到序列、光标也不移动。
+
+原因：`process_terminal_input` 的 `Event::Key` 分支只覆盖 Enter、Backspace、Tab、Escape、
+Ctrl+D/Z/L 与方向键，`egui::Key::Home`/`Key::End` 等编辑键没有任何匹配分支，事件既不发送也不消费。
+egui 侧无干扰（`EventFilter` 只涉及 tab、方向键与 escape，不会吞掉编辑键）。
+
+完成结果：
+
+- `terminal.rs`：新增 `TerminalEmulator::application_cursor()`，封装 vt100 的
+  `Screen::application_cursor()`，读取远端是否通过 `smkx` 打开应用光标键模式（DECCKM）。
+- `ui.rs`：新增 `terminal_edit_key_sequence(key, ctrl, application_cursor)` 映射，并在
+  `process_terminal_input` 中按方向键相同的路径发送（`consume_key` + `had_input`，
+  输入后视图自动回到底部）：
+  - Home / End：普通模式 `\x1b[H` / `\x1b[F`，应用光标键模式 `\x1bOH` / `\x1bOF`
+    （与 xterm 及 terminfo 的 `khome` / `kend` 一致，bash/readline 与 vim/less 均可识别）；
+  - Ctrl+Home / Ctrl+End：`\x1b[1;5H` / `\x1b[1;5F`，带修饰键时统一为 CSI 1;5 形式，不受 DECCKM 影响；
+  - Insert / Delete / PageUp / PageDown：`\x1b[2~` / `\x1b[3~` / `\x1b[5~` / `\x1b[6~`，固定 CSI 形式；
+  - Ctrl+Insert、Shift+Insert、Shift+Delete 由平台层转换为系统 Copy/Paste/Cut 事件，不发送到远端。
+- 本地历史滚动不受影响：PageUp/PageDown 发送远端序列，本地仍由滚轮与滚动条控制。
+
+测试覆盖（新增 4 项）：
+
+- `terminal::tests::application_cursor_follows_decckm_mode`：`\x1b[?1h` / `\x1b[?1l` 正确切换
+  DECCKM 状态
+- `ui::tests::terminal_home_end_follow_application_cursor_mode`：普通模式 CSI 形式、应用模式 SS3
+  形式、Ctrl 修饰键的 CSI 1;5 形式
+- `ui::tests::terminal_edit_keys_send_xterm_sequences`：Insert/Delete/PageUp/PageDown 的 `CSI n ~`
+  序列，以及 Ctrl 组合与普通字母键返回 `None`
+- `ui::tests::terminal_home_end_are_forwarded_to_remote`：经真实 `process_terminal_input` 管线驱动，
+  断言普通模式发送 `\x1b[H` / `\x1b[F`、远端开启 DECCKM 后发送 `\x1bOH` / `\x1bOF`
+
+验证说明：`cargo test` 共 228 项测试（227 项通过、1 项因需要交互式 Windows 会话而忽略），
+`cargo test ssh_client` 82 项全部通过；`cargo build`、`cargo build --release` 通过；
+`rustfmt --check` 对本次改动文件无差异，`cargo clippy --all-targets` 无新增告警
+（bin 66 项、test 69 项与改动前一致）。
 
 ---
 

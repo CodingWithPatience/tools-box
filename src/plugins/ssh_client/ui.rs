@@ -126,6 +126,36 @@ fn terminal_arrow_sequence(key: egui::Key, ctrl: bool) -> Option<&'static [u8]> 
     }
 }
 
+/// 终端编辑键序列：Home/End 跳转行首行尾、Insert/Delete/PageUp/PageDown 与 xterm 对齐
+///
+/// Home/End 在普通模式下发送 CSI 形式（`ESC [ H` / `ESC [ F`），远端开启应用光标键模式
+/// （DECCKM，由 vim/less 等全屏程序打开）后发送 SS3 形式（`ESC O H` / `ESC O F`）；
+/// Ctrl+Home/Ctrl+End 发送 xterm 带修饰键的 `CSI 1;5 H/F` 形式（带修饰键时不受 DECCKM 影响）。
+/// Insert/Delete/PageUp/PageDown 固定为 `CSI n ~` 形式，该形式不受 DECCKM 影响。
+///
+/// 与方向键一致，这里只区分 Ctrl 修饰键，Shift/Alt 组合不改变发送的序列；
+/// Ctrl+Insert、Shift+Insert、Shift+Delete 在 Windows 上由 `egui-winit` 提前转换为
+/// 系统 Copy/Paste/Cut 事件（不产生 Key 事件），因此不会进入本映射。
+fn terminal_edit_key_sequence(
+    key: egui::Key,
+    ctrl: bool,
+    application_cursor: bool,
+) -> Option<&'static [u8]> {
+    match (key, ctrl, application_cursor) {
+        (egui::Key::Home, true, _) => Some(b"\x1b[1;5H"),
+        (egui::Key::Home, false, false) => Some(b"\x1b[H"),
+        (egui::Key::Home, false, true) => Some(b"\x1bOH"),
+        (egui::Key::End, true, _) => Some(b"\x1b[1;5F"),
+        (egui::Key::End, false, false) => Some(b"\x1b[F"),
+        (egui::Key::End, false, true) => Some(b"\x1bOF"),
+        (egui::Key::Insert, false, _) => Some(b"\x1b[2~"),
+        (egui::Key::Delete, false, _) => Some(b"\x1b[3~"),
+        (egui::Key::PageUp, false, _) => Some(b"\x1b[5~"),
+        (egui::Key::PageDown, false, _) => Some(b"\x1b[6~"),
+        _ => None,
+    }
+}
+
 /// 计算一次滚轮事件应滚动的终端行数
 ///
 /// egui 会把一格滚轮换算为 `points_per_notch` 点（原生平台默认 40 点），
@@ -1825,6 +1855,12 @@ impl SshClientUi {
     ) -> bool {
         let mut had_input = false;
         let mut ime_active = self.current_tab().map(|t| t.ime_active).unwrap_or(false);
+        // Home/End 的序列形式取决于远端是否开启应用光标键模式（DECCKM）
+        let application_cursor = self
+            .current_tab()
+            .and_then(|tab| tab.terminal.as_ref())
+            .map(TerminalEmulator::application_cursor)
+            .unwrap_or(false);
         let current_time = ctx.input(|i| i.time);
         let paste_deadline = self
             .current_tab()
@@ -1903,6 +1939,15 @@ impl SshClientUi {
                         }
                         if let Some(sequence) = terminal_arrow_sequence(key, modifiers.ctrl) {
                             // Ctrl+左右箭头按单词移动
+                            let _ = tx.send(SshInput::KeyInput(sequence.to_vec()));
+                            i.consume_key(modifiers, key);
+                            had_input = true;
+                            continue;
+                        }
+                        if let Some(sequence) =
+                            terminal_edit_key_sequence(key, modifiers.ctrl, application_cursor)
+                        {
+                            // Home/End 跳转行首行尾，Insert/Delete/PageUp/PageDown 发送对应序列
                             let _ = tx.send(SshInput::KeyInput(sequence.to_vec()));
                             i.consume_key(modifiers, key);
                             had_input = true;
@@ -3125,9 +3170,9 @@ mod tests {
         tab_switch_direction, tab_switch_shortcut_from_events, terminal_arrow_sequence,
         terminal_backspace_sequence, terminal_clipboard_action, terminal_content_rows,
         terminal_cursor_display_row, terminal_cursor_in_view, terminal_cursor_rect,
-        terminal_ime_cursor_rect, terminal_position_from_pointer, terminal_scroll_lines,
-        terminal_scrollbar_handle, terminal_scrollbar_offset, terminal_scrollbar_ratios,
-        terminal_scrollbar_track,
+        terminal_edit_key_sequence, terminal_ime_cursor_rect, terminal_position_from_pointer,
+        terminal_scroll_lines, terminal_scrollbar_handle, terminal_scrollbar_offset,
+        terminal_scrollbar_ratios, terminal_scrollbar_track,
     };
     use crate::plugins::ssh_client::models::{
         SessionTab, SftpRequest, SshInput, TerminalSelection,
@@ -3291,6 +3336,129 @@ mod tests {
             TERMINAL_WORD_DELETE_SEQUENCE
         );
         assert_eq!(terminal_backspace_sequence(true), b"\x17");
+    }
+
+    #[test]
+    fn terminal_home_end_follow_application_cursor_mode() {
+        // 普通模式：xterm 的 CSI 形式，readline 类行编辑移动到行首/行尾
+        assert_eq!(
+            terminal_edit_key_sequence(egui::Key::Home, false, false),
+            Some(&b"\x1b[H"[..])
+        );
+        assert_eq!(
+            terminal_edit_key_sequence(egui::Key::End, false, false),
+            Some(&b"\x1b[F"[..])
+        );
+
+        // 应用光标键模式（DECCKM）：SS3 形式，与 vim/less 的 terminfo 一致
+        assert_eq!(
+            terminal_edit_key_sequence(egui::Key::Home, false, true),
+            Some(&b"\x1bOH"[..])
+        );
+        assert_eq!(
+            terminal_edit_key_sequence(egui::Key::End, false, true),
+            Some(&b"\x1bOF"[..])
+        );
+
+        // 带 Ctrl 修饰键时统一为 CSI 1;5 形式，不受 DECCKM 影响
+        assert_eq!(
+            terminal_edit_key_sequence(egui::Key::Home, true, false),
+            Some(&b"\x1b[1;5H"[..])
+        );
+        assert_eq!(
+            terminal_edit_key_sequence(egui::Key::End, true, true),
+            Some(&b"\x1b[1;5F"[..])
+        );
+    }
+
+    #[test]
+    fn terminal_edit_keys_send_xterm_sequences() {
+        for (key, expected) in [
+            (egui::Key::Insert, &b"\x1b[2~"[..]),
+            (egui::Key::Delete, &b"\x1b[3~"[..]),
+            (egui::Key::PageUp, &b"\x1b[5~"[..]),
+            (egui::Key::PageDown, &b"\x1b[6~"[..]),
+        ] {
+            assert_eq!(
+                terminal_edit_key_sequence(key, false, false),
+                Some(expected),
+                "{key:?} 应发送 xterm 的 CSI n ~ 序列"
+            );
+            // 该形式不受应用光标键模式影响
+            assert_eq!(terminal_edit_key_sequence(key, false, true), Some(expected));
+        }
+
+        // 带 Ctrl 的组合返回 None；Ctrl+Insert / Shift+Insert / Shift+Delete 在平台层
+        // 已转换为系统 Copy/Paste/Cut 事件，不会以 Key 事件形式到达这里
+        assert_eq!(
+            terminal_edit_key_sequence(egui::Key::Insert, true, false),
+            None
+        );
+        assert_eq!(
+            terminal_edit_key_sequence(egui::Key::Delete, true, false),
+            None
+        );
+        assert_eq!(
+            terminal_edit_key_sequence(egui::Key::PageUp, true, false),
+            None
+        );
+        // 其他按键不产生序列
+        assert_eq!(terminal_edit_key_sequence(egui::Key::A, false, false), None);
+    }
+
+    /// 把按键送入真实终端输入管线，返回发送到远端的字节序列
+    fn forward_terminal_keys(
+        ssh_ui: &mut SshClientUi,
+        tx: &mpsc::SyncSender<SshInput>,
+        rx: &mpsc::Receiver<SshInput>,
+        keys: &[egui::Key],
+    ) -> Vec<Vec<u8>> {
+        let ctx = egui::Context::default();
+        let mut raw_input = egui::RawInput::default();
+        for key in keys {
+            raw_input
+                .events
+                .push(key_event(*key, egui::Modifiers::NONE));
+        }
+
+        let mut had_input = false;
+        let _ = ctx.run(raw_input, |ctx| {
+            had_input = ssh_ui.process_terminal_input(tx, ctx);
+        });
+        assert!(had_input, "编辑键应被识别为终端输入");
+
+        let mut sent = Vec::new();
+        while let Ok(SshInput::KeyInput(bytes)) = rx.try_recv() {
+            sent.push(bytes);
+        }
+        sent
+    }
+
+    #[test]
+    fn terminal_home_end_are_forwarded_to_remote() {
+        let (tx, rx) = mpsc::sync_channel(16);
+        let mut ssh_ui = SshClientUi::new();
+        ssh_ui.tabs.push(SessionTab::new(1, "测试".to_string()));
+        ssh_ui.active_tab_index = Some(0);
+
+        assert_eq!(
+            forward_terminal_keys(&mut ssh_ui, &tx, &rx, &[egui::Key::Home, egui::Key::End]),
+            vec![b"\x1b[H".to_vec(), b"\x1b[F".to_vec()],
+            "普通模式下 Home/End 应发送 CSI 形式的行首行尾序列"
+        );
+
+        // 远端开启应用光标键模式（DECCKM）后改用 SS3 形式
+        let mut terminal = TerminalEmulator::new(80, 24, 14.0);
+        terminal.process(b"\x1b[?1h");
+        if let Some(tab) = ssh_ui.current_tab_mut() {
+            tab.terminal = Some(terminal);
+        }
+
+        assert_eq!(
+            forward_terminal_keys(&mut ssh_ui, &tx, &rx, &[egui::Key::Home, egui::Key::End]),
+            vec![b"\x1bOH".to_vec(), b"\x1bOF".to_vec()],
+            "应用光标键模式下 Home/End 应发送 SS3 形式"
+        );
     }
 
     #[test]

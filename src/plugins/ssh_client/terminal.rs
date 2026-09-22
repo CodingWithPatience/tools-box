@@ -98,6 +98,14 @@ impl TerminalEmulator {
         (col, row)
     }
 
+    /// 远端是否启用了应用光标键模式（DECCKM）
+    ///
+    /// 该模式由远端程序（vim、less 等通过 smkx）开启；开启后 Home/End 需发送
+    /// SS3（`ESC O x`）序列而非 CSI（`ESC [ x`）序列，与 xterm 行为一致
+    pub fn application_cursor(&self) -> bool {
+        self.parser.screen().application_cursor()
+    }
+
     /// 获取当前可见终端的纯文本内容
     pub fn visible_text(&self) -> String {
         self.parser.screen().contents()
@@ -541,6 +549,24 @@ mod tests {
                 .iter()
                 .filter(|section| section.format.color == ANSI_PALETTE_DARK[4])
                 .all(|section| section.format.background == Color32::TRANSPARENT)
+        );
+    }
+
+    #[test]
+    fn application_cursor_follows_decckm_mode() {
+        let mut terminal = TerminalEmulator::new(20, 5, 14.0);
+        assert!(!terminal.application_cursor(), "默认应为普通光标键模式");
+
+        terminal.process(b"\x1b[?1h");
+        assert!(
+            terminal.application_cursor(),
+            "DECSET 1（smkx）应开启应用光标键模式"
+        );
+
+        terminal.process(b"\x1b[?1l");
+        assert!(
+            !terminal.application_cursor(),
+            "DECRST 1（rmkx）应关闭应用光标键模式"
         );
     }
 
