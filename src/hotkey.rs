@@ -18,6 +18,11 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 pub struct HotkeyEvent {
     /// 插件索引（0 表示唤出主窗口/最近工具）
     pub plugin_index: usize,
+    /// 热键按下时主窗口是否已位于桌面最前层
+    ///
+    /// 切换热键（`usize::MAX`）据此决定隐藏到托盘还是唤出到最前层；
+    /// 必须在唤醒窗口之前采样，唤醒本身会激活窗口使采样失真。
+    pub window_in_front: bool,
 }
 
 /// 热键绑定配置
@@ -37,21 +42,33 @@ pub struct HotkeyBinding {
 /// 使用 std::sync::OnceLock 确保线程安全
 static HOTKEY_EGUI_CTX: std::sync::OnceLock<egui::Context> = std::sync::OnceLock::new();
 
-/// 转发全局热键事件，并在发送成功后唤醒主窗口。
+/// 判断热键事件是否需要唤醒主窗口。
+///
+/// 窗口已在前台且按下的是切换热键（`usize::MAX`）时，按键意图是隐藏到系统托盘；
+/// 此时若仍唤醒窗口，会先把窗口激活，主线程就会把本次按键误判为「已显示」而重复隐藏。
+fn should_wake_main_window(event: &HotkeyEvent) -> bool {
+    event.plugin_index != usize::MAX || !event.window_in_front
+}
+
+/// 转发全局热键事件，并在需要唤出窗口时唤醒主窗口。
 fn dispatch_hotkey_event(
     tx: &mpsc::Sender<HotkeyEvent>,
     event: HotkeyEvent,
 ) -> Result<(), mpsc::SendError<HotkeyEvent>> {
-    dispatch_hotkey_event_with_wake(tx, event, crate::tray::wake_main_window)
+    let should_wake = should_wake_main_window(&event);
+    dispatch_hotkey_event_with_wake(tx, event, should_wake, crate::tray::wake_main_window)
 }
 
 fn dispatch_hotkey_event_with_wake(
     tx: &mpsc::Sender<HotkeyEvent>,
     event: HotkeyEvent,
+    should_wake: bool,
     wake_main_window: impl FnOnce(),
 ) -> Result<(), mpsc::SendError<HotkeyEvent>> {
     tx.send(event)?;
-    wake_main_window();
+    if should_wake {
+        wake_main_window();
+    }
 
     if let Some(ctx) = HOTKEY_EGUI_CTX.get() {
         ctx.request_repaint();
@@ -179,6 +196,8 @@ impl HotkeyManager {
                         if let Some(binding) = current_bindings.iter().find(|b| b.id == hotkey_id) {
                             let event = HotkeyEvent {
                                 plugin_index: binding.plugin_index,
+                                // 必须在唤醒窗口前采样，唤醒会激活窗口使采样失真
+                                window_in_front: crate::tray::is_main_window_in_front(),
                             };
                             match dispatch_hotkey_event(&tx, event) {
                                 Ok(()) => {}
@@ -301,7 +320,9 @@ mod tests {
             &tx,
             HotkeyEvent {
                 plugin_index: usize::MAX,
+                window_in_front: false,
             },
+            true,
             || wake_called.set(true),
         );
 
@@ -323,12 +344,69 @@ mod tests {
             &tx,
             HotkeyEvent {
                 plugin_index: usize::MAX,
+                window_in_front: false,
             },
+            true,
             || wake_called.set(true),
         );
 
         assert!(result.is_err(), "接收端关闭后事件转发应失败");
         assert!(!wake_called.get(), "事件未转发时不应唤醒主窗口");
+    }
+
+    #[test]
+    fn test_toggle_hotkey_in_front_forwards_event_without_waking() {
+        let (tx, rx) = mpsc::channel();
+        let wake_called = Cell::new(false);
+        let event = HotkeyEvent {
+            plugin_index: usize::MAX,
+            window_in_front: true,
+        };
+        let should_wake = should_wake_main_window(&event);
+
+        let result = dispatch_hotkey_event_with_wake(&tx, event, should_wake, || {
+            wake_called.set(true);
+        });
+
+        assert!(result.is_ok(), "切换热键事件仍必须转发给主线程");
+        assert!(
+            !wake_called.get(),
+            "窗口已在前台时不应唤醒并激活窗口，否则隐藏判定会失真"
+        );
+        match rx.try_recv() {
+            Ok(event) => assert!(event.window_in_front, "事件应保留采样到的前台状态"),
+            Err(error) => panic!("未收到热键事件: {error}"),
+        }
+    }
+
+    #[test]
+    fn test_toggle_hotkey_in_front_does_not_wake_main_window() {
+        let toggle_in_front = HotkeyEvent {
+            plugin_index: usize::MAX,
+            window_in_front: true,
+        };
+        assert!(
+            !should_wake_main_window(&toggle_in_front),
+            "窗口已在前台时切换热键意图是隐藏到托盘，不应唤醒并激活窗口"
+        );
+
+        let toggle_behind = HotkeyEvent {
+            plugin_index: usize::MAX,
+            window_in_front: false,
+        };
+        assert!(
+            should_wake_main_window(&toggle_behind),
+            "窗口隐藏或最小化时必须唤醒窗口"
+        );
+
+        let plugin_hotkey = HotkeyEvent {
+            plugin_index: 2,
+            window_in_front: true,
+        };
+        assert!(
+            should_wake_main_window(&plugin_hotkey),
+            "插件热键始终需要唤出窗口"
+        );
     }
 
     #[test]

@@ -318,24 +318,87 @@ pub fn set_main_window_handle(hwnd: HWND) {
     }
 }
 
-/// 使用原生窗口操作唤醒隐藏状态下的主窗口事件循环。
+/// 读取已登记的主窗口句柄，尚未登记时返回空句柄。
+pub fn main_window_handle() -> HWND {
+    MAIN_WINDOW_HWND.load(Ordering::Acquire)
+}
+
+/// 使用原生窗口操作唤醒隐藏或最小化的主窗口。
 ///
 /// 托盘事件和全局热键事件均可调用此函数，不依赖 eframe 后续重绘。
+/// 最小化到任务栏的窗口也在此还原：`IsWindowVisible` 对最小化窗口仍返回可见，
+/// 仅判断可见性会漏掉该状态，导致热键唤出时窗口停留在任务栏。
 pub fn wake_main_window() {
-    let hwnd = MAIN_WINDOW_HWND.load(Ordering::Acquire);
+    let hwnd = main_window_handle();
     if hwnd.is_null() {
         log::debug!("[托盘] 主窗口句柄尚未登记，使用 egui 重绘请求唤醒");
         return;
     }
 
-    // SAFETY: hwnd 由主窗口在隐藏前登记，主窗口生命周期覆盖托盘和热键管理器。
+    // SAFETY: hwnd 由主窗口在运行期间登记，主窗口生命周期覆盖托盘和热键管理器。
     // ShowWindowAsync 在热键监听线程调用时不会同步等待主窗口线程。
     unsafe {
-        if IsWindowVisible(hwnd) == 0 {
-            let shown = ShowWindowAsync(hwnd, SW_SHOW);
-            if shown == 0 {
-                log::error!("异步唤醒主窗口失败");
-            }
+        let command = if IsIconic(hwnd) != 0 {
+            SW_RESTORE
+        } else if IsWindowVisible(hwnd) == 0 {
+            SW_SHOW
+        } else {
+            return;
+        };
+
+        if ShowWindowAsync(hwnd, command) == 0 {
+            log::error!("异步唤醒主窗口失败: command={command}");
+        }
+    }
+}
+
+/// 判断主窗口当前是否已位于桌面最前层（可见、未最小化且为前台窗口）。
+///
+/// 供热键监听线程在唤出窗口前采样状态：只有窗口已位于桌面最前层时，
+/// 切换热键才应隐藏到托盘；隐藏、最小化到任务栏、被其他程序覆盖都应唤出。
+/// 必须在 `wake_main_window()` 之前采样，否则唤醒本身会把窗口激活，采样结果失真。
+pub fn is_main_window_in_front() -> bool {
+    let hwnd = main_window_handle();
+    if hwnd.is_null() {
+        return false;
+    }
+
+    // SAFETY: hwnd 由主窗口在运行期间登记，主窗口生命周期覆盖热键管理器。
+    unsafe { IsWindowVisible(hwnd) != 0 && IsIconic(hwnd) == 0 && GetForegroundWindow() == hwnd }
+}
+
+/// 将主窗口唤出到桌面最前层：还原/显示 + 置顶抬升 + 前台激活。
+///
+/// 供主线程（`App::update`）在热键或托盘唤出窗口后调用，保证窗口不被其他程序覆盖。
+/// Windows 前台锁定会静默拒绝 `SetForegroundWindow`，因此先置顶再取消置顶：
+/// 该操作不受前台锁定限制，可把窗口排到所有非置顶窗口之上。
+pub fn bring_main_window_to_front() {
+    let hwnd = main_window_handle();
+    if hwnd.is_null() {
+        log::debug!("[托盘] 主窗口句柄尚未登记，跳过窗口唤出到最前层");
+        return;
+    }
+
+    // SAFETY: hwnd 由主窗口在运行期间登记，主窗口生命周期覆盖托盘和热键管理器；
+    // 本函数由主线程调用，同步 ShowWindow 不会跨线程等待。
+    unsafe {
+        if IsIconic(hwnd) != 0 {
+            ShowWindow(hwnd, SW_RESTORE);
+        } else if IsWindowVisible(hwnd) == 0 {
+            ShowWindow(hwnd, SW_SHOW);
+        }
+
+        let raise_flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW;
+        let raised = SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, raise_flags) != 0
+            && SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, raise_flags) != 0;
+        let activated = SetForegroundWindow(hwnd) != 0;
+
+        if raised && activated {
+            log::debug!("主窗口已唤出到桌面最前层");
+        } else if raised {
+            log::warn!("主窗口抢前台失败，已通过置顶抬升保证窗口位于最前层");
+        } else {
+            log::warn!("主窗口置顶抬升失败，抢前台结果: {activated}");
         }
     }
 }
@@ -519,7 +582,7 @@ mod tests {
         }
     }
 
-    fn wait_for_window_visible(hwnd: HWND) -> bool {
+    fn wait_for_window_state(hwnd: HWND, ready: impl Fn(HWND) -> bool) -> bool {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
         loop {
             // SAFETY: 在创建测试窗口的线程中处理该窗口的消息，MSG 已正确初始化。
@@ -530,7 +593,7 @@ mod tests {
                     DispatchMessageW(&message);
                 }
 
-                if IsWindowVisible(hwnd) != 0 {
+                if ready(hwnd) {
                     return true;
                 }
             }
@@ -540,6 +603,16 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+
+    fn wait_for_window_visible(hwnd: HWND) -> bool {
+        // SAFETY: 仅查询窗口状态，不解引用任何指针。
+        wait_for_window_state(hwnd, |hwnd| unsafe { IsWindowVisible(hwnd) != 0 })
+    }
+
+    fn wait_for_window_restored(hwnd: HWND) -> bool {
+        // SAFETY: 仅查询窗口状态，不解引用任何指针。
+        wait_for_window_state(hwnd, |hwnd| unsafe { IsIconic(hwnd) == 0 })
     }
 
     struct TestMainWindow(HWND);
@@ -707,6 +780,55 @@ mod tests {
         assert!(
             wait_for_window_visible(window.0),
             "后台线程应在超时前恢复隐藏窗口"
+        );
+    }
+
+    #[test]
+    fn test_wake_restores_minimized_main_window() {
+        let _guard = lock_main_window_tests();
+        let window = TestMainWindow::new();
+
+        // SAFETY: 句柄在测试期间有效，并由 TestMainWindow 保持存活。
+        unsafe {
+            ShowWindow(window.0, SW_SHOW);
+            ShowWindow(window.0, SW_MINIMIZE);
+            assert_ne!(IsIconic(window.0), 0, "测试窗口应处于最小化状态");
+        }
+        set_main_window_handle(window.0);
+
+        wake_main_window();
+        assert!(
+            wait_for_window_restored(window.0),
+            "唤醒应还原最小化到任务栏的主窗口"
+        );
+    }
+
+    #[test]
+    fn test_bring_main_window_to_front_restores_and_keeps_window_unpinned() {
+        let _guard = lock_main_window_tests();
+        let window = TestMainWindow::new();
+
+        // SAFETY: 句柄在测试期间有效，并由 TestMainWindow 保持存活。
+        unsafe {
+            ShowWindow(window.0, SW_SHOW);
+            ShowWindow(window.0, SW_MINIMIZE);
+        }
+        set_main_window_handle(window.0);
+
+        bring_main_window_to_front();
+
+        // SAFETY: 仅查询窗口状态与扩展样式，不解引用任何指针。
+        let on_screen = wait_for_window_state(window.0, |hwnd| unsafe {
+            IsWindowVisible(hwnd) != 0 && IsIconic(hwnd) == 0
+        });
+        assert!(on_screen, "唤出到最前层时应还原并显示最小化窗口");
+
+        // SAFETY: 仅查询窗口扩展样式。
+        let ex_style = unsafe { GetWindowLongW(window.0, GWL_EXSTYLE) };
+        assert_eq!(
+            ex_style & WS_EX_TOPMOST as i32,
+            0,
+            "唤出瞬间抬升后不应保留永久置顶属性"
         );
     }
 

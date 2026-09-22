@@ -8,7 +8,7 @@ use egui::FontFamily;
 use raw_window_handle::HasWindowHandle;
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    IsIconic, SW_HIDE, SW_RESTORE, SW_SHOW, SetForegroundWindow, ShowWindow,
+    IsIconic, IsWindowVisible, SW_HIDE, SW_RESTORE, SW_SHOW, ShowWindow,
 };
 
 /// 侧边栏面板的持久化状态 ID。
@@ -35,6 +35,50 @@ unsafe fn set_native_window_visible(hwnd: HWND, visible: bool) {
     unsafe {
         ShowWindow(hwnd, command);
     }
+}
+
+/// 判断原生窗口当前是否真正显示在桌面上（可见且未最小化）。
+///
+/// # Safety
+/// `hwnd` 必须是当前进程持有的有效窗口句柄。
+unsafe fn is_window_on_screen(hwnd: HWND) -> bool {
+    // SAFETY: 调用方保证 hwnd 是当前进程持有的有效窗口句柄。
+    unsafe { IsWindowVisible(hwnd) != 0 && IsIconic(hwnd) == 0 }
+}
+
+/// 热键唤出窗口时执行的动作。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HotkeyWindowAction {
+    /// 窗口已位于桌面最前层：隐藏到系统托盘
+    Hide,
+    /// 窗口被隐藏、最小化到任务栏或被其他程序覆盖：唤出到桌面最前层
+    BringToFront,
+}
+
+/// 根据窗口是否已位于桌面最前层决定 Ctrl+Alt+Space 的唤出动作。
+///
+/// 入参取自热键线程在唤醒窗口前采样的 `window_in_front`（可见、未最小化且为前台窗口）；
+/// 只有窗口本身就在最前层时才隐藏到托盘，隐藏、最小化到任务栏、被其他程序覆盖
+/// 三种情况统一唤出到桌面最前层，保证热键唤出后窗口总在最前。
+fn toggle_hotkey_action(window_in_front: bool) -> HotkeyWindowAction {
+    if window_in_front {
+        HotkeyWindowAction::Hide
+    } else {
+        HotkeyWindowAction::BringToFront
+    }
+}
+
+/// 以原生窗口状态校准应用侧的窗口可见性标记。
+///
+/// 双向同步：最小化到任务栏视为隐藏，从任务栏还原后重新视为可见。
+/// 返回标记是否发生变化。
+fn sync_window_visibility_flag(window_visible: &mut bool, window_on_screen: bool) -> bool {
+    if *window_visible == window_on_screen {
+        return false;
+    }
+
+    *window_visible = window_on_screen;
+    true
 }
 
 /// 应用侧边栏宽度，并清除 egui 保存的旧面板尺寸。
@@ -92,6 +136,8 @@ pub struct App {
     last_active_tool: usize,
     /// 窗口是否可见
     window_visible: bool,
+    /// 主窗口句柄是否已登记（供热键与托盘线程唤出窗口使用）
+    main_window_registered: bool,
     /// 是否处于设置面板模式
     settings_mode: bool,
     /// 是否显示保存确认弹窗
@@ -222,36 +268,88 @@ impl App {
             tray_manager,
             last_active_tool: 0,
             window_visible: true,
+            main_window_registered: false,
             settings_mode: false,
             show_save_confirm: false,
             settings_plugin,
         }
     }
 
+    /// 登记主窗口句柄，供热键监听线程与托盘回调唤出窗口使用。
+    ///
+    /// 首帧即登记（而不是等到隐藏到系统托盘）：窗口最小化在任务栏时若句柄为空，
+    /// 线程侧无法还原窗口，热键唤出就会失效。
+    fn register_main_window(&mut self, frame: &eframe::Frame) {
+        if self.main_window_registered {
+            return;
+        }
+
+        let Ok(handle) = frame.window_handle() else {
+            return;
+        };
+        let raw_window_handle::RawWindowHandle::Win32(h) = handle.as_raw() else {
+            return;
+        };
+
+        crate::tray::set_main_window_handle(h.hwnd.get() as HWND);
+        self.main_window_registered = true;
+    }
+
+    /// 以原生窗口状态为准同步 `window_visible`。
+    ///
+    /// 用户点击最小化按钮把窗口收到任务栏时 egui 不会上报关闭或隐藏事件，
+    /// 若不同步，热键与托盘会把最小化误判为「已显示」，唤出时窗口仍停在任务栏；
+    /// 反之从任务栏还原窗口时也必须恢复渲染，避免界面停在不可见状态。
+    fn sync_window_visibility(&mut self) {
+        let hwnd = crate::tray::main_window_handle();
+        if hwnd.is_null() {
+            return;
+        }
+
+        // SAFETY: hwnd 由主窗口在首帧登记，主窗口生命周期内有效。
+        let on_screen = unsafe { is_window_on_screen(hwnd) };
+        if !sync_window_visibility_flag(&mut self.window_visible, on_screen) {
+            return;
+        }
+
+        if on_screen {
+            log::info!("检测到窗口已从任务栏还原，同步窗口状态为可见");
+        } else {
+            log::info!("检测到窗口已最小化到任务栏，同步窗口状态为隐藏");
+        }
+    }
+
     /// 处理全局热键事件
+    ///
+    /// 热键唤出统一还原窗口并抬到桌面最前层，避免最小化到任务栏或被其他程序覆盖时
+    /// 窗口停留在原层级。切换热键的隐藏/唤出判定使用热键线程采样的窗口状态，
+    /// 不受唤醒窗口本身的影响。
     fn process_hotkey_events(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         for event in self.hotkey_manager.poll_events() {
             if event.plugin_index == usize::MAX {
-                // Ctrl+Alt+Space：切换窗口显示/隐藏
-                if self.window_visible {
-                    log::info!("[热键] Ctrl+Alt+Space → 最小化到托盘");
-                    self.hide_window(frame);
-                } else {
-                    log::info!(
-                        "[热键] Ctrl+Alt+Space → 恢复窗口，工具={}",
-                        self.last_active_tool
-                    );
-                    self.selected = self.last_active_tool;
-                    self.show_window(ctx, frame);
-                    self.status_message =
-                        format!("热键唤出：{}", self.plugins[self.last_active_tool].name());
+                // Ctrl+Alt+Space：窗口已位于桌面最前层时隐藏到托盘，否则唤出到最前层
+                match toggle_hotkey_action(event.window_in_front) {
+                    HotkeyWindowAction::Hide => {
+                        log::info!("[热键] Ctrl+Alt+Space → 最小化到托盘");
+                        self.hide_window(frame);
+                    }
+                    HotkeyWindowAction::BringToFront => {
+                        log::info!(
+                            "[热键] Ctrl+Alt+Space → 唤出窗口，工具={}",
+                            self.last_active_tool
+                        );
+                        self.selected = self.last_active_tool;
+                        self.show_window(ctx, frame);
+                        self.status_message =
+                            format!("热键唤出：{}", self.plugins[self.last_active_tool].name());
+                    }
                 }
             } else if event.plugin_index < self.plugins.len() {
-                // Ctrl+Alt+数字：跳转到指定插件并显示窗口
+                // Ctrl+Alt+数字：跳转到指定插件；窗口不在桌面最前层时一并唤出
                 log::info!("[热键] 唤出插件索引={}", event.plugin_index);
                 self.selected = event.plugin_index;
                 self.last_active_tool = event.plugin_index;
-                if !self.window_visible {
+                if !event.window_in_front {
                     self.show_window(ctx, frame);
                 }
                 self.status_message =
@@ -304,7 +402,7 @@ impl App {
         log::info!("窗口已最小化到系统托盘");
     }
 
-    /// 从系统托盘恢复窗口
+    /// 从系统托盘恢复窗口，并抬到桌面最前层
     fn show_window(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.window_visible = true;
         self.status_message = "窗口已恢复".to_string();
@@ -312,12 +410,14 @@ impl App {
         if let Ok(handle) = frame.window_handle() {
             if let raw_window_handle::RawWindowHandle::Win32(h) = handle.as_raw() {
                 let hwnd = h.hwnd.get() as _;
+                crate::tray::set_main_window_handle(hwnd);
                 // SAFETY: hwnd 是有效的 Win32 窗口句柄
                 unsafe {
                     set_native_window_visible(hwnd, true);
-                    SetForegroundWindow(hwnd);
                 }
-                log::info!("窗口已从系统托盘恢复");
+                // 置顶抬升绕过前台锁定，保证唤出后窗口不被其他程序覆盖
+                crate::tray::bring_main_window_to_front();
+                log::info!("窗口已从系统托盘恢复到桌面最前层");
             }
         }
 
@@ -650,20 +750,25 @@ impl eframe::App for App {
             self.font_applied = true;
         }
 
-        // 2. 处理全局热键事件
+        // 2. 登记主窗口句柄，并以原生窗口状态为准同步可见性
+        // （窗口最小化到任务栏时须同步为隐藏，否则热键唤出会误判为「已显示」）
+        self.register_main_window(frame);
+        self.sync_window_visibility();
+
+        // 3. 处理全局热键事件
         self.process_hotkey_events(ctx, frame);
 
-        // 3. 处理托盘事件（切换显示/隐藏、退出）
+        // 4. 处理托盘事件（切换显示/隐藏、退出）
         self.process_tray_events(ctx, frame);
 
-        // 4. 处理窗口关闭事件（用户点击 ✕）→ 取消关闭，改为隐藏到托盘
+        // 5. 处理窗口关闭事件（用户点击 ✕）→ 取消关闭，改为隐藏到托盘
         if ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.hide_window(frame);
             return;
         }
 
-        // 5. 窗口不可见时跳过渲染，但保持事件循环活跃
+        // 6. 窗口不可见时跳过渲染，但保持事件循环活跃
         if !self.window_visible {
             // request_repaint_after 通过 eframe 内部的 EventLoopProxy 唤醒 winit，
             // 确保 update() 在窗口隐藏后仍被持续调用
@@ -671,7 +776,7 @@ impl eframe::App for App {
             return;
         }
 
-        // 6. 处理窗口内快捷键
+        // 7. 处理窗口内快捷键
         self.handle_shortcuts(ctx);
 
         // 顶部面板
@@ -703,7 +808,11 @@ impl eframe::App for App {
 
 #[cfg(test)]
 mod tests {
-    use super::{SIDEBAR_PANEL_ID, apply_sidebar_width, set_native_window_visible, sidebar_panel};
+    use super::{
+        HotkeyWindowAction, SIDEBAR_PANEL_ID, apply_sidebar_width, is_window_on_screen,
+        set_native_window_visible, sidebar_panel, sync_window_visibility_flag,
+        toggle_hotkey_action,
+    };
     use windows_sys::Win32::Foundation::HWND;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DestroyWindow, IsIconic, IsWindowVisible, IsZoomed, SW_MAXIMIZE,
@@ -867,5 +976,72 @@ mod tests {
             assert_ne!(IsWindowVisible(window.0), 0, "恢复后的窗口应可见");
             assert_ne!(IsZoomed(window.0), 0, "恢复后的窗口应保持最大化");
         }
+    }
+
+    #[test]
+    fn window_on_screen_detects_hidden_and_minimized_states() {
+        let window = TestWindow::new();
+
+        // SAFETY: 句柄在测试期间有效，并由 TestWindow 保持存活。
+        unsafe {
+            set_native_window_visible(window.0, true);
+            assert!(
+                is_window_on_screen(window.0),
+                "显示中的窗口应判定为在桌面上"
+            );
+
+            ShowWindow(window.0, SW_MINIMIZE);
+            assert_ne!(IsIconic(window.0), 0, "测试窗口应处于最小化状态");
+            assert!(
+                IsWindowVisible(window.0) != 0,
+                "最小化窗口仍带 WS_VISIBLE，仅判断可见性无法区分该状态"
+            );
+            assert!(
+                !is_window_on_screen(window.0),
+                "最小化到任务栏的窗口不应判定为在桌面上"
+            );
+
+            set_native_window_visible(window.0, true);
+            set_native_window_visible(window.0, false);
+            assert!(
+                !is_window_on_screen(window.0),
+                "隐藏到系统托盘的窗口不应判定为在桌面上"
+            );
+        }
+    }
+
+    #[test]
+    fn hotkey_toggle_hides_only_when_window_is_in_front() {
+        assert_eq!(
+            toggle_hotkey_action(true),
+            HotkeyWindowAction::Hide,
+            "窗口已在前台时应隐藏到系统托盘"
+        );
+        assert_eq!(
+            toggle_hotkey_action(false),
+            HotkeyWindowAction::BringToFront,
+            "窗口被隐藏、最小化到任务栏或被其他程序覆盖时必须唤出到桌面最前层"
+        );
+    }
+
+    #[test]
+    fn window_visibility_flag_follows_native_window_state() {
+        let mut window_visible = true;
+
+        assert!(
+            sync_window_visibility_flag(&mut window_visible, false),
+            "窗口最小化到任务栏后必须同步为隐藏"
+        );
+        assert!(!window_visible);
+        assert!(
+            !sync_window_visibility_flag(&mut window_visible, false),
+            "状态一致时不应重复同步"
+        );
+
+        assert!(
+            sync_window_visibility_flag(&mut window_visible, true),
+            "窗口从任务栏还原后必须同步为可见"
+        );
+        assert!(window_visible);
     }
 }
