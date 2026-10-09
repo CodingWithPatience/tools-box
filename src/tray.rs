@@ -6,12 +6,10 @@
 
 use std::ffi::c_void;
 use std::sync::{
-    atomic::{AtomicPtr, Ordering},
+    atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering},
     mpsc,
 };
-#[cfg(test)]
-use windows_sys::Win32::Foundation::GetLastError;
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows_sys::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
@@ -24,6 +22,10 @@ const WM_TRAYICON: u32 = WM_APP + 1;
 const WM_SHOW_EXISTING_INSTANCE: u32 = WM_APP + 2;
 /// 托盘消息窗口类名。
 const TRAY_WINDOW_CLASS_NAME: &str = "ToolsBoxTrayClass";
+/// 资源管理器重建任务栏时广播的消息名。
+const TASKBAR_CREATED_MESSAGE_NAME: &str = "TaskbarCreated";
+/// 托盘图标提示文本。
+const TRAY_ICON_TIP: &str = "Tools Box";
 
 /// 菜单项 ID
 const MENU_SHOW: usize = 1;
@@ -31,6 +33,10 @@ const MENU_QUIT: usize = 2;
 
 /// 窗口属性名（用于存储菜单句柄）
 const MENU_PROP: [u16; 3] = [b'T' as u16, b'M' as u16, 0];
+/// 窗口属性名（用于存储托盘图标句柄，供任务栏重建后重新注册）
+const ICON_PROP: [u16; 3] = [b'I' as u16, b'C' as u16, 0];
+/// 托盘图标注册失败后的重试间隔（毫秒），首次注册不等待。
+const TRAY_REGISTER_RETRY_DELAYS_MS: [u64; 3] = [100, 200, 400];
 
 /// 托盘事件类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +59,12 @@ static mut GLOBAL_EGUI_CTX: Option<egui::Context> = None;
 
 /// 主窗口句柄，用于在窗口隐藏时通过原生消息唤醒 eframe 事件循环。
 static MAIN_WINDOW_HWND: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+
+/// 托盘图标当前是否已注册，供关闭按钮决定隐藏到托盘还是最小化到任务栏。
+static ICON_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+/// 资源管理器重建任务栏时广播的消息 ID（注册失败时为 0）。
+static TASKBAR_CREATED_MESSAGE: AtomicU32 = AtomicU32::new(0);
 
 /// 系统托盘管理器
 pub struct TrayManager {
@@ -128,31 +140,24 @@ impl TrayManager {
             SetPropW(hwnd, MENU_PROP.as_ptr(), hmenu as _);
         }
 
-        // 注册托盘图标
-        let icon = create_hicon();
-        let mut nid = notify_icon_data(hwnd);
-        nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
-        nid.uCallbackMessage = WM_TRAYICON;
-        nid.hIcon = icon;
-        let tip: Vec<u16> = "Tools Box\0".encode_utf16().collect();
-        let tip_len = tip.len().min(127);
-        nid.szTip[..tip_len].copy_from_slice(&tip[..tip_len]);
-
-        // SAFETY: nid 结构体字段已正确初始化，Shell_NotifyIconW 会验证参数
-        let ok = unsafe { Shell_NotifyIconW(NIM_ADD, &nid) };
-        let icon_registered = ok != 0;
-        #[cfg(test)]
-        let registration_error = if icon_registered {
-            0
-        } else {
-            // SAFETY: 紧接失败的 Win32 调用读取当前线程的错误码。
-            unsafe { GetLastError() }
-        };
-        if icon_registered {
-            log::info!("系统托盘图标已创建");
-        } else {
-            log::error!("创建系统托盘图标失败");
+        // 登记资源管理器重建任务栏时广播的消息 ID，用于重建后自动恢复托盘图标
+        // SAFETY: 消息名以空字符结尾且在调用期间有效。
+        let taskbar_created =
+            unsafe { RegisterWindowMessageW(taskbar_created_message_name().as_ptr()) };
+        if taskbar_created == 0 {
+            log::warn!("注册 TaskbarCreated 消息失败，资源管理器重启后无法自动恢复托盘图标");
         }
+        TASKBAR_CREATED_MESSAGE.store(taskbar_created, Ordering::Release);
+
+        // 注册托盘图标（失败时按退避重试，并记录图标句柄供任务栏重建后重新注册）
+        let icon = create_hicon();
+        // SAFETY: hwnd 已创建，icon 由 CreateIcon 返回，两者在窗口生命周期内保持有效。
+        unsafe {
+            SetPropW(hwnd, ICON_PROP.as_ptr(), icon as _);
+        }
+        let nid = tray_icon_data(hwnd, icon);
+        let registration_error = register_tray_icon(&nid);
+        let icon_registered = registration_error == 0;
 
         Self {
             hwnd,
@@ -179,6 +184,7 @@ impl TrayManager {
 impl Drop for TrayManager {
     fn drop(&mut self) {
         MAIN_WINDOW_HWND.store(std::ptr::null_mut(), Ordering::Release);
+        ICON_REGISTERED.store(false, Ordering::Release);
 
         // SAFETY: 按正确顺序清理资源
         unsafe {
@@ -203,6 +209,16 @@ unsafe extern "system" fn tray_wnd_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    let taskbar_created = TASKBAR_CREATED_MESSAGE.load(Ordering::Acquire);
+    if taskbar_created != 0 && msg == taskbar_created {
+        log::info!("[托盘] 资源管理器已重建任务栏，重新注册托盘图标");
+        // SAFETY: hwnd 是 Windows 传入的有效托盘消息窗口句柄。
+        unsafe {
+            reregister_tray_icon(hwnd);
+        }
+        return 0;
+    }
+
     match msg {
         WM_TRAYICON => {
             let mouse_msg = (lparam & 0xFFFF) as u32;
@@ -321,6 +337,14 @@ pub fn set_main_window_handle(hwnd: HWND) {
 /// 读取已登记的主窗口句柄，尚未登记时返回空句柄。
 pub fn main_window_handle() -> HWND {
     MAIN_WINDOW_HWND.load(Ordering::Acquire)
+}
+
+/// 托盘图标当前是否已注册。
+///
+/// 关闭按钮据此决定隐藏到系统托盘还是退化为最小化到任务栏：
+/// 没有托盘图标时隐藏窗口会让程序彻底失联（任务栏与托盘都没有入口）。
+pub fn is_icon_registered() -> bool {
+    ICON_REGISTERED.load(Ordering::Acquire)
 }
 
 /// 使用原生窗口操作唤醒隐藏或最小化的主窗口。
@@ -457,6 +481,87 @@ fn menu_action(command: i32) -> Option<TrayMenuAction> {
         MENU_QUIT => Some(TrayMenuAction::Quit),
         _ => None,
     }
+}
+
+/// 按退避间隔重复注册托盘图标，返回最后一次尝试的 Win32 错误码（成功为 0）。
+///
+/// 资源管理器在登录或系统更新后可能正在重建通知区域，此时 `NIM_ADD` 会被拒绝；
+/// 只尝试一次会让整个会话都没有托盘图标，因此失败后按固定间隔重试。
+fn register_tray_icon(nid: &NOTIFYICONDATAW) -> u32 {
+    let mut last_error = 0;
+
+    for (attempt, delay_ms) in std::iter::once(0u64)
+        .chain(TRAY_REGISTER_RETRY_DELAYS_MS)
+        .enumerate()
+    {
+        if delay_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        }
+
+        // SAFETY: nid 由调用方按托盘协议构造，调用期间保持有效。
+        let added = unsafe { Shell_NotifyIconW(NIM_ADD, nid) } != 0;
+        if added {
+            ICON_REGISTERED.store(true, Ordering::Release);
+            log::info!("系统托盘图标已创建");
+            return 0;
+        }
+
+        // SAFETY: 紧接失败的 Shell_NotifyIconW 读取当前线程的错误码。
+        last_error = unsafe { GetLastError() };
+        log::warn!(
+            "创建系统托盘图标失败（第 {} 次尝试），错误码={}",
+            attempt + 1,
+            last_error
+        );
+    }
+
+    ICON_REGISTERED.store(false, Ordering::Release);
+    log::error!(
+        "创建系统托盘图标失败，重试 {} 次仍未成功，错误码={}",
+        TRAY_REGISTER_RETRY_DELAYS_MS.len(),
+        last_error
+    );
+    last_error
+}
+
+/// 资源管理器重建任务栏后重新注册托盘图标。
+///
+/// # Safety
+/// `hwnd` 必须是 TrayManager 创建且仍然有效的托盘消息窗口句柄。
+unsafe fn reregister_tray_icon(hwnd: HWND) {
+    // SAFETY: 图标句柄由 TrayManager 在创建窗口后写入同名窗口属性，与窗口生命周期一致。
+    let icon = unsafe { GetPropW(hwnd, ICON_PROP.as_ptr()) as HICON };
+    if icon.is_null() {
+        log::warn!("[托盘] 未找到托盘图标句柄，跳过重新注册");
+        return;
+    }
+
+    let nid = tray_icon_data(hwnd, icon);
+    if register_tray_icon(&nid) != 0 {
+        log::error!("[托盘] 任务栏重建后重新注册托盘图标失败");
+    }
+}
+
+/// 构建注册托盘图标所需的完整数据（图标、回调消息与提示文本）。
+fn tray_icon_data(hwnd: HWND, icon: HICON) -> NOTIFYICONDATAW {
+    let mut nid = notify_icon_data(hwnd);
+    nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    nid.uCallbackMessage = WM_TRAYICON;
+    nid.hIcon = icon;
+
+    let tip: Vec<u16> = TRAY_ICON_TIP.encode_utf16().collect();
+    let tip_len = tip.len().min(nid.szTip.len() - 1);
+    nid.szTip[..tip_len].copy_from_slice(&tip[..tip_len]);
+    nid.szTip[tip_len] = 0;
+    nid
+}
+
+/// 资源管理器重建任务栏时广播的消息名（宽字符、以空字符结尾）。
+fn taskbar_created_message_name() -> Vec<u16> {
+    TASKBAR_CREATED_MESSAGE_NAME
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
 /// 创建具有正确大小和标识的托盘图标数据。
@@ -845,6 +950,37 @@ mod tests {
         );
         assert_eq!(nid.hWnd, window.0);
         assert_eq!(nid.uID, 1);
+    }
+
+    #[test]
+    fn test_tray_icon_data_sets_icon_message_and_tip() {
+        let _guard = lock_main_window_tests();
+        let window = TestMainWindow::new();
+        let icon = create_hicon();
+        let nid = tray_icon_data(window.0, icon);
+
+        assert_eq!(nid.hWnd, window.0);
+        assert_eq!(nid.uID, 1);
+        assert_eq!(nid.hIcon, icon);
+        assert_eq!(nid.uFlags, NIF_ICON | NIF_MESSAGE | NIF_TIP);
+        assert_eq!(nid.uCallbackMessage, WM_TRAYICON);
+
+        let expected_tip: Vec<u16> = TRAY_ICON_TIP.encode_utf16().collect();
+        assert_eq!(&nid.szTip[..expected_tip.len()], expected_tip.as_slice());
+        assert_eq!(nid.szTip[expected_tip.len()], 0, "提示文本必须以空字符结尾");
+
+        // SAFETY: icon 由 CreateIcon 创建且仅在此处销毁一次。
+        unsafe {
+            DestroyIcon(icon);
+        }
+    }
+
+    #[test]
+    fn test_icon_registered_flag_matches_manager_state() {
+        let _guard = lock_main_window_tests();
+        let manager = TrayManager::new();
+
+        assert_eq!(is_icon_registered(), manager.icon_registered);
     }
 
     #[test]

@@ -8,7 +8,7 @@ use egui::FontFamily;
 use raw_window_handle::HasWindowHandle;
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    IsIconic, IsWindowVisible, SW_HIDE, SW_RESTORE, SW_SHOW, ShowWindow,
+    IsIconic, IsWindowVisible, SW_HIDE, SW_MINIMIZE, SW_RESTORE, SW_SHOW, ShowWindow,
 };
 
 /// 侧边栏面板的持久化状态 ID。
@@ -65,6 +65,27 @@ fn toggle_hotkey_action(window_in_front: bool) -> HotkeyWindowAction {
         HotkeyWindowAction::Hide
     } else {
         HotkeyWindowAction::BringToFront
+    }
+}
+
+/// 用户点击窗口关闭按钮时的处理方式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseAction {
+    /// 托盘图标可用：隐藏窗口到系统托盘
+    HideToTray,
+    /// 托盘图标不可用：最小化到任务栏，避免窗口失联
+    MinimizeToTaskbar,
+}
+
+/// 根据托盘图标是否已注册决定关闭按钮的处理方式。
+///
+/// 托盘图标注册失败时（例如被系统或安全软件拒绝）仍然隐藏窗口，会让程序既不在
+/// 任务栏也不在托盘中，只能靠全局热键找回；此时退化为最小化到任务栏更安全。
+fn close_action(icon_registered: bool) -> CloseAction {
+    if icon_registered {
+        CloseAction::HideToTray
+    } else {
+        CloseAction::MinimizeToTaskbar
     }
 }
 
@@ -400,6 +421,28 @@ impl App {
         }
 
         log::info!("窗口已最小化到系统托盘");
+    }
+
+    /// 托盘图标不可用时退化为最小化到任务栏。
+    ///
+    /// 保持窗口在任务栏可见，避免隐藏后既没有托盘图标也没有任务栏入口。
+    fn minimize_window(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.window_visible = false;
+        self.status_message = "托盘图标不可用，已最小化到任务栏".to_string();
+
+        if let Ok(handle) = frame.window_handle() {
+            if let raw_window_handle::RawWindowHandle::Win32(h) = handle.as_raw() {
+                let hwnd = h.hwnd.get() as _;
+                crate::tray::set_main_window_handle(hwnd);
+                // SAFETY: hwnd 是有效的 Win32 窗口句柄
+                unsafe {
+                    ShowWindow(hwnd, SW_MINIMIZE);
+                }
+                log::warn!("托盘图标不可用，关闭按钮改为最小化到任务栏");
+            }
+        }
+
+        ctx.request_repaint();
     }
 
     /// 从系统托盘恢复窗口，并抬到桌面最前层
@@ -762,9 +805,13 @@ impl eframe::App for App {
         self.process_tray_events(ctx, frame);
 
         // 5. 处理窗口关闭事件（用户点击 ✕）→ 取消关闭，改为隐藏到托盘
+        //    托盘图标不可用时退化为最小化到任务栏，避免窗口隐藏后无处唤出
         if ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.hide_window(frame);
+            match close_action(crate::tray::is_icon_registered()) {
+                CloseAction::HideToTray => self.hide_window(frame),
+                CloseAction::MinimizeToTaskbar => self.minimize_window(ctx, frame),
+            }
             return;
         }
 
@@ -809,8 +856,8 @@ impl eframe::App for App {
 #[cfg(test)]
 mod tests {
     use super::{
-        HotkeyWindowAction, SIDEBAR_PANEL_ID, apply_sidebar_width, is_window_on_screen,
-        set_native_window_visible, sidebar_panel, sync_window_visibility_flag,
+        CloseAction, HotkeyWindowAction, SIDEBAR_PANEL_ID, apply_sidebar_width, close_action,
+        is_window_on_screen, set_native_window_visible, sidebar_panel, sync_window_visibility_flag,
         toggle_hotkey_action,
     };
     use windows_sys::Win32::Foundation::HWND;
@@ -1021,6 +1068,20 @@ mod tests {
             toggle_hotkey_action(false),
             HotkeyWindowAction::BringToFront,
             "窗口被隐藏、最小化到任务栏或被其他程序覆盖时必须唤出到桌面最前层"
+        );
+    }
+
+    #[test]
+    fn close_hides_to_tray_only_when_icon_is_registered() {
+        assert_eq!(
+            close_action(true),
+            CloseAction::HideToTray,
+            "托盘图标可用时点击关闭应隐藏到系统托盘"
+        );
+        assert_eq!(
+            close_action(false),
+            CloseAction::MinimizeToTaskbar,
+            "托盘图标不可用时点击关闭必须退化为最小化到任务栏，避免窗口失联"
         );
     }
 

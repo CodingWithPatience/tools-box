@@ -2,7 +2,14 @@
 //!
 //! 提供主题、字体、侧边栏宽度、自定义热键、跟随系统启动的设置界面。
 
+use std::path::Path;
+
 use super::models::AppSettings;
+use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+use windows_sys::Win32::System::Registry::{
+    HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE, REG_SZ, RegCloseKey, RegDeleteValueW,
+    RegOpenKeyExW, RegSetValueExW,
+};
 
 /// 字体大小范围
 const MIN_FONT_SIZE: f32 = 10.0;
@@ -294,14 +301,17 @@ fn commit_sidebar_width_input(settings: &mut AppSettings, input: &mut String) ->
 
 /// 应用跟随系统启动设置（通过 Windows 注册表）
 fn apply_auto_start(enable: bool) {
-    let exe_path = std::env::current_exe().unwrap_or_default();
-    let exe_str = exe_path.to_string_lossy().to_string();
+    let exe_path = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(error) => {
+            log::error!("获取当前程序路径失败，未修改跟随系统启动设置: {}", error);
+            return;
+        }
+    };
+    let exe_str = auto_start_value(&exe_path);
 
-    // SAFETY: 调用 Windows API 操作注册表
+    // SAFETY: 调用 Windows API 操作注册表，子键名、值名与数据均在调用期间保持有效。
     unsafe {
-        use windows_sys::Win32::Foundation::*;
-        use windows_sys::Win32::System::Registry::*;
-
         let key_path: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Run\0"
             .encode_utf16()
             .collect();
@@ -340,12 +350,32 @@ fn apply_auto_start(enable: bool) {
     }
 }
 
+/// 构建注册表 `Run` 项的值。
+///
+/// 路径必须加引号：`Run` 项按命令行解析，含空格的路径（如 `C:\Program Files\...`）
+/// 不加引号会被拆成「C:\Program」加参数，导致开机启动静默失败。
+fn auto_start_value(exe_path: &Path) -> String {
+    format!("\"{}\"", exe_path.display())
+}
+
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::{
         AppSettings, MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH, SIDEBAR_WIDTH_INPUT_ID, SettingsChange,
-        SettingsUi, commit_sidebar_width_input, format_sidebar_width,
+        SettingsUi, auto_start_value, commit_sidebar_width_input, format_sidebar_width,
     };
+
+    #[test]
+    fn auto_start_value_quotes_path_with_spaces() {
+        let path = Path::new("C:\\Program Files\\Tools-box\\tools-box.exe");
+
+        assert_eq!(
+            auto_start_value(path),
+            "\"C:\\Program Files\\Tools-box\\tools-box.exe\""
+        );
+    }
 
     fn render_settings_frame(
         ctx: &egui::Context,

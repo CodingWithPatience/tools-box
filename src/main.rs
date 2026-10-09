@@ -9,12 +9,21 @@ mod storage;
 mod tray;
 mod utils;
 
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
 use app::App;
 use plugins::settings::AppSettings;
 use storage::Database;
 
+/// 日志文件大小上限（字节）：超过后归档为 `tools-box.log.old` 并重新开始写入。
+const LOG_FILE_MAX_BYTES: u64 = 5 * 1024 * 1024;
+/// 日志文件名。
+const LOG_FILE_NAME: &str = "tools-box.log";
+
 fn main() -> eframe::Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    init_logging();
 
     log::info!("Tools Box 启动中...");
 
@@ -109,4 +118,93 @@ fn build_hotkey_bindings(
     }
 
     bindings
+}
+
+/// 初始化日志：同时写入 `%APPDATA%\tools-box\logs\tools-box.log` 与标准错误。
+///
+/// Windows GUI 子系统构建没有控制台，只写标准错误的日志会被直接丢弃
+/// （托盘注册失败、窗口唤醒失败等关键信息都收不到），因此这里把日志同时落盘。
+fn init_logging() {
+    let mut builder =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
+
+    match open_log_writer() {
+        Ok(writer) => {
+            builder.target(env_logger::Target::Pipe(Box::new(writer)));
+        }
+        Err(error) => {
+            eprintln!("日志文件不可用，日志仅写入标准错误: {error}");
+        }
+    }
+
+    builder.init();
+}
+
+/// 打开日志文件（必要时先归档旧日志），返回同时写文件与标准错误的写入器。
+fn open_log_writer() -> std::io::Result<TeeWriter> {
+    let path = log_file_path().ok_or_else(|| std::io::Error::other("无法获取系统数据目录"))?;
+
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    rotate_log_if_needed(&path)?;
+
+    let file = OpenOptions::new().create(true).append(true).open(&path)?;
+    Ok(TeeWriter { file })
+}
+
+/// 日志文件路径：`%APPDATA%\tools-box\logs\tools-box.log`。
+fn log_file_path() -> Option<PathBuf> {
+    let data_dir = dirs::data_dir()?;
+    Some(data_dir.join("tools-box").join("logs").join(LOG_FILE_NAME))
+}
+
+/// 日志超过大小上限时归档为 `tools-box.log.old`。
+fn rotate_log_if_needed(path: &Path) -> std::io::Result<()> {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return Ok(());
+    };
+    if !should_rotate_log(metadata.len()) {
+        return Ok(());
+    }
+
+    std::fs::rename(path, path.with_extension("log.old"))
+}
+
+/// 判断日志文件是否已达到需要归档的大小。
+fn should_rotate_log(len: u64) -> bool {
+    len >= LOG_FILE_MAX_BYTES
+}
+
+/// 同时写入日志文件与标准错误的日志写入器。
+///
+/// GUI 子系统下标准错误通常无效，写入失败会被忽略，不影响文件日志。
+struct TeeWriter {
+    file: std::fs::File,
+}
+
+impl Write for TeeWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let written = self.file.write(buf)?;
+        let _ = std::io::stderr().write_all(&buf[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()?;
+        let _ = std::io::stderr().flush();
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LOG_FILE_MAX_BYTES, should_rotate_log};
+
+    #[test]
+    fn rotates_log_only_after_reaching_size_limit() {
+        assert!(!should_rotate_log(0));
+        assert!(!should_rotate_log(LOG_FILE_MAX_BYTES - 1));
+        assert!(should_rotate_log(LOG_FILE_MAX_BYTES));
+    }
 }

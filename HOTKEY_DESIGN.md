@@ -15,8 +15,10 @@
 
 | 功能 | 说明 | 优先级 |
 |------|------|--------|
-| 关闭最小化到托盘 | 点击 ✕ 按钮隐藏窗口而非退出程序 | P0 |
+| 关闭最小化到托盘 | 点击 ✕ 按钮隐藏窗口而非退出程序；托盘图标不可用时退化为最小化到任务栏 | P0 |
 | 托盘图标 | 任务栏托盘区域显示 Tools Box 图标 | P0 |
+| 托盘图标自恢复 | 注册失败按退避间隔重试；资源管理器重建任务栏后自动重新注册 | P1 |
+| 运行日志 | 日志同时写入 `%APPDATA%\tools-box\logs\tools-box.log`，GUI 子系统下不再丢失 | P1 |
 | 左键切换显示 | 左键单击托盘图标显示/隐藏窗口 | P0 |
 | 右键菜单 | 右键弹出菜单：显示窗口、退出 | P0 |
 | 退出程序 | 托盘菜单"退出"完全关闭程序和后台线程 | P0 |
@@ -434,3 +436,57 @@ windows-sys = { version = "0.60", features = [
 仍强制抬升"的行为回归、补充不唤醒分支的事件投递测试、按抬升结果分别校验并调整日志级别与措辞。
 抬升效果本身（窗口确实排到其他窗口之上）依赖真实前台激活，单元测试无法稳定断言，
 保留"还原 + 不残留置顶"的断言并交由人工验证。
+
+### 10.2 托盘图标注册健壮性与降权环境适配（2026-10-09）
+
+问题：程序 exe 位于被打了 **Low 完整性标签**的目录（DSH Windows 沙箱在授予工作区写权限时
+会把工作区根目录连同全部子项标为 Low）时，进程会以低完整性运行，
+`Shell_NotifyIconW(NIM_ADD)` 被 UIPI 拒绝（`GetLastError=5` 拒绝访问），导致整个会话没有托盘图标；
+而点击 ✕ 仍然执行"隐藏到托盘"，窗口与托盘双无入口，只能靠全局热键找回。
+另外 `Run` 项写入的是**未加引号**的 exe 路径，路径含空格（如 `C:\Program Files\...`）
+会被按命令行拆成「C:\Program」加参数，导致开机自启静默失效；
+日志只写标准错误，GUI 子系统构建下没有控制台，关键信息（托盘注册失败原因）全部丢失。
+
+原因：
+
+- `TrayManager::new()` 只调用一次 `NIM_ADD`，失败即永久丢失图标，既不重试也不感知
+  资源管理器重建任务栏（`TaskbarCreated`）后的通知区域失效。
+- `App::update()` 的关闭分支无条件调用 `hide_window()`，没有"托盘是否可用"的前置判断。
+- `apply_auto_start()` 直接写 `current_exe()` 的原始路径，未做命令行引号转义，
+  且 `current_exe()` 失败时用 `unwrap_or_default()` 拿到空路径仍会写坏注册表值。
+- `main()` 用 `env_logger` 默认目标（标准错误），`windows_subsystem = "windows"` 下无处可读。
+
+完成结果：
+
+- `tray.rs`：新增 `register_tray_icon()`，失败按 `TRAY_REGISTER_RETRY_DELAYS_MS`（100/200/400ms）
+  退避重试，并同步维护 `ICON_REGISTERED`；新增公开接口 `is_icon_registered()`；
+  登记 `TaskbarCreated` 广播消息，图标句柄存入窗口属性 `ICON_PROP`，
+  资源管理器重建任务栏时通过 `reregister_tray_icon()` 自动重新注册；
+  新增 `tray_icon_data()` 统一构建注册数据（图标、回调消息、提示文本）。
+- `app.rs`：新增 `CloseAction` 与 `close_action(icon_registered)`：托盘图标可用时照旧
+  隐藏到系统托盘，不可用时退化为 `minimize_window()`（最小化到任务栏并提示状态），
+  保证窗口始终有入口。
+- `main.rs`：新增 `init_logging()`/`TeeWriter`，日志同时写入
+  `%APPDATA%\tools-box\logs\tools-box.log`（超过 5MB 归档为 `tools-box.log.old`）与标准错误。
+- `plugins/settings/ui.rs`：新增 `auto_start_value()` 为 `Run` 值加引号；
+  `current_exe()` 失败时记录错误并放弃写入，不再写空值。
+
+测试覆盖（新增 5 项）：
+
+- `tray::tests::test_tray_icon_data_sets_icon_message_and_tip`：
+  注册数据包含图标、回调消息与以空字符结尾的提示文本
+- `tray::tests::test_icon_registered_flag_matches_manager_state`：
+  托盘注册状态对外接口与管理器内部状态一致
+- `app::tests::close_hides_to_tray_only_when_icon_is_registered`：
+  关闭动作判定（有图标隐藏、无图标最小化）
+- `plugins::settings::ui::tests::auto_start_value_quotes_path_with_spaces`：
+  含空格路径写入 `Run` 项时必须带引号
+- `tests::rotates_log_only_after_reaching_size_limit`：日志归档阈值判定
+
+验证说明：`cargo test` 共 232 项测试（231 项通过、1 项因需要交互式 Windows 会话而忽略）；
+`cargo build`、`cargo build --release` 通过（仅 api_tester 既有 7 项告警，本次改动无新增告警）。
+实机验证：将 release 构建部署到 `C:\Program Files\Tools-box\tools-box.exe`（该目录无完整性标签）
+后以普通权限启动，进程完整性为 Medium，日志输出"系统托盘图标已创建"，
+且 `%APPDATA%\tools-box\logs\tools-box.log` 已生成并记录启动过程；
+同一二进制放在带 Low 标签的工作区内启动时为 Low 完整性、托盘注册失败，A/B 对照确认因果。
+本次按用户要求跳过 code-reviewer 审查。
