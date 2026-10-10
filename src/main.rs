@@ -48,13 +48,21 @@ fn main() -> eframe::Result<()> {
     let db = Database::open().expect("数据库初始化失败");
 
     // 从数据库加载设置
-    let settings = AppSettings::load(db.conn()).unwrap_or_default();
+    let mut settings = AppSettings::load(db.conn()).unwrap_or_default();
 
     // 创建系统托盘
     let tray_manager = tray::TrayManager::new();
 
     // 根据设置构建热键绑定（而非使用默认值）
     let plugin_count = plugins::register_all_plugins().len();
+
+    // 新增插件后补齐缺失的工具热键，保证每个工具都有可用热键
+    if settings.ensure_tool_hotkeys(plugin_count) {
+        if let Err(error) = settings.save(db.conn()) {
+            log::error!("补齐工具热键后保存设置失败: {}", error);
+        }
+    }
+
     let bindings = build_hotkey_bindings(&settings, plugin_count);
     let hotkey_manager = hotkey::HotkeyManager::new(bindings);
 

@@ -236,6 +236,48 @@ impl Database {
             log::info!("app_settings 表已迁移：添加 auto_start 列");
         }
 
+        // 常用文件编辑器 - 自定义目录表
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS file_editor_directories (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                name       TEXT NOT NULL UNIQUE,
+                sort_order INTEGER DEFAULT 0,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );",
+        )?;
+
+        // 常用文件编辑器 - 常用文件条目表
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS file_editor_files (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                directory_id   INTEGER,
+                path           TEXT NOT NULL UNIQUE,
+                alias          TEXT,
+                sort_order     INTEGER DEFAULT 0,
+                created_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
+                last_opened_at DATETIME,
+                FOREIGN KEY (directory_id) REFERENCES file_editor_directories(id) ON DELETE SET NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_file_editor_files_dir ON file_editor_files(directory_id);",
+        )?;
+
+        // 常用文件编辑器 - 插件设置表（左侧列表宽度）
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS file_editor_settings (
+                id         INTEGER PRIMARY KEY DEFAULT 1,
+                list_width REAL NOT NULL DEFAULT 260.0,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );",
+        )?;
+
+        // 数据库迁移：常用文件编辑器表结构（v3）
+        if db_version < 3 {
+            self.conn
+                .pragma_update(None, "user_version", 3)
+                .context("更新数据库版本号失败")?;
+            log::info!("数据库已迁移到 v3（常用文件编辑器表）");
+        }
+
         log::info!("数据库表初始化完成");
         Ok(())
     }
@@ -244,5 +286,4 @@ impl Database {
     pub fn conn(&self) -> &Connection {
         &self.conn
     }
-
 }

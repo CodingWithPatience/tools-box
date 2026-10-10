@@ -1,5 +1,6 @@
 pub mod api_tester;
 pub mod diff_viewer;
+pub mod file_editor;
 pub mod hosts_manager;
 pub mod json_editor;
 pub mod note_taker;
@@ -21,6 +22,7 @@ pub fn register_all_plugins() -> Vec<Box<dyn Plugin>> {
         Box::new(api_tester::ApiTesterPlugin::new()),
         Box::new(note_taker::NoteTakerPlugin::new()),
         Box::new(ssh_client::SshClientPlugin::new()),
+        Box::new(file_editor::FileEditorPlugin::new()),
     ];
 
     log::info!("已注册 {} 个插件", plugins.len());

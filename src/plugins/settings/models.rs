@@ -26,7 +26,7 @@ impl Default for AppSettings {
             theme: "dark".to_string(),
             font_size: 14.0,
             sidebar_width: 200.0,
-            tool_hotkeys: vec!['1', '2', '3', '4', '5', '6', '7'],
+            tool_hotkeys: vec!['1', '2', '3', '4', '5', '6', '7', '8'],
             auto_start: false,
         }
     }
@@ -58,6 +58,34 @@ impl AppSettings {
         }
     }
 
+    /// 按插件数量补齐缺失的工具热键，返回设置是否发生变化
+    ///
+    /// 新增插件后会多出一个工具，而老数据库里保存的热键数量可能不足；
+    /// 这里按未占用的字符（数字优先）自动补位，避免新工具没有可用热键。
+    pub fn ensure_tool_hotkeys(&mut self, plugin_count: usize) -> bool {
+        if self.tool_hotkeys.len() >= plugin_count {
+            return false;
+        }
+
+        let candidates: Vec<char> = "1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZ".chars().collect();
+        while self.tool_hotkeys.len() < plugin_count {
+            let Some(candidate) = candidates
+                .iter()
+                .copied()
+                .find(|candidate| !self.tool_hotkeys.contains(candidate))
+            else {
+                break;
+            };
+            self.tool_hotkeys.push(candidate);
+        }
+
+        log::info!(
+            "已为新增工具补齐热键: {}",
+            self.tool_hotkeys.iter().collect::<String>()
+        );
+        true
+    }
+
     /// 保存设置到数据库
     pub fn save(&self, conn: &Connection) -> Result<()> {
         let hotkeys_str: String = self.tool_hotkeys.iter().collect();
@@ -81,5 +109,38 @@ impl AppSettings {
         log::info!("设置保存成功");
         Ok(())
     }
+}
 
+#[cfg(test)]
+mod tests {
+    use super::AppSettings;
+
+    #[test]
+    fn keeps_hotkeys_when_plugin_count_matches() {
+        let mut settings = AppSettings::default();
+
+        assert!(!settings.ensure_tool_hotkeys(8));
+        assert_eq!(
+            settings.tool_hotkeys,
+            vec!['1', '2', '3', '4', '5', '6', '7', '8']
+        );
+    }
+
+    #[test]
+    fn fills_missing_hotkeys_with_unused_characters() {
+        let mut settings = AppSettings::default();
+        settings.tool_hotkeys = vec!['1', '2', '3'];
+
+        assert!(settings.ensure_tool_hotkeys(6));
+        assert_eq!(settings.tool_hotkeys, vec!['1', '2', '3', '4', '5', '6']);
+    }
+
+    #[test]
+    fn skips_characters_already_used_by_other_tools() {
+        let mut settings = AppSettings::default();
+        settings.tool_hotkeys = vec!['8', '2'];
+
+        assert!(settings.ensure_tool_hotkeys(4));
+        assert_eq!(settings.tool_hotkeys, vec!['8', '2', '1', '3']);
+    }
 }
