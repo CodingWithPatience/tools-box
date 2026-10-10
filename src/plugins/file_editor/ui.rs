@@ -5,9 +5,13 @@
 //! 避免 egui 渲染过程中的借用冲突。
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use egui::text::LayoutJob;
 use egui::{Context, RichText, Ui};
 use rusqlite::Connection;
+
+use crate::utils::highlight::SyntaxHighlighter;
 
 use super::document;
 use super::{models, store};
@@ -20,6 +24,8 @@ const LIST_MAX_WIDTH: f32 = 520.0;
 const LIST_PANEL_ID: &str = "file_editor_list";
 /// 编辑器区域可编辑行数（撑开滚动区）
 const EDITOR_DESIRED_ROWS: usize = 24;
+/// 参与语法着色的最大文本长度（字节）：超过后按纯文本布局，避免拖慢输入
+const HIGHLIGHT_MAX_BYTES: usize = 128 * 1024;
 
 /// 当前打开的弹窗
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +81,8 @@ enum Action {
     CloseTab(usize),
     /// 保存当前标签
     SaveActive,
+    /// 另存为：写入用户选择的新路径并切换标签到新文件
+    SaveAsActive,
     /// 放弃修改并重新读取当前标签
     ReloadActive,
     /// 从常用列表移除条目
@@ -114,6 +122,167 @@ fn should_persist_width(pointer_down: bool, current: f32, last_saved: f32) -> bo
     !pointer_down && (current - last_saved).abs() >= 0.5
 }
 
+/// 该长度的文本是否参与语法着色
+fn should_highlight_text(len: usize) -> bool {
+    len <= HIGHLIGHT_MAX_BYTES
+}
+
+/// 按最近打开时间排序（未打开过的排在最后，其次按路径排序保证稳定）
+fn sort_files_by_recent(files: &mut [models::FavoriteFile]) {
+    files.sort_by(
+        |left, right| match (&right.last_opened_at, &left.last_opened_at) {
+            (Some(right_time), Some(left_time)) => right_time
+                .cmp(left_time)
+                .then_with(|| left.path.cmp(&right.path)),
+            (Some(_), None) => std::cmp::Ordering::Greater,
+            (None, Some(_)) => std::cmp::Ordering::Less,
+            (None, None) => left.path.cmp(&right.path),
+        },
+    );
+}
+
+/// 另存为成功后更新标签的路径与显示名
+///
+/// 只有目标路径与原路径不同时才解除与原列表条目的关联，
+/// 否则"另存为到原路径"会让点列表条目再开一个重复标签。
+fn apply_saved_as(tab: &mut models::EditorTab, target: &Path, disk: models::DiskState) {
+    let path_changed = tab.path != target;
+
+    tab.display_name = target
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| target.display().to_string());
+    tab.path = target.to_path_buf();
+    if path_changed {
+        tab.file_id = None;
+    }
+    tab.disk = disk;
+    tab.dirty = false;
+    tab.message = None;
+}
+
+/// 纯文本（不着色）布局
+fn plain_layout_job(text: &str, font_size: f32) -> LayoutJob {
+    let mut job = LayoutJob::default();
+    job.append(
+        text,
+        0.0,
+        egui::TextFormat {
+            font_id: egui::FontId::monospace(font_size),
+            ..Default::default()
+        },
+    );
+    job
+}
+
+/// 一次布局除文本内容外的参数（与文本内容一起构成缓存键）
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct LayoutParams<'a> {
+    /// 高亮语言（`None` 为纯文本）
+    language: Option<&'a str>,
+    /// 可用布局宽度
+    width: f32,
+    /// 等宽字号
+    font_size: f32,
+    /// 是否暗色主题
+    dark: bool,
+}
+
+/// 编辑器语法高亮缓存
+///
+/// 每帧重新高亮整篇文本会明显拖慢输入，因此缓存最近一次布局结果。
+/// 缓存键包含**文本内容本身**（而不是版本计数器）：这样无论是编辑、重载还是
+/// 切换到另一个内容相同的标签，都能得到与当前文本一致的布局结果——egui 会把
+/// 这个返回值直接用于绘制与光标定位，键里缺少文本身份会导致显示错内容或光标错位。
+#[derive(Default)]
+struct HighlightCache {
+    /// 上次布局的文本内容
+    text: String,
+    /// 上次布局的参数
+    params: Option<LayoutParamsOwned>,
+    /// 缓存的布局结果
+    galley: Option<Arc<egui::Galley>>,
+    /// 实际执行布局的次数（仅供测试断言缓存命中）
+    #[cfg(test)]
+    layouts: u32,
+}
+
+/// 缓存中保存的布局参数（拥有语言字符串）
+#[derive(Debug, Clone, PartialEq)]
+struct LayoutParamsOwned {
+    /// 高亮语言
+    language: Option<String>,
+    /// 可用布局宽度
+    width: f32,
+    /// 等宽字号
+    font_size: f32,
+    /// 是否暗色主题
+    dark: bool,
+}
+
+impl LayoutParamsOwned {
+    /// 与本次布局参数是否一致
+    fn matches(&self, params: LayoutParams<'_>) -> bool {
+        self.language.as_deref() == params.language
+            && (self.width - params.width).abs() < 1.0
+            && (self.font_size - params.font_size).abs() <= f32::EPSILON
+            && self.dark == params.dark
+    }
+}
+
+impl HighlightCache {
+    /// 取得与当前文本和参数匹配的布局结果，必要时重新高亮并布局
+    fn galley(
+        &mut self,
+        ui: &Ui,
+        highlighter: &SyntaxHighlighter,
+        text: &str,
+        params: LayoutParams<'_>,
+    ) -> Arc<egui::Galley> {
+        if let Some(galley) = &self.galley {
+            // 先比较廉价参数（长度不同立即判为未命中），再比较文本内容
+            if self.text.len() == text.len()
+                && self
+                    .params
+                    .as_ref()
+                    .is_some_and(|saved| saved.matches(params))
+                && self.text == text
+            {
+                return galley.clone();
+            }
+        }
+
+        let mut job = if should_highlight_text(text.len()) {
+            highlighter.highlight_to_layout_job(
+                text,
+                params.language,
+                params.font_size,
+                params.dark,
+            )
+        } else {
+            plain_layout_job(text, params.font_size)
+        };
+        job.wrap.max_width = params.width;
+
+        let galley = ui.fonts(|fonts| fonts.layout_job(job));
+        self.galley = Some(galley.clone());
+        self.text.clear();
+        self.text.push_str(text);
+        self.params = Some(LayoutParamsOwned {
+            language: params.language.map(str::to_string),
+            width: params.width,
+            font_size: params.font_size,
+            dark: params.dark,
+        });
+        #[cfg(test)]
+        {
+            self.layouts += 1;
+        }
+
+        galley
+    }
+}
+
 /// 常用文件编辑器界面状态
 pub struct FileEditorUi {
     /// 自定义目录
@@ -146,6 +315,14 @@ pub struct FileEditorUi {
     status: String,
     /// 数据库是否可写（只读时在顶部显示警告）
     storage_writable: bool,
+    /// 语法高亮器（首次进入插件时懒加载，避免拖慢程序启动）
+    highlighter: Option<SyntaxHighlighter>,
+    /// 编辑器语法高亮缓存
+    highlight_cache: HighlightCache,
+    /// 列表是否按最近打开时间排序
+    sort_by_recent: bool,
+    /// 上一帧窗口是否处于焦点（用于重新获得焦点时检查外部修改）
+    was_focused: bool,
     /// 是否已从数据库加载
     initialized: bool,
 }
@@ -169,6 +346,10 @@ impl FileEditorUi {
             last_saved_width: store::DEFAULT_LIST_WIDTH,
             status: "就绪".to_string(),
             storage_writable: true,
+            highlighter: None,
+            highlight_cache: HighlightCache::default(),
+            sort_by_recent: false,
+            was_focused: false,
             initialized: false,
         }
     }
@@ -195,6 +376,19 @@ impl FileEditorUi {
         if !self.storage_writable {
             self.render_storage_warning(ui);
         }
+
+        // 窗口重新获得焦点时检查活动标签的磁盘状态：长时间停留同一标签也能发现外部修改
+        let focused = ui
+            .ctx()
+            .input(|input| input.viewport().focused)
+            .unwrap_or(false);
+        if focused
+            && !self.was_focused
+            && let Some(index) = self.active_tab.filter(|index| *index < self.tabs.len())
+        {
+            self.check_external_change(index);
+        }
+        self.was_focused = focused;
 
         if self.can_save_active_tab() && self.save_shortcut_pressed(ui.ctx()) {
             actions.push(Action::SaveActive);
@@ -322,6 +516,30 @@ impl FileEditorUi {
             {
                 actions.push(Action::ReloadActive);
             }
+
+            // 只读预览（超过 2 MB 只加载了前 2 MB）不能另存为，否则会把截断内容当完整文件写出
+            let can_save_as = self
+                .active_tab
+                .and_then(|index| self.tabs.get(index))
+                .is_some_and(|tab| !tab.read_only);
+            if ui
+                .add_enabled(can_save_as, egui::Button::new("📄 另存为…"))
+                .on_hover_text("把当前内容另存到其它路径，并把标签切换到新文件")
+                .clicked()
+            {
+                actions.push(Action::SaveAsActive);
+            }
+
+            ui.separator();
+
+            let mut sort_by_recent = self.sort_by_recent;
+            if ui
+                .checkbox(&mut sort_by_recent, "⇅ 最近打开")
+                .on_hover_text("按最近打开时间排序常用文件")
+                .changed()
+            {
+                self.sort_by_recent = sort_by_recent;
+            }
         });
     }
 
@@ -335,7 +553,10 @@ impl FileEditorUi {
     /// 渲染左侧目录 / 文件列表
     fn render_file_list(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
         let directories = self.directories.clone();
-        let files = self.files.clone();
+        let mut files = self.files.clone();
+        if self.sort_by_recent {
+            sort_files_by_recent(&mut files);
+        }
 
         egui::ScrollArea::vertical()
             .id_salt("file_editor_list_scroll")
@@ -491,18 +712,47 @@ impl FileEditorUi {
         self.render_editor_toolbar(ui, active, actions);
         self.render_tab_message(ui, active);
 
+        // 语法高亮：按文本内容 + 布局宽度 / 字号 / 主题 / 语言缓存布局结果
+        let language = models::highlight_language(&self.tabs[active].path);
+        let font_size = ui
+            .style()
+            .text_styles
+            .get(&egui::TextStyle::Monospace)
+            .map(|font| font.size)
+            .unwrap_or(14.0);
+        let dark = ui.visuals().dark_mode;
+        let highlighter = self.highlighter.get_or_insert_with(SyntaxHighlighter::new);
+        let cache = &mut self.highlight_cache;
+        let tabs = &mut self.tabs;
+
         egui::ScrollArea::both()
             .id_salt("file_editor_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                let tab = &mut self.tabs[active];
+                let tab = &mut tabs[active];
                 let editable = !tab.read_only;
+                let language_ref = language.as_deref();
+                let mut layouter = |ui: &Ui, text: &str, wrap_width: f32| -> Arc<egui::Galley> {
+                    cache.galley(
+                        ui,
+                        highlighter,
+                        text,
+                        LayoutParams {
+                            language: language_ref,
+                            width: wrap_width,
+                            font_size,
+                            dark,
+                        },
+                    )
+                };
+
                 let response = ui.add(
                     egui::TextEdit::multiline(&mut tab.text)
                         .code_editor()
                         .desired_width(f32::INFINITY)
                         .desired_rows(EDITOR_DESIRED_ROWS)
-                        .interactive(editable),
+                        .interactive(editable)
+                        .layouter(&mut layouter),
                 );
 
                 if response.changed() {
@@ -649,10 +899,10 @@ impl FileEditorUi {
                                     .desired_width(320.0)
                                     .hint_text("例如 C:\\Users\\me\\.gitconfig"),
                             );
-                            if ui.button("📂 浏览…").clicked() {
-                                if let Some(path) = rfd::FileDialog::new().pick_file() {
-                                    self.add_form.path = path.display().to_string();
-                                }
+                            if ui.button("📂 浏览…").clicked()
+                                && let Some(path) = rfd::FileDialog::new().pick_file()
+                            {
+                                self.add_form.path = path.display().to_string();
                             }
                         });
                         ui.end_row();
@@ -1019,6 +1269,11 @@ impl FileEditorUi {
                         self.save_tab(index);
                     }
                 }
+                Action::SaveAsActive => {
+                    if let Some(index) = self.active_tab {
+                        self.save_tab_as(index);
+                    }
+                }
                 Action::ReloadActive => {
                     if let Some(index) = self.active_tab {
                         self.reload_tab(index);
@@ -1173,6 +1428,69 @@ impl FileEditorUi {
         }
     }
 
+    /// 另存为：把当前内容写入用户选择的新路径，并把标签切换到新文件
+    fn save_tab_as(&mut self, index: usize) {
+        if index >= self.tabs.len() {
+            return;
+        }
+
+        // 只读预览只加载了前 2 MB，另存为会写出截断内容，直接拒绝
+        if self.tabs[index].read_only {
+            self.status = "只读预览不可另存为（文件超过 2 MB 上限）".to_string();
+            log::info!(
+                "常用文件编辑器忽略只读标签的另存为请求: {}",
+                self.tabs[index].path.display()
+            );
+            return;
+        }
+
+        let file_name = self.tabs[index]
+            .path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let Some(target) = rfd::FileDialog::new().set_file_name(&file_name).save_file() else {
+            return;
+        };
+
+        if models::is_hosts_file(&target) {
+            self.status = "hosts 文件请使用 Hosts 管理器插件编辑".to_string();
+            return;
+        }
+
+        let (text, encoding, line_ending) = {
+            let tab = &self.tabs[index];
+            (tab.text.clone(), tab.encoding, tab.line_ending)
+        };
+
+        match document::save(&target, &text, encoding, line_ending) {
+            Ok(disk) => {
+                // 目标已是列表中的条目时重新绑定，避免重复添加同一个文件
+                let target_key = target.display().to_string();
+                let existing = self
+                    .files
+                    .iter()
+                    .find(|file| file.path.eq_ignore_ascii_case(&target_key))
+                    .map(|file| file.id);
+
+                let tab = &mut self.tabs[index];
+                apply_saved_as(tab, &target, disk);
+                if let Some(id) = existing {
+                    tab.file_id = Some(id);
+                }
+
+                self.status = format!("已另存为 {}", target.display());
+                log::info!("常用文件编辑器另存为: {}", target.display());
+            }
+            Err(error) => {
+                let message = format!("另存为失败: {error}");
+                self.tabs[index].message = Some(message.clone());
+                self.status = message.clone();
+                log::error!("常用文件编辑器另存为失败 {}: {error}", target.display());
+            }
+        }
+    }
+
     /// 放弃修改并重新读取标签内容
     fn reload_tab(&mut self, index: usize) {
         if index >= self.tabs.len() {
@@ -1275,11 +1593,16 @@ impl FileEditorUi {
 
 #[cfg(test)]
 mod tests {
-    use super::{FileEditorUi, active_after_close, should_persist_width};
+    use super::{
+        FileEditorUi, HIGHLIGHT_MAX_BYTES, HighlightCache, LayoutParams, active_after_close,
+        apply_saved_as, should_highlight_text, should_persist_width, sort_files_by_recent,
+    };
     use crate::plugins::file_editor::store;
+    use crate::utils::highlight::SyntaxHighlighter;
     use rusqlite::Connection;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::Arc;
 
     /// 建立与 `storage::database` 一致的表结构（内存库）
     fn test_connection() -> Connection {
@@ -1384,6 +1707,15 @@ mod tests {
         assert_eq!(state.tabs[0].line_ending, super::models::LineEnding::CrLf);
         assert!(!state.tabs[0].dirty);
 
+        // 语法高亮缓存：内容与宽度未变化时不应重复布局
+        let layouts_before = state.highlight_cache.layouts;
+        render_frame(&ctx, &mut state, &conn);
+        render_frame(&ctx, &mut state, &conn);
+        assert_eq!(
+            state.highlight_cache.layouts, layouts_before,
+            "内容与宽度未变化时不应重复高亮布局"
+        );
+
         state.tabs[0].text = "key = 2\n".to_string();
         state.tabs[0].dirty = true;
         render_frame(&ctx, &mut state, &conn);
@@ -1411,7 +1743,182 @@ mod tests {
         assert!(state.tabs.is_empty());
         assert_eq!(state.pending_close, None);
 
+        // 重载后高亮缓存必须跟随新内容（否则界面继续显示重载前的文本）
+        state.open_file(&conn, id, &path, "flow.toml".to_string());
+        fs::write(&path, "key = 77\r\n").expect("改写测试文件失败");
+        state.reload_tab(0);
+        render_frame(&ctx, &mut state, &conn);
+        assert_eq!(
+            state.highlight_cache.text, state.tabs[0].text,
+            "重载后高亮缓存必须与标签文本一致"
+        );
+        assert_eq!(state.tabs[0].text, "key = 77\n");
+
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn highlights_only_reasonable_text_sizes() {
+        assert!(should_highlight_text(0));
+        assert!(should_highlight_text(HIGHLIGHT_MAX_BYTES));
+        assert!(!should_highlight_text(HIGHLIGHT_MAX_BYTES + 1));
+    }
+
+    #[test]
+    fn highlight_cache_reuses_layout_for_unchanged_text() {
+        let ctx = egui::Context::default();
+        let highlighter = SyntaxHighlighter::new();
+        let mut cache = HighlightCache::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(600.0, 400.0),
+            )),
+            ..Default::default()
+        };
+        let params = |language: Option<&'static str>| LayoutParams {
+            language,
+            width: 400.0,
+            font_size: 14.0,
+            dark: true,
+        };
+
+        let mut first = None;
+        let mut second = None;
+        let mut same_length = None;
+        let mut other_language = None;
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                first = Some(cache.galley(ui, &highlighter, "key = 1\n", params(Some("TOML"))));
+                second = Some(cache.galley(ui, &highlighter, "key = 1\n", params(Some("TOML"))));
+                // 长度相同但内容不同（等价于"同版本号、不同文本"，必须重新布局）
+                same_length =
+                    Some(cache.galley(ui, &highlighter, "key = 2\n", params(Some("TOML"))));
+                // 内容相同但语言不同也必须重新布局
+                other_language = Some(cache.galley(ui, &highlighter, "key = 2\n", params(None)));
+            });
+        });
+
+        let first = first.expect("首次布局应成功");
+        let second = second.expect("第二次布局应成功");
+        let same_length = same_length.expect("内容变化后的布局应成功");
+        let other_language = other_language.expect("语言变化后的布局应成功");
+
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "文本与参数都不变时应复用同一布局"
+        );
+        assert!(
+            !Arc::ptr_eq(&first, &same_length),
+            "文本内容变化后必须重新布局（不能只看长度或版本号）"
+        );
+        assert_eq!(
+            cache.layouts, 3,
+            "首次、内容变化、语言变化各布局一次（语言变化也必须重新布局）"
+        );
+        assert_eq!(cache.text, "key = 2\n", "缓存应记录最近一次布局的文本");
+        assert_eq!(
+            other_language.len(),
+            same_length.len(),
+            "语言变化后的布局对应同一份文本"
+        );
+    }
+
+    #[test]
+    fn sorts_files_by_recent_open_time() {
+        let file = |id: i64, path: &str, opened: Option<&str>| super::models::FavoriteFile {
+            id,
+            directory_id: None,
+            path: path.to_string(),
+            alias: None,
+            sort_order: 0,
+            last_opened_at: opened.map(str::to_string),
+        };
+
+        let mut files = vec![
+            file(1, "C:\\a.toml", None),
+            file(2, "C:\\b.toml", Some("2026-10-10 10:00:00")),
+            file(3, "C:\\c.toml", Some("2026-10-11 10:00:00")),
+            file(4, "C:\\d.toml", None),
+        ];
+        sort_files_by_recent(&mut files);
+
+        let order: Vec<i64> = files.iter().map(|file| file.id).collect();
+        assert_eq!(
+            order,
+            vec![3, 2, 1, 4],
+            "最近打开的排在前面，未打开过的按路径稳定排在最后"
+        );
+    }
+
+    #[test]
+    fn applies_saved_as_target_to_tab() {
+        let mut tab = super::models::EditorTab {
+            file_id: Some(7),
+            path: PathBuf::from("C:\\old.toml"),
+            display_name: "old.toml".to_string(),
+            text: "key = 1\n".to_string(),
+            dirty: true,
+            disk: super::models::DiskState {
+                modified: None,
+                len: 8,
+            },
+            encoding: super::models::TextEncoding::Utf8,
+            line_ending: super::models::LineEnding::Lf,
+            read_only: false,
+            message: Some("旧提示".to_string()),
+        };
+        let target = PathBuf::from("C:\\new\\config.toml");
+        let disk = super::models::DiskState {
+            modified: None,
+            len: 16,
+        };
+
+        apply_saved_as(&mut tab, &target, disk);
+
+        assert_eq!(tab.path, target);
+        assert_eq!(tab.display_name, "config.toml");
+        assert_eq!(tab.disk, disk);
+        assert_eq!(tab.file_id, None, "另存到新路径后不应再关联原列表条目");
+        assert!(!tab.dirty, "另存为成功后应清除未保存标记");
+        assert_eq!(tab.message, None, "另存为成功后应清除提示");
+    }
+
+    #[test]
+    fn keeps_file_link_when_saved_as_same_path() {
+        let mut tab = super::models::EditorTab {
+            file_id: Some(7),
+            path: PathBuf::from("C:\\old.toml"),
+            display_name: "old.toml".to_string(),
+            text: "key = 1\n".to_string(),
+            dirty: true,
+            disk: super::models::DiskState {
+                modified: None,
+                len: 8,
+            },
+            encoding: super::models::TextEncoding::Utf8,
+            line_ending: super::models::LineEnding::Lf,
+            read_only: false,
+            message: None,
+        };
+        let same = PathBuf::from("C:\\old.toml");
+
+        apply_saved_as(
+            &mut tab,
+            &same,
+            super::models::DiskState {
+                modified: None,
+                len: 8,
+            },
+        );
+
+        assert_eq!(
+            tab.file_id,
+            Some(7),
+            "另存为到原路径时应保持与列表条目的关联"
+        );
+        assert_eq!(tab.display_name, "old.toml");
+        assert!(!tab.dirty);
     }
 
     #[test]
@@ -1468,6 +1975,8 @@ mod tests {
     }
 
     #[test]
+    // 测试清理：Windows 下删除只读文件前需要清掉只读属性
+    #[allow(clippy::permissions_set_readonly_false)]
     fn save_failure_keeps_tab_open() {
         let conn = test_connection();
         let path = temp_file("readonly-attr.toml");

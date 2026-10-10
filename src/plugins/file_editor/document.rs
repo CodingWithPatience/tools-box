@@ -341,6 +341,8 @@ mod tests {
     }
 
     #[test]
+    // 测试清理：Windows 下删除只读文件前需要清掉只读属性
+    #[allow(clippy::permissions_set_readonly_false)]
     fn refuses_to_save_read_only_file() {
         let path = temp_file("readonly.conf");
         fs::write(&path, "key = 1\n").expect("写入测试文件失败");
