@@ -87,6 +87,16 @@ enum Action {
     SaveActive,
     /// 另存为：写入用户选择的新路径并切换标签到新文件
     SaveAsActive,
+    /// 展开 / 收起查找替换栏
+    ToggleFind,
+    /// 查找下一个匹配
+    FindNext,
+    /// 查找上一个匹配
+    FindPrev,
+    /// 替换当前匹配
+    ReplaceOne,
+    /// 替换全部匹配
+    ReplaceAll,
     /// 放弃修改并重新读取当前标签
     ReloadActive,
     /// 从常用列表移除条目
@@ -129,6 +139,143 @@ fn should_persist_width(pointer_down: bool, current: f32, last_saved: f32) -> bo
 /// 该长度的文本是否参与语法着色
 fn should_highlight_text(len: usize) -> bool {
     len <= HIGHLIGHT_MAX_BYTES
+}
+
+/// 一次查找命中的位置（同时给出字节与字符区间）
+///
+/// 字节区间用于文本切片，字符区间用于设置编辑器光标（`CCursor` 按字符计数）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MatchRange {
+    /// 起始字节偏移
+    start_byte: usize,
+    /// 结束字节偏移（不含）
+    end_byte: usize,
+    /// 起始字符下标
+    start_char: usize,
+    /// 结束字符下标（不含）
+    end_char: usize,
+}
+
+/// 判断 `byte` 处是否匹配 `query`，返回命中的结束字节偏移
+///
+/// `byte` 必须是字符边界（调用方均来自 `char_indices()` 或既有命中位置）。
+fn match_at(text: &str, byte: usize, query_chars: &[char], match_case: bool) -> Option<usize> {
+    let mut end = byte;
+    let mut chars = text[byte..].chars();
+
+    for expected in query_chars {
+        let actual = chars.next()?;
+        let equal = if match_case {
+            actual == *expected
+        } else if actual.is_ascii() && expected.is_ascii() {
+            // ASCII 快路径：避免每字符两次 to_lowercase 折叠（大文本查找会明显变慢）
+            actual.eq_ignore_ascii_case(expected)
+        } else {
+            actual.to_lowercase().eq(expected.to_lowercase())
+        };
+        if !equal {
+            return None;
+        }
+        end += actual.len_utf8();
+    }
+
+    Some(end)
+}
+
+/// 由字节区间构造命中位置（附带字符区间）
+///
+/// `start_byte` / `end_byte` 必须是字符边界。
+fn match_range(text: &str, start_byte: usize, end_byte: usize) -> MatchRange {
+    MatchRange {
+        start_byte,
+        end_byte,
+        start_char: text[..start_byte].chars().count(),
+        end_char: text[..end_byte].chars().count(),
+    }
+}
+
+/// 从 `from_byte` 向后查找，到达末尾后回到开头继续（环绕查找）
+fn find_next(text: &str, query: &str, from_byte: usize, match_case: bool) -> Option<MatchRange> {
+    if query.is_empty() {
+        return None;
+    }
+    let query_chars: Vec<char> = query.chars().collect();
+
+    let search = |start: usize| -> Option<MatchRange> {
+        text.char_indices()
+            .filter(|(byte, _)| *byte >= start)
+            .find_map(|(byte, _)| {
+                match_at(text, byte, &query_chars, match_case)
+                    .map(|end| match_range(text, byte, end))
+            })
+    };
+
+    search(from_byte.min(text.len())).or_else(|| search(0))
+}
+
+/// 从 `before_byte` 向前查找最近的一个命中，没有则环绕到文末的最后一个命中
+fn find_prev(text: &str, query: &str, before_byte: usize, match_case: bool) -> Option<MatchRange> {
+    if query.is_empty() {
+        return None;
+    }
+    let query_chars: Vec<char> = query.chars().collect();
+    let limit = before_byte.min(text.len());
+
+    let mut before: Option<MatchRange> = None;
+    let mut last: Option<MatchRange> = None;
+    for (byte, _) in text.char_indices() {
+        let Some(end) = match_at(text, byte, &query_chars, match_case) else {
+            continue;
+        };
+        let found = match_range(text, byte, end);
+        if end <= limit {
+            before = Some(found);
+        }
+        last = Some(found);
+    }
+
+    before.or(last)
+}
+
+/// 全部替换（不重叠），返回新文本与替换次数
+fn replace_all(text: &str, query: &str, replacement: &str, match_case: bool) -> (String, usize) {
+    if query.is_empty() {
+        return (text.to_string(), 0);
+    }
+    let query_chars: Vec<char> = query.chars().collect();
+    let mut result = String::with_capacity(text.len());
+    let mut cursor = 0;
+    let mut count = 0;
+
+    for (byte, _) in text.char_indices() {
+        if byte < cursor {
+            continue;
+        }
+        if let Some(end) = match_at(text, byte, &query_chars, match_case) {
+            result.push_str(&text[cursor..byte]);
+            result.push_str(replacement);
+            cursor = end;
+            count += 1;
+        }
+    }
+
+    result.push_str(&text[cursor..]);
+    (result, count)
+}
+
+/// 判断一段文本是否与查找内容完全一致
+fn matches_query(slice: &str, query: &str, match_case: bool) -> bool {
+    let query_chars: Vec<char> = query.chars().collect();
+    match_at(slice, 0, &query_chars, match_case) == Some(slice.len())
+}
+
+/// 计算字节偏移所在的行号（从 1 开始）
+///
+/// 偏移不是字符边界或超出文本长度时按文本末尾处理，不会 panic。
+fn line_number(text: &str, byte: usize) -> usize {
+    let end = byte.min(text.len());
+    let prefix = text.get(..end).unwrap_or(text);
+    prefix.matches('\n').count() + 1
 }
 
 /// 编辑区应显示的行数：按可用高度换算，让编辑器占满可见区域
@@ -309,6 +456,62 @@ impl HighlightJobCache {
     }
 }
 
+/// 编辑器的固定标识（查找替换需要读写它的光标状态）
+const EDITOR_ID_SALT: &str = "file_editor_editor";
+/// 查找命中高亮的底色
+///
+/// 用低透明度底色 + 描边：高亮叠在语法着色文字之上，
+/// 底色太实（或用预乘 alpha 传非预乘分量）都会把正文压得看不清。
+fn find_highlight_fill(dark: bool) -> egui::Color32 {
+    if dark {
+        egui::Color32::from_rgba_unmultiplied(0xE0, 0xC0, 0x40, 0x38)
+    } else {
+        egui::Color32::from_rgba_unmultiplied(0xB0, 0x7A, 0x00, 0x2E)
+    }
+}
+
+/// 查找命中高亮的描边（低透明度底色下依然能一眼看到命中范围）
+fn find_highlight_stroke(dark: bool) -> egui::Color32 {
+    if dark {
+        egui::Color32::from_rgb(0xE0, 0xC0, 0x40)
+    } else {
+        egui::Color32::from_rgb(0xA0, 0x6A, 0x00)
+    }
+}
+
+/// 命中区间在当前布局中的矩形（与光标定位共用同一套字符下标）
+fn match_rect(galley: &egui::Galley, range: MatchRange) -> egui::Rect {
+    let start = galley.pos_from_ccursor(egui::text::CCursor::new(range.start_char));
+    let end = galley.pos_from_ccursor(egui::text::CCursor::new(range.end_char));
+
+    start.union(end)
+}
+
+/// 查找 / 替换状态
+#[derive(Default)]
+struct FindState {
+    /// 是否展开查找栏
+    visible: bool,
+    /// 查找内容
+    query: String,
+    /// 替换内容
+    replace: String,
+    /// 是否区分大小写
+    match_case: bool,
+    /// 当前命中（用于替换与"替换全部"的起点计算）
+    current: Option<MatchRange>,
+    /// 下一次查找的起始字节偏移（替换后从这里继续）
+    anchor: Option<usize>,
+    /// 上一次动作是替换（用于把"已替换"与"下一处命中"合并成一条提示）
+    replaced_once: bool,
+    /// 待应用到编辑器的选区（字符下标区间）
+    pending_selection: Option<(usize, usize)>,
+    /// 是否需要把选区滚动到可见区域（egui 只在交互改变选区时自动滚动）
+    pending_scroll: bool,
+    /// 结果提示
+    message: String,
+}
+
 /// 常用文件编辑器界面状态
 pub struct FileEditorUi {
     /// 自定义目录
@@ -345,6 +548,10 @@ pub struct FileEditorUi {
     highlighter: Option<SyntaxHighlighter>,
     /// 编辑器语法高亮缓存（缓存最近一次的 LayoutJob）
     highlight_job_cache: HighlightJobCache,
+    /// 查找 / 替换状态
+    find: FindState,
+    /// 编辑器的持久 Id（查找结果要读写它的光标状态；同时便于测试断言）
+    editor_id: Option<egui::Id>,
     /// 列表是否按最近打开时间排序
     sort_by_recent: bool,
     /// 上一帧窗口是否处于焦点（用于重新获得焦点时检查外部修改）
@@ -374,6 +581,8 @@ impl FileEditorUi {
             storage_writable: true,
             highlighter: None,
             highlight_job_cache: HighlightJobCache::default(),
+            find: FindState::default(),
+            editor_id: None,
             sort_by_recent: false,
             was_focused: false,
             initialized: false,
@@ -554,6 +763,15 @@ impl FileEditorUi {
                 .clicked()
             {
                 actions.push(Action::SaveAsActive);
+            }
+
+            let find_visible = self.find.visible;
+            if ui
+                .add_enabled(has_tab, egui::SelectableLabel::new(find_visible, "🔍 查找"))
+                .on_hover_text("查找 / 替换（Ctrl+F 保留给全局插件搜索）")
+                .clicked()
+            {
+                actions.push(Action::ToggleFind);
             }
 
             ui.separator();
@@ -738,6 +956,10 @@ impl FileEditorUi {
         self.render_editor_toolbar(ui, active, actions);
         self.render_tab_message(ui, active);
 
+        if self.find.visible {
+            self.render_find_bar(ui, actions);
+        }
+
         // 语法高亮：按文本内容 + 字号 / 主题 / 语言缓存布局结果（不做自动换行）
         let language = models::highlight_language(&self.tabs[active].path);
         let font_size = ui
@@ -750,6 +972,8 @@ impl FileEditorUi {
         let highlighter = self.highlighter.get_or_insert_with(SyntaxHighlighter::new);
         let cache = &mut self.highlight_job_cache;
         let tabs = &mut self.tabs;
+        let find = &mut self.find;
+        let editor_id_slot = &mut self.editor_id;
 
         egui::ScrollArea::both()
             .id_salt("file_editor_scroll")
@@ -757,6 +981,26 @@ impl FileEditorUi {
             .show(ui, |ui| {
                 let tab = &mut tabs[active];
                 let editable = !tab.read_only;
+
+                // 应用查找结果：设置编辑器选区（egui 的选区按字符下标计算）
+                //
+                // 这里算出的 Id 必须与下面 `TextEdit::id(...)` 使用的一致：
+                // `TextEdit::id_salt(s)` 内部把 salt 包成 `Id::new(s)` 再经 `Ui::make_persistent_id`，
+                // 直接传 `&str` 会得到另一个 Id，于是选区被写到别的状态槽位（编辑器读不到）。
+                let editor_id = ui.make_persistent_id(egui::Id::new(EDITOR_ID_SALT));
+                *editor_id_slot = Some(editor_id);
+                if let Some((start, end)) = find.pending_selection.take() {
+                    let mut text_state = egui::text_edit::TextEditState::load(ui.ctx(), editor_id)
+                        .unwrap_or_default();
+                    text_state
+                        .cursor
+                        .set_char_range(Some(egui::text::CCursorRange::two(
+                            egui::text::CCursor::new(start),
+                            egui::text::CCursor::new(end),
+                        )));
+                    text_state.store(ui.ctx(), editor_id);
+                    find.pending_scroll = true;
+                }
 
                 // 编辑区占满可见高度：行数按可用高度换算，长文本继续往下滚
                 let row_height =
@@ -786,13 +1030,288 @@ impl FileEditorUi {
                         .desired_width(f32::INFINITY)
                         .desired_rows(desired_rows)
                         .interactive(editable)
+                        .id(editor_id)
                         .layouter(&mut layouter),
                 );
 
                 if response.changed() {
                     tab.dirty = true;
+                    // 文本被编辑后原命中位置失效，需重新查找
+                    find.current = None;
+                    find.pending_selection = None;
+                }
+
+                // 命中高亮：egui 只在编辑器获得焦点时绘制自身选区（builder.rs:723-730），
+                // 而查找时焦点在查找框里，所以这里在文本之上自绘一层高亮。
+                if let Some(range) = find.current {
+                    let job = cache.job(
+                        highlighter,
+                        &tab.text,
+                        LayoutParams {
+                            language: language_ref,
+                            font_size,
+                            dark,
+                        },
+                    );
+                    let galley = ui.fonts(|fonts| fonts.layout_job(job));
+                    let rect = match_rect(&galley, range).translate(response.rect.min.to_vec2());
+                    if ui.is_rect_visible(rect) {
+                        ui.painter().rect(
+                            rect.expand(1.0),
+                            egui::CornerRadius::same(2),
+                            find_highlight_fill(dark),
+                            egui::Stroke::new(1.0, find_highlight_stroke(dark)),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                }
+
+                // egui 只在"本帧交互改变选区"时自动滚动，外部设置的查找选区需要手动滚动到可见区域
+                if find.pending_scroll {
+                    find.pending_scroll = false;
+                    if let Some(range) = find.current {
+                        let job = cache.job(
+                            highlighter,
+                            &tab.text,
+                            LayoutParams {
+                                language: language_ref,
+                                font_size,
+                                dark,
+                            },
+                        );
+                        let galley = ui.fonts(|fonts| fonts.layout_job(job));
+                        let cursor_rect =
+                            galley.pos_from_ccursor(egui::text::CCursor::new(range.end_char));
+                        ui.scroll_to_rect(cursor_rect.translate(response.rect.min.to_vec2()), None);
+                    }
                 }
             });
+    }
+
+    /// 渲染查找 / 替换栏
+    ///
+    /// 不做 Ctrl+F 绑定：`Ctrl+F` 由 app 级快捷键用于聚焦全局插件搜索框。
+    fn render_find_bar(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
+        // 只读预览（超过 2 MB 只加载前 2 MB）不允许替换
+        let read_only = self
+            .active_tab
+            .and_then(|index| self.tabs.get(index))
+            .is_some_and(|tab| tab.read_only);
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label("🔍");
+
+            let query = ui.add(
+                egui::TextEdit::singleline(&mut self.find.query)
+                    .desired_width(180.0)
+                    .hint_text("查找内容"),
+            );
+            if query.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                actions.push(Action::FindNext);
+            }
+
+            if ui.button("↑ 上一个").clicked() {
+                actions.push(Action::FindPrev);
+            }
+            if ui.button("↓ 下一个").clicked() {
+                actions.push(Action::FindNext);
+            }
+
+            if ui
+                .checkbox(&mut self.find.match_case, "区分大小写")
+                .changed()
+            {
+                // 匹配规则变了，旧命中作废
+                self.find.current = None;
+                self.find.anchor = None;
+            }
+            ui.separator();
+
+            ui.label("替换为");
+            let replacement = ui.add(
+                egui::TextEdit::singleline(&mut self.find.replace)
+                    .desired_width(180.0)
+                    .hint_text("替换内容"),
+            );
+            if replacement.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                actions.push(Action::ReplaceOne);
+            }
+
+            if ui
+                .add_enabled(
+                    self.find.current.is_some() && !read_only,
+                    egui::Button::new("替换"),
+                )
+                .on_hover_text("替换当前匹配并跳到下一个")
+                .clicked()
+            {
+                actions.push(Action::ReplaceOne);
+            }
+            if ui
+                .add_enabled(
+                    !self.find.query.is_empty() && !read_only,
+                    egui::Button::new("全部替换"),
+                )
+                .clicked()
+            {
+                actions.push(Action::ReplaceAll);
+            }
+
+            if read_only {
+                ui.weak("只读预览不可替换");
+            } else if !self.find.message.is_empty() {
+                ui.weak(&self.find.message);
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("✕").on_hover_text("关闭查找栏").clicked() {
+                    actions.push(Action::ToggleFind);
+                }
+            });
+        });
+        ui.separator();
+    }
+
+    /// 清除当前查找命中（切换标签或重新打开文件后原位置失效）
+    fn clear_find_match(&mut self) {
+        self.find.current = None;
+        self.find.anchor = None;
+        self.find.pending_selection = None;
+        self.find.pending_scroll = false;
+    }
+
+    /// 在当前标签中查找下一个 / 上一个匹配
+    fn find_in_active(&mut self, forward: bool) {
+        let Some(index) = self.active_tab.filter(|index| *index < self.tabs.len()) else {
+            return;
+        };
+        if self.find.query.is_empty() {
+            self.find.message = "请输入查找内容".to_string();
+            return;
+        }
+
+        let (tabs, find) = (&self.tabs, &mut self.find);
+        let text = &tabs[index].text;
+        let anchor = find
+            .anchor
+            .unwrap_or(if forward { 0 } else { text.len() })
+            .min(text.len());
+
+        let found = if forward {
+            find_next(text, &find.query, anchor, find.match_case)
+        } else {
+            find_prev(text, &find.query, anchor, find.match_case)
+        };
+
+        match found {
+            Some(found) => {
+                let line = line_number(text, found.start_byte);
+                find.message = if find.replaced_once {
+                    format!("已替换 1 处 · 下一处第 {line} 行")
+                } else {
+                    format!("第 {line} 行命中")
+                };
+                find.replaced_once = false;
+                find.anchor = Some(if forward {
+                    found.end_byte
+                } else {
+                    found.start_byte
+                });
+                find.current = Some(found);
+                find.pending_selection = Some((found.start_char, found.end_char));
+            }
+            None => {
+                find.message = if find.replaced_once {
+                    "已替换 1 处 · 未找到更多匹配".to_string()
+                } else {
+                    "未找到匹配".to_string()
+                };
+                find.replaced_once = false;
+                find.current = None;
+            }
+        }
+    }
+
+    /// 替换当前匹配，并把查找起点移到替换内容之后
+    fn replace_in_active(&mut self) {
+        let Some(index) = self.active_tab.filter(|index| *index < self.tabs.len()) else {
+            return;
+        };
+        if self.find.query.is_empty() {
+            self.find.message = "请输入查找内容".to_string();
+            return;
+        }
+        if self.tabs[index].read_only {
+            self.find.message = "只读预览不可替换".to_string();
+            log::info!(
+                "常用文件编辑器忽略只读标签的替换请求: {}",
+                self.tabs[index].path.display()
+            );
+            return;
+        }
+
+        let (tabs, find) = (&mut self.tabs, &mut self.find);
+        let tab = &mut tabs[index];
+
+        // 只有当前命中仍与查找内容一致时才替换（文本可能已被手动编辑）
+        let valid = find.current.filter(|range| {
+            tab.text
+                .get(range.start_byte..range.end_byte)
+                .is_some_and(|slice| matches_query(slice, &find.query, find.match_case))
+        });
+        let Some(range) = valid else {
+            find.current = None;
+            find.message = "请先查找匹配".to_string();
+            return;
+        };
+
+        tab.text
+            .replace_range(range.start_byte..range.end_byte, &find.replace);
+        tab.dirty = true;
+        find.anchor = Some(range.start_byte + find.replace.len());
+        find.current = None;
+        find.pending_selection = None;
+        find.replaced_once = true;
+        find.message = "已替换 1 处".to_string();
+        log::info!("常用文件编辑器替换一处: {}", tab.path.display());
+    }
+
+    /// 替换当前标签中的全部匹配
+    fn replace_all_in_active(&mut self) {
+        let Some(index) = self.active_tab.filter(|index| *index < self.tabs.len()) else {
+            return;
+        };
+        if self.find.query.is_empty() {
+            self.find.message = "请输入查找内容".to_string();
+            return;
+        }
+        if self.tabs[index].read_only {
+            self.find.message = "只读预览不可替换".to_string();
+            log::info!(
+                "常用文件编辑器忽略只读标签的替换请求: {}",
+                self.tabs[index].path.display()
+            );
+            return;
+        }
+
+        let (tabs, find) = (&mut self.tabs, &mut self.find);
+        let tab = &mut tabs[index];
+        let (text, count) = replace_all(&tab.text, &find.query, &find.replace, find.match_case);
+
+        if count == 0 {
+            find.current = None;
+            find.message = "未找到匹配".to_string();
+            return;
+        }
+
+        tab.text = text;
+        tab.dirty = true;
+        find.current = None;
+        find.anchor = None;
+        find.pending_selection = None;
+        find.replaced_once = false;
+        find.message = format!("已替换 {count} 处");
+        log::info!("常用文件编辑器替换全部: {} 处", count);
     }
 
     /// 渲染标签栏
@@ -1294,6 +1813,7 @@ impl FileEditorUi {
                 Action::ActivateTab(index) => {
                     if index < self.tabs.len() {
                         self.active_tab = Some(index);
+                        self.clear_find_match();
                         self.check_external_change(index);
                     }
                 }
@@ -1313,6 +1833,14 @@ impl FileEditorUi {
                         self.reload_tab(index);
                     }
                 }
+                Action::ToggleFind => self.find.visible = !self.find.visible,
+                Action::FindNext => self.find_in_active(true),
+                Action::FindPrev => self.find_in_active(false),
+                Action::ReplaceOne => {
+                    self.replace_in_active();
+                    self.find_in_active(true);
+                }
+                Action::ReplaceAll => self.replace_all_in_active(),
                 Action::RemoveFile(id) => self.remove_file(conn, id),
                 Action::Reveal(path) => self.reveal_in_explorer(&path),
                 Action::StartAddFile(directory_id) => {
@@ -1345,6 +1873,7 @@ impl FileEditorUi {
             .position(|tab| tab.file_id == Some(file_id) || tab.path == path)
         {
             self.active_tab = Some(index);
+            self.clear_find_match();
             self.check_external_change(index);
             return;
         }
@@ -1381,6 +1910,7 @@ impl FileEditorUi {
                     message,
                 });
                 self.active_tab = Some(self.tabs.len() - 1);
+                self.clear_find_match();
                 self.status = format!("已打开 {}", path.display());
                 log::info!("常用文件编辑器打开文件: {}", path.display());
             }
@@ -1531,6 +2061,9 @@ impl FileEditorUi {
             return;
         }
 
+        // 文本将被整体替换，旧查找命中作废
+        self.clear_find_match();
+
         let path = self.tabs[index].path.clone();
         match document::load(&path) {
             Ok(loaded) => {
@@ -1620,6 +2153,7 @@ impl FileEditorUi {
             return;
         }
 
+        self.clear_find_match();
         self.tabs.remove(index);
         self.active_tab = active_after_close(self.active_tab, index, self.tabs.len());
     }
@@ -1629,8 +2163,9 @@ impl FileEditorUi {
 mod tests {
     use super::{
         EDITOR_DESIRED_ROWS, FileEditorUi, HIGHLIGHT_MAX_BYTES, HighlightJobCache, LayoutParams,
-        active_after_close, apply_saved_as, editor_rows, should_highlight_text,
-        should_persist_width, sort_files_by_recent,
+        active_after_close, apply_saved_as, editor_rows, find_highlight_fill, find_next, find_prev,
+        line_number, replace_all, should_highlight_text, should_persist_width,
+        sort_files_by_recent,
     };
     use crate::plugins::file_editor::store;
     use crate::utils::highlight::SyntaxHighlighter;
@@ -1670,8 +2205,12 @@ mod tests {
         conn
     }
 
-    /// 渲染一帧界面：无窗口环境下验证布局与交互代码不会 panic
-    fn render_frame(ctx: &egui::Context, state: &mut FileEditorUi, conn: &Connection) {
+    /// 渲染一帧界面并返回输出（可检查实际绘制内容）
+    fn render_frame_output(
+        ctx: &egui::Context,
+        state: &mut FileEditorUi,
+        conn: &Connection,
+    ) -> egui::FullOutput {
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
@@ -1680,11 +2219,16 @@ mod tests {
             ..Default::default()
         };
 
-        let _ = ctx.run(input, |ctx| {
+        ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 state.render(ui, conn);
             });
-        });
+        })
+    }
+
+    /// 渲染一帧界面：无窗口环境下验证布局与交互代码不会 panic
+    fn render_frame(ctx: &egui::Context, state: &mut FileEditorUi, conn: &Connection) {
+        let _ = render_frame_output(ctx, state, conn);
     }
 
     /// 生成唯一的临时文件路径
@@ -1856,6 +2400,191 @@ mod tests {
             galley_width > 1000.0,
             "长行不应自动换行（否则不会出现横向滚动条），实际宽度 {galley_width}"
         );
+    }
+
+    #[test]
+    fn finds_matches_with_and_without_case() {
+        let text = "Name = a\nname = b\n";
+
+        let first = find_next(text, "name", 0, false).expect("不区分大小写应命中第一处");
+        assert_eq!(&text[first.start_byte..first.end_byte], "Name");
+
+        let second = find_next(text, "name", 0, true).expect("区分大小写应跳过 Name");
+        assert_eq!(&text[second.start_byte..second.end_byte], "name");
+
+        assert!(find_next(text, "missing", 0, true).is_none());
+        assert!(find_next(text, "", 0, true).is_none(), "空查询不应命中");
+    }
+
+    #[test]
+    fn find_next_wraps_around_and_reports_char_indices() {
+        let text = "配置 = 1\n键 = 2\n";
+
+        let found = find_next(text, "键", 0, true).expect("应命中中文");
+        assert_eq!(found.start_byte, 11, "字节偏移");
+        assert_eq!(found.start_char, 7, "字符下标（供编辑器选区使用）");
+        assert_eq!(&text[found.start_byte..found.end_byte], "键");
+
+        let wrapped = find_next(text, "配置", found.end_byte, true).expect("应环绕回到开头");
+        assert_eq!(wrapped.start_char, 0);
+    }
+
+    #[test]
+    fn find_prev_returns_nearest_before_and_wraps() {
+        let text = "a\nb\na\n";
+
+        let found = find_prev(text, "a", 3, true).expect("应命中前面的 a");
+        assert_eq!(found.start_byte, 0);
+
+        let wrapped = find_prev(text, "a", 0, true).expect("应环绕命中文末的 a");
+        assert_eq!(wrapped.start_byte, 4);
+
+        assert!(find_prev(text, "zz", 4, true).is_none());
+    }
+
+    #[test]
+    fn replaces_all_matches_without_overlap() {
+        let (text, count) = replace_all("aaa", "aa", "b", true);
+        assert_eq!((text.as_str(), count), ("ba", 1), "替换不重叠");
+
+        let (text, count) = replace_all("Key = 1\nkey = 2\n", "key", "param", false);
+        assert_eq!(text, "param = 1\nparam = 2\n");
+        assert_eq!(count, 2);
+
+        let (text, count) = replace_all("nothing", "zz", "x", false);
+        assert_eq!((text.as_str(), count), ("nothing", 0));
+    }
+
+    #[test]
+    fn counts_lines_for_match_position() {
+        assert_eq!(line_number("a\nb\nc", 0), 1);
+        assert_eq!(line_number("a\nb\nc", 2), 2);
+        assert_eq!(line_number("a\nb\nc", 4), 3);
+        assert_eq!(line_number("a\nb\nc", 999), 3, "越界偏移按文本末尾计算");
+    }
+
+    #[test]
+    fn find_and_replace_flow_updates_tab() {
+        let conn = test_connection();
+        let ctx = egui::Context::default();
+        let path = temp_file("find-flow.toml");
+        fs::write(&path, "key = 1\nother = 2\nkey = 3\n").expect("写入测试文件失败");
+
+        let mut state = FileEditorUi::new();
+        state.init(&conn);
+        let id = store::insert_file(&conn, None, &path.display().to_string(), None)
+            .expect("新增条目失败");
+        state.reload_data(&conn);
+        state.open_file(&conn, id, &path, "find-flow.toml".to_string());
+
+        state.find.visible = true;
+        state.find.query = "key".to_string();
+
+        state.find_in_active(true);
+        let first = state.find.current.expect("应命中第一处");
+        assert_eq!(first.start_byte, 0);
+
+        render_frame(&ctx, &mut state, &conn);
+        assert!(
+            state.find.pending_selection.is_none(),
+            "渲染后查找选区应已应用到编辑器"
+        );
+
+        // 关键回归：选区必须真正写进编辑器的 TextEditState（Id 不一致时这一步会失败）
+        let editor_id = state.editor_id.expect("渲染后应记录编辑器 id");
+        let text_state =
+            egui::text_edit::TextEditState::load(&ctx, editor_id).expect("应存在编辑器状态");
+        let applied = text_state.cursor.char_range().expect("应写入查找选区");
+        let mut applied_indices = [applied.primary.index, applied.secondary.index];
+        applied_indices.sort_unstable();
+        assert_eq!(
+            applied_indices,
+            [first.start_char, first.end_char],
+            "命中区间必须写入编辑器状态（否则只是滚动、没有选中）"
+        );
+
+        // 命中高亮必须真的画出来：焦点在查找框时 egui 不会绘制编辑器自身选区
+        let output = render_frame_output(&ctx, &mut state, &conn);
+        let fill = find_highlight_fill(ctx.style().visuals.dark_mode);
+        let painted = output
+            .shapes
+            .iter()
+            .any(|clipped| matches!(&clipped.shape, egui::Shape::Rect(rect) if rect.fill == fill));
+        assert!(painted, "命中处应绘制高亮底色");
+
+        // 替换当前匹配后应自动跳到下一处
+        state.find.replace = "param".to_string();
+        state.replace_in_active();
+        state.find_in_active(true);
+        assert!(state.tabs[0].dirty, "替换后应标记未保存");
+        let second = state.find.current.expect("应命中下一处");
+        assert_eq!(
+            &state.tabs[0].text[second.start_byte..second.end_byte],
+            "key"
+        );
+
+        state.replace_all_in_active();
+        assert_eq!(state.tabs[0].text, "param = 1\nother = 2\nparam = 3\n");
+        assert!(state.find.message.contains("1 处"));
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_only_tab_refuses_replace() {
+        let conn = test_connection();
+        let path = temp_file("huge-replace.toml");
+        let limit =
+            usize::try_from(super::document::MAX_EDITABLE_BYTES).expect("上限应能转换为 usize");
+        fs::write(&path, vec![b'a'; limit + 8]).expect("写入测试文件失败");
+
+        let mut state = FileEditorUi::new();
+        state.init(&conn);
+        let id = store::insert_file(&conn, None, &path.display().to_string(), None)
+            .expect("新增条目失败");
+        state.reload_data(&conn);
+        state.open_file(&conn, id, &path, "huge-replace.toml".to_string());
+        assert!(state.tabs[0].read_only);
+
+        state.find.query = "a".to_string();
+        state.find.replace = "b".to_string();
+        state.replace_all_in_active();
+
+        assert_eq!(state.tabs[0].text.len(), limit, "只读标签内容不应被替换");
+        assert!(!state.tabs[0].dirty, "只读标签不应被标记未保存");
+        assert!(state.find.message.contains("只读"));
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn replaces_multibyte_match_and_advances_anchor() {
+        let conn = test_connection();
+        let path = temp_file("cn-replace.toml");
+        fs::write(&path, "键 = 1\n键 = 2\n").expect("写入测试文件失败");
+
+        let mut state = FileEditorUi::new();
+        state.init(&conn);
+        let id = store::insert_file(&conn, None, &path.display().to_string(), None)
+            .expect("新增条目失败");
+        state.reload_data(&conn);
+        state.open_file(&conn, id, &path, "cn-replace.toml".to_string());
+
+        state.find.query = "键".to_string();
+        state.find.replace = "参数".to_string();
+
+        state.find_in_active(true);
+        state.replace_in_active();
+        assert_eq!(state.tabs[0].text, "参数 = 1\n键 = 2\n", "多字节替换");
+
+        // 替换后起点应移到替换内容之后，继续替换第二处
+        state.find_in_active(true);
+        state.replace_in_active();
+        assert_eq!(state.tabs[0].text, "参数 = 1\n参数 = 2\n");
+        assert!(state.tabs[0].dirty);
+        assert!(state.find.message.contains("已替换"));
+
+        let _ = fs::remove_file(&path);
     }
 
     #[test]
