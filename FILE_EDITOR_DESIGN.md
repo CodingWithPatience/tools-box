@@ -410,12 +410,18 @@ src/plugins/file_editor/
 12. **公共 API 文档注释**：新增的 `pub` 结构体与方法统一写 `///` 文档注释，
     `use` 语句集中在文件顶部，遵循 `cargo fmt` 与现有命名风格。
 13. **语法高亮**：通过 `TextEdit::layouter` 接入 `utils::highlight`（syntect）；
-    `HighlightCache` 以**文本内容本身**加（布局宽度、等宽字号、主题、语言）为键缓存 `Arc<Galley>`，
-    同一内容不会每帧重新高亮，而编辑、重载、切换标签等任何文本变化都必然重新布局
+    `HighlightJobCache` 以**文本内容本身**加（等宽字号、主题、语言）为键缓存 `LayoutJob`，
+    同一内容不会每帧重新高亮，而编辑、重载、切换标签等任何文本变化都必然重新高亮
     （egui 会把 layouter 的返回值直接用于绘制与光标定位，缓存键里缺少文本身份会导致显示错内容或光标错位）。
+    缓存 `LayoutJob` 而不是 `Galley`：布局与字形图集失效（缩放比例变化、图集重建）交给 epaint 自行处理，
+    在外部缓存 `Galley` 会绕过这套失效契约。
     超过 `HIGHLIGHT_MAX_BYTES`（128 KB）的文本按纯文本布局以避免输入卡顿。
     窗口重新获得焦点时会检查活动标签的磁盘状态（仅在本插件处于渲染状态时执行），
     长时间停留同一标签也能发现外部修改。
+14. **编辑区尺寸与滚动**：编辑器行数按可用高度换算（`editor_rows`，夹取 6~400 行、异常时回退默认值），
+    编辑区始终占满可见区域；布局不做自动换行（`job.wrap.max_width = f32::INFINITY`），
+    长行保持单行、宽度随内容增长，由外层 `ScrollArea::both()` 提供横向滚动条，
+    窗口缩窄时不会自动折行改变行高。
 
 ---
 
@@ -691,3 +697,42 @@ cargo clippy --all-targets # file_editor 相关 0 条告警
 脏标签保存前的"磁盘已变更"覆盖提示、同帧多动作的稳定标签标识、「⇅ 最近打开」开关持久化、
 大文件撤销栈内存（egui 默认 100 步、每步持有整份文本）、查找替换；
 插件未被渲染期间发生的磁盘改动暂不检查。
+
+### 12.7 编辑区高度与滚动修复（2026-10-10）
+
+界面实测反馈的问题：① 编辑区只占 `desired_rows(24)` 的最小高度，下方留大片空白；
+② 窗口缩窄时文本自动换行、高度随内容变化，且不出现横向滚动条。
+
+原因（对照 egui 0.31 源码确认）：`TextEdit` 的内容高度为
+`max(galley 高度, desired_rows × row_height)`（`text_edit/builder.rs:540-541`），固定 24 行即最小高度；
+多行布局默认按 `wrap_width = desired_width.min(available_width)` 折行
+（`builder.rs:512-518`、默认 layouter `:524`）。
+
+修复：
+
+1. 新增 `editor_rows(available_height, row_height)`：按可用高度换算行数（夹取 6~400 行，
+   行高或高度异常时回退默认 24 行），编辑区随面板高度铺满，长文本继续纵向滚动；
+2. 自定义 layouter 改为 `job.wrap.max_width = f32::INFINITY`（不折行）：长行保持单行、宽度随内容增长，
+   由外层 `ScrollArea::both()` 给出横向滚动条；
+3. 布局宽度因此恒为无穷大，从高亮缓存键中移除 `width` 维度（`LayoutParams` 只保留语言 / 字号 / 主题）；
+4. 同一轮代码审查发现：外部缓存 `Galley` 会绕过 epaint 的失效契约
+   （`pixels_per_point` / `max_texture_size` 变化、字形图集重建时 epaint 会整体重建字体系统并丢弃 galley 缓存，
+   见 `epaint-0.31.1/src/text/text_layout_types.rs:486-492`、`fonts.rs:447-462`），
+   跨不同缩放比例的显示器拖窗口可能出现文字错位。因此缓存对象由 `Galley` 改为 `LayoutJob`
+   （`HighlightJobCache`）：高亮结果仍被复用，布局与失效交给 epaint；每帧成本为 job 克隆与哈希。
+
+测试：新增 `editor_rows_fills_available_height`（高度换算 / 最小行数 / 上限 / 负高度 / NaN / ∞ / 0 行高回退），
+高亮缓存测试改名 `highlight_cache_reuses_job_for_unchanged_text` 并覆盖
+"文本变化 / 语言变化必须重新高亮"与"长行不折行（galley 宽度 > 1000px）"。
+
+验证：
+
+```text
+cargo test                 # 273 通过 / 1 忽略（file_editor 38 项）
+cargo build                # 无新增告警
+cargo build --release      # 仅 api_tester 既有 7 项告警
+cargo clippy --all-targets # file_editor 相关 0 条告警
+```
+
+仍待处理（本插件下阶段）：极长单行（压缩 JSON 等）在不折行下的超宽 galley 与绘制精度，
+可考虑加"软折行"开关或行长上限；其余见 §12.6 的待办清单。

@@ -22,8 +22,12 @@ const LIST_MIN_WIDTH: f32 = 180.0;
 const LIST_MAX_WIDTH: f32 = 520.0;
 /// 标签栏、列表等控件的唯一标识前缀
 const LIST_PANEL_ID: &str = "file_editor_list";
-/// 编辑器区域可编辑行数（撑开滚动区）
+/// 编辑器在缺少可用高度时的默认行数（撑开滚动区）
 const EDITOR_DESIRED_ROWS: usize = 24;
+/// 编辑区最少显示行数（可用高度很小时避免塌缩）
+const MIN_EDITOR_ROWS: f32 = 6.0;
+/// 编辑区最多显示行数（可用高度异常大时的保护上限）
+const MAX_EDITOR_ROWS: f32 = 400.0;
 /// 参与语法着色的最大文本长度（字节）：超过后按纯文本布局，避免拖慢输入
 const HIGHLIGHT_MAX_BYTES: usize = 128 * 1024;
 
@@ -127,6 +131,29 @@ fn should_highlight_text(len: usize) -> bool {
     len <= HIGHLIGHT_MAX_BYTES
 }
 
+/// 编辑区应显示的行数：按可用高度换算，让编辑器占满可见区域
+///
+/// `f32 → usize` 没有标准转换实现，这里先把结果夹取到
+/// `[MIN_EDITOR_ROWS, MAX_EDITOR_ROWS]` 的安全整数区间再取整，
+/// 因此不存在截断出异常值或符号问题的可能。
+fn editor_rows(available_height: f32, row_height: f32) -> usize {
+    if !row_height.is_finite()
+        || row_height <= 0.0
+        || !available_height.is_finite()
+        || available_height <= 0.0
+    {
+        return EDITOR_DESIRED_ROWS;
+    }
+
+    let rows = (available_height / row_height)
+        .floor()
+        .clamp(MIN_EDITOR_ROWS, MAX_EDITOR_ROWS);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let rows = rows as usize;
+
+    rows
+}
+
 /// 按最近打开时间排序（未打开过的排在最后，其次按路径排序保证稳定）
 fn sort_files_by_recent(files: &mut [models::FavoriteFile]) {
     files.sort_by(
@@ -176,12 +203,12 @@ fn plain_layout_job(text: &str, font_size: f32) -> LayoutJob {
 }
 
 /// 一次布局除文本内容外的参数（与文本内容一起构成缓存键）
+///
+/// 编辑器不做自动换行（长行交给横向滚动条），因此布局宽度恒为无穷大、无需入键。
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct LayoutParams<'a> {
     /// 高亮语言（`None` 为纯文本）
     language: Option<&'a str>,
-    /// 可用布局宽度
-    width: f32,
     /// 等宽字号
     font_size: f32,
     /// 是否暗色主题
@@ -190,21 +217,25 @@ struct LayoutParams<'a> {
 
 /// 编辑器语法高亮缓存
 ///
-/// 每帧重新高亮整篇文本会明显拖慢输入，因此缓存最近一次布局结果。
-/// 缓存键包含**文本内容本身**（而不是版本计数器）：这样无论是编辑、重载还是
-/// 切换到另一个内容相同的标签，都能得到与当前文本一致的布局结果——egui 会把
-/// 这个返回值直接用于绘制与光标定位，键里缺少文本身份会导致显示错内容或光标错位。
+/// 缓存**布局任务**（`LayoutJob`）而不是布局结果（`Galley`）：
+/// syntect 的高亮结果被复用，而 `Galley` 的失效（缩放比例变化、字形图集重建等）
+/// 交给 epaint 的字体系统按它自己的规则处理——在外部缓存 `Galley` 会绕过这套失效契约，
+/// 把窗口拖到不同缩放比例的显示器后可能出现文字错位。
+///
+/// 缓存键包含**文本内容本身**（而不是版本计数器）：编辑、重载或切换到内容相同的标签
+/// 都能得到与当前文本一致的结果；egui 会把 layouter 的返回值直接用于绘制与光标定位，
+/// 键里缺少文本身份会导致显示错内容或光标错位。
 #[derive(Default)]
-struct HighlightCache {
-    /// 上次布局的文本内容
+struct HighlightJobCache {
+    /// 上次高亮的文本内容
     text: String,
-    /// 上次布局的参数
+    /// 上次高亮的参数
     params: Option<LayoutParamsOwned>,
-    /// 缓存的布局结果
-    galley: Option<Arc<egui::Galley>>,
-    /// 实际执行布局的次数（仅供测试断言缓存命中）
+    /// 缓存的布局任务
+    job: Option<LayoutJob>,
+    /// 实际执行高亮的次数（仅供测试断言缓存命中）
     #[cfg(test)]
-    layouts: u32,
+    highlights: u32,
 }
 
 /// 缓存中保存的布局参数（拥有语言字符串）
@@ -212,8 +243,6 @@ struct HighlightCache {
 struct LayoutParamsOwned {
     /// 高亮语言
     language: Option<String>,
-    /// 可用布局宽度
-    width: f32,
     /// 等宽字号
     font_size: f32,
     /// 是否暗色主题
@@ -224,22 +253,20 @@ impl LayoutParamsOwned {
     /// 与本次布局参数是否一致
     fn matches(&self, params: LayoutParams<'_>) -> bool {
         self.language.as_deref() == params.language
-            && (self.width - params.width).abs() < 1.0
             && (self.font_size - params.font_size).abs() <= f32::EPSILON
             && self.dark == params.dark
     }
 }
 
-impl HighlightCache {
-    /// 取得与当前文本和参数匹配的布局结果，必要时重新高亮并布局
-    fn galley(
+impl HighlightJobCache {
+    /// 取得与当前文本和参数匹配的布局任务，必要时重新高亮
+    fn job(
         &mut self,
-        ui: &Ui,
         highlighter: &SyntaxHighlighter,
         text: &str,
         params: LayoutParams<'_>,
-    ) -> Arc<egui::Galley> {
-        if let Some(galley) = &self.galley {
+    ) -> LayoutJob {
+        if let Some(job) = &self.job {
             // 先比较廉价参数（长度不同立即判为未命中），再比较文本内容
             if self.text.len() == text.len()
                 && self
@@ -248,7 +275,7 @@ impl HighlightCache {
                     .is_some_and(|saved| saved.matches(params))
                 && self.text == text
             {
-                return galley.clone();
+                return job.clone();
             }
         }
 
@@ -262,24 +289,23 @@ impl HighlightCache {
         } else {
             plain_layout_job(text, params.font_size)
         };
-        job.wrap.max_width = params.width;
+        // 不自动换行：长行保持单行，由外层 ScrollArea 提供横向滚动条
+        job.wrap.max_width = f32::INFINITY;
 
-        let galley = ui.fonts(|fonts| fonts.layout_job(job));
-        self.galley = Some(galley.clone());
+        self.job = Some(job.clone());
         self.text.clear();
         self.text.push_str(text);
         self.params = Some(LayoutParamsOwned {
             language: params.language.map(str::to_string),
-            width: params.width,
             font_size: params.font_size,
             dark: params.dark,
         });
         #[cfg(test)]
         {
-            self.layouts += 1;
+            self.highlights += 1;
         }
 
-        galley
+        job
     }
 }
 
@@ -317,8 +343,8 @@ pub struct FileEditorUi {
     storage_writable: bool,
     /// 语法高亮器（首次进入插件时懒加载，避免拖慢程序启动）
     highlighter: Option<SyntaxHighlighter>,
-    /// 编辑器语法高亮缓存
-    highlight_cache: HighlightCache,
+    /// 编辑器语法高亮缓存（缓存最近一次的 LayoutJob）
+    highlight_job_cache: HighlightJobCache,
     /// 列表是否按最近打开时间排序
     sort_by_recent: bool,
     /// 上一帧窗口是否处于焦点（用于重新获得焦点时检查外部修改）
@@ -347,7 +373,7 @@ impl FileEditorUi {
             status: "就绪".to_string(),
             storage_writable: true,
             highlighter: None,
-            highlight_cache: HighlightCache::default(),
+            highlight_job_cache: HighlightJobCache::default(),
             sort_by_recent: false,
             was_focused: false,
             initialized: false,
@@ -712,7 +738,7 @@ impl FileEditorUi {
         self.render_editor_toolbar(ui, active, actions);
         self.render_tab_message(ui, active);
 
-        // 语法高亮：按文本内容 + 布局宽度 / 字号 / 主题 / 语言缓存布局结果
+        // 语法高亮：按文本内容 + 字号 / 主题 / 语言缓存布局结果（不做自动换行）
         let language = models::highlight_language(&self.tabs[active].path);
         let font_size = ui
             .style()
@@ -722,7 +748,7 @@ impl FileEditorUi {
             .unwrap_or(14.0);
         let dark = ui.visuals().dark_mode;
         let highlighter = self.highlighter.get_or_insert_with(SyntaxHighlighter::new);
-        let cache = &mut self.highlight_cache;
+        let cache = &mut self.highlight_job_cache;
         let tabs = &mut self.tabs;
 
         egui::ScrollArea::both()
@@ -731,26 +757,34 @@ impl FileEditorUi {
             .show(ui, |ui| {
                 let tab = &mut tabs[active];
                 let editable = !tab.read_only;
+
+                // 编辑区占满可见高度：行数按可用高度换算，长文本继续往下滚
+                let row_height =
+                    ui.fonts(|fonts| fonts.row_height(&egui::FontId::monospace(font_size)));
+                let desired_rows = editor_rows(ui.available_height(), row_height);
+
                 let language_ref = language.as_deref();
-                let mut layouter = |ui: &Ui, text: &str, wrap_width: f32| -> Arc<egui::Galley> {
-                    cache.galley(
-                        ui,
+                let mut layouter = |ui: &Ui, text: &str, _wrap_width: f32| -> Arc<egui::Galley> {
+                    let job = cache.job(
                         highlighter,
                         text,
                         LayoutParams {
                             language: language_ref,
-                            width: wrap_width,
                             font_size,
                             dark,
                         },
-                    )
+                    );
+
+                    // 布局交给 egui / epaint：它会按缩放比例与字形图集的变化自行失效重建
+                    ui.fonts(|fonts| fonts.layout_job(job))
                 };
 
                 let response = ui.add(
                     egui::TextEdit::multiline(&mut tab.text)
                         .code_editor()
+                        // 不折行时宽度由内容决定，这里让控件至少铺满可见宽度（点击空白处也能定位光标）
                         .desired_width(f32::INFINITY)
-                        .desired_rows(EDITOR_DESIRED_ROWS)
+                        .desired_rows(desired_rows)
                         .interactive(editable)
                         .layouter(&mut layouter),
                 );
@@ -1594,15 +1628,15 @@ impl FileEditorUi {
 #[cfg(test)]
 mod tests {
     use super::{
-        FileEditorUi, HIGHLIGHT_MAX_BYTES, HighlightCache, LayoutParams, active_after_close,
-        apply_saved_as, should_highlight_text, should_persist_width, sort_files_by_recent,
+        EDITOR_DESIRED_ROWS, FileEditorUi, HIGHLIGHT_MAX_BYTES, HighlightJobCache, LayoutParams,
+        active_after_close, apply_saved_as, editor_rows, should_highlight_text,
+        should_persist_width, sort_files_by_recent,
     };
     use crate::plugins::file_editor::store;
     use crate::utils::highlight::SyntaxHighlighter;
     use rusqlite::Connection;
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::Arc;
 
     /// 建立与 `storage::database` 一致的表结构（内存库）
     fn test_connection() -> Connection {
@@ -1707,13 +1741,13 @@ mod tests {
         assert_eq!(state.tabs[0].line_ending, super::models::LineEnding::CrLf);
         assert!(!state.tabs[0].dirty);
 
-        // 语法高亮缓存：内容与宽度未变化时不应重复布局
-        let layouts_before = state.highlight_cache.layouts;
+        // 语法高亮缓存：内容与参数未变化时不应重复高亮
+        let highlights_before = state.highlight_job_cache.highlights;
         render_frame(&ctx, &mut state, &conn);
         render_frame(&ctx, &mut state, &conn);
         assert_eq!(
-            state.highlight_cache.layouts, layouts_before,
-            "内容与宽度未变化时不应重复高亮布局"
+            state.highlight_job_cache.highlights, highlights_before,
+            "内容与参数未变化时不应重复高亮"
         );
 
         state.tabs[0].text = "key = 2\n".to_string();
@@ -1749,7 +1783,7 @@ mod tests {
         state.reload_tab(0);
         render_frame(&ctx, &mut state, &conn);
         assert_eq!(
-            state.highlight_cache.text, state.tabs[0].text,
+            state.highlight_job_cache.text, state.tabs[0].text,
             "重载后高亮缓存必须与标签文本一致"
         );
         assert_eq!(state.tabs[0].text, "key = 77\n");
@@ -1765,10 +1799,42 @@ mod tests {
     }
 
     #[test]
-    fn highlight_cache_reuses_layout_for_unchanged_text() {
+    fn highlight_cache_reuses_job_for_unchanged_text() {
         let ctx = egui::Context::default();
         let highlighter = SyntaxHighlighter::new();
-        let mut cache = HighlightCache::default();
+        let mut cache = HighlightJobCache::default();
+        let params = |language: Option<&'static str>| LayoutParams {
+            language,
+            font_size: 14.0,
+            dark: true,
+        };
+        let long_text = "x".repeat(400);
+
+        let first = cache.job(&highlighter, "key = 1\n", params(Some("TOML")));
+        let second = cache.job(&highlighter, "key = 1\n", params(Some("TOML")));
+        assert_eq!(cache.highlights, 1, "文本与参数都不变时不应重新高亮");
+        assert_eq!(first.text, second.text);
+
+        // 长度相同但内容不同（等价于"同版本号、不同文本"，必须重新高亮）
+        let same_length = cache.job(&highlighter, "key = 2\n", params(Some("TOML")));
+        assert_eq!(cache.highlights, 2, "文本内容变化后必须重新高亮");
+        assert_ne!(first.text, same_length.text);
+
+        // 内容相同但语言不同也必须重新高亮
+        let other_language = cache.job(&highlighter, "key = 2\n", params(None));
+        assert_eq!(cache.highlights, 3, "语言变化后必须重新高亮");
+        assert_eq!(other_language.text, same_length.text);
+
+        // 长行不换行：宽度随内容增长，由外层滚动条负责横向滚动
+        let long_job = cache.job(&highlighter, &long_text, params(Some("TOML")));
+        assert_eq!(cache.highlights, 4, "长文本应重新高亮一次");
+        assert_eq!(cache.text, long_text, "缓存应记录最近一次高亮的文本");
+        assert!(
+            long_job.wrap.max_width.is_infinite(),
+            "布局任务必须不折行（max_width 为无穷大）"
+        );
+
+        // 布局必须在帧内进行（首帧之前字体系统尚未就绪）
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
@@ -1776,51 +1842,19 @@ mod tests {
             )),
             ..Default::default()
         };
-        let params = |language: Option<&'static str>| LayoutParams {
-            language,
-            width: 400.0,
-            font_size: 14.0,
-            dark: true,
-        };
-
-        let mut first = None;
-        let mut second = None;
-        let mut same_length = None;
-        let mut other_language = None;
+        let mut galley_width = 0.0;
         let _ = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                first = Some(cache.galley(ui, &highlighter, "key = 1\n", params(Some("TOML"))));
-                second = Some(cache.galley(ui, &highlighter, "key = 1\n", params(Some("TOML"))));
-                // 长度相同但内容不同（等价于"同版本号、不同文本"，必须重新布局）
-                same_length =
-                    Some(cache.galley(ui, &highlighter, "key = 2\n", params(Some("TOML"))));
-                // 内容相同但语言不同也必须重新布局
-                other_language = Some(cache.galley(ui, &highlighter, "key = 2\n", params(None)));
+                galley_width = ui
+                    .fonts(|fonts| fonts.layout_job(long_job.clone()))
+                    .size()
+                    .x;
             });
         });
 
-        let first = first.expect("首次布局应成功");
-        let second = second.expect("第二次布局应成功");
-        let same_length = same_length.expect("内容变化后的布局应成功");
-        let other_language = other_language.expect("语言变化后的布局应成功");
-
         assert!(
-            Arc::ptr_eq(&first, &second),
-            "文本与参数都不变时应复用同一布局"
-        );
-        assert!(
-            !Arc::ptr_eq(&first, &same_length),
-            "文本内容变化后必须重新布局（不能只看长度或版本号）"
-        );
-        assert_eq!(
-            cache.layouts, 3,
-            "首次、内容变化、语言变化各布局一次（语言变化也必须重新布局）"
-        );
-        assert_eq!(cache.text, "key = 2\n", "缓存应记录最近一次布局的文本");
-        assert_eq!(
-            other_language.len(),
-            same_length.len(),
-            "语言变化后的布局对应同一份文本"
+            galley_width > 1000.0,
+            "长行不应自动换行（否则不会出现横向滚动条），实际宽度 {galley_width}"
         );
     }
 
@@ -1919,6 +1953,43 @@ mod tests {
         );
         assert_eq!(tab.display_name, "old.toml");
         assert!(!tab.dirty);
+    }
+
+    #[test]
+    fn editor_rows_fills_available_height() {
+        assert_eq!(editor_rows(400.0, 20.0), 20, "按可用高度换算行数");
+        assert_eq!(editor_rows(10.0, 20.0), 6, "可用高度过小时保留最小行数");
+        assert_eq!(editor_rows(100_000.0, 20.0), 400, "行数受上限保护");
+        assert_eq!(
+            editor_rows(400.0, 0.0),
+            EDITOR_DESIRED_ROWS,
+            "行高异常时回退默认行数"
+        );
+        assert_eq!(
+            editor_rows(f32::INFINITY, 20.0),
+            EDITOR_DESIRED_ROWS,
+            "可用高度异常时回退默认行数"
+        );
+        assert_eq!(
+            editor_rows(0.0, 20.0),
+            EDITOR_DESIRED_ROWS,
+            "无可用高度时回退默认行数"
+        );
+        assert_eq!(
+            editor_rows(-100.0, 20.0),
+            EDITOR_DESIRED_ROWS,
+            "负可用高度时回退默认行数"
+        );
+        assert_eq!(
+            editor_rows(400.0, f32::NAN),
+            EDITOR_DESIRED_ROWS,
+            "行高为 NaN 时回退默认行数"
+        );
+        assert_eq!(
+            editor_rows(f32::NAN, 20.0),
+            EDITOR_DESIRED_ROWS,
+            "可用高度为 NaN 时回退默认行数"
+        );
     }
 
     #[test]
