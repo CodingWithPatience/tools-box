@@ -490,3 +490,49 @@ windows-sys = { version = "0.60", features = [
 且 `%APPDATA%\tools-box\logs\tools-box.log` 已生成并记录启动过程；
 同一二进制放在带 Low 标签的工作区内启动时为 Low 完整性、托盘注册失败，A/B 对照确认因果。
 本次按用户要求跳过 code-reviewer 审查。
+
+### 10.3 托盘左键恢复窗口（窗口闪一下又消失，2026-10-12）
+
+问题：窗口隐藏到托盘后，**左键点击托盘图标**会看到窗口闪一下又消失；
+右键菜单「显示窗口」与 `Ctrl+Alt+Space` 都能正常恢复。
+
+原因（日志与代码逐条对上）：
+
+- 托盘回调收到 `WM_LBUTTONUP` 后调用 `send_event(TrayEvent::ToggleVisible)`，
+  而 `send_event` 在投递事件后立即调用 `wake_main_window()`；
+- 当时的 `wake_main_window()` 在窗口隐藏时会 `ShowWindowAsync(SW_SHOW)`——
+  **它不只是唤醒，而是把窗口真的显示出来**（这就是"闪一下"）；
+- 主线程下一帧的顺序是「先 `sync_window_visibility()`（读原生状态：此刻窗口已被显示 →
+  `window_visible = true`），再 `process_tray_events()`」，
+  于是 `ToggleVisible` 判定为"已显示"，走隐藏分支（这就是"再消失"）。
+- 日志中该三段式重复出现：`左键点击 → 切换窗口` → `检测到窗口已从任务栏还原，同步窗口状态为可见`
+  → `[托盘事件] 切换窗口可见性，当前=true` → `窗口已通过 SW_HIDE 完全隐藏到系统托盘`。
+- 两条正常路径恰好都绕开了这个问题：右键菜单发的是 `ShowWindow`（无条件显示，不看标志位）；
+  `Ctrl+Alt+Space` 在热键线程**唤醒之前**采样状态（`10.1` 的同一处经验）。
+
+完成结果：
+
+- `tray.rs`：
+  - `TrayEvent::ToggleVisible` 拆分为 `HideWindow` / `ShowWindow`，新增纯函数
+    `tray_left_click_event(window_in_front)`：窗口已在最前层才隐藏，否则唤出
+    （与 `Ctrl+Alt+Space` 的口径一致）；
+  - 托盘回调在 `send_event` **之前**采样 `is_main_window_in_front()`，判定不再依赖被唤醒污染的状态；
+  - `wake_main_window()` 恢复"必要时显示/还原窗口"的语义，并明确文档化为**仅用于唤出意图**
+    （隐藏窗口不会产生重绘请求，必须真正显示窗口才能让事件循环跑帧）；
+    新增 `nudge_main_window()`：只投递 `WM_NULL` 唤醒消息循环、**不改变窗口可见性**，供隐藏意图使用；
+    `send_event` 按事件语义选择唤醒方式。
+- `app.rs`：托盘事件分支改为显式的 `ShowWindow` / `HideWindow`，不再依赖 `window_visible` 的切换判定。
+- 测试：新增 `test_tray_left_click_event_follows_window_front_state`、
+  `test_nudge_keeps_hidden_window_hidden`、`test_nudge_does_not_restore_minimized_window`；
+  保留并强化 `wake_main_window` 的"唤出意图必然显示/还原"用例（隐藏窗口必须被恢复，
+  否则事件循环不会跑帧——该用例在只发消息的中间版本上会失败并已纠正实现）。
+
+验证（`cargo test` 289 通过 / 1 忽略）：
+
+```text
+场景 A：窗口隐藏 → 注入托盘左键消息 → 1 秒后 IsWindowVisible=True、2.5 秒后仍为 True ✅（修复前会再次隐藏）
+日志：    [托盘] 左键点击 → 显示窗口（点击时窗口在最前层=false）
+          [托盘事件] 显示窗口 → 窗口已从系统托盘恢复到桌面最前层
+```
+
+部署：`C:\Program Files\Tools-box\tools-box.exe`（哈希 AF34621E…）已重启验证。

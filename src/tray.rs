@@ -41,8 +41,24 @@ const TRAY_REGISTER_RETRY_DELAYS_MS: [u64; 3] = [100, 200, 400];
 /// 托盘事件类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayEvent {
-    ToggleVisible,
+    /// 隐藏窗口到托盘
+    HideWindow,
+    /// 显示窗口并抬到桌面最前层
     ShowWindow,
+}
+
+/// 托盘左键点击应执行的动作
+///
+/// 判定必须在 [`wake_main_window`] **之前**采样：唤醒会显示/还原窗口，
+/// 之后再读状态会把刚被显示的窗口误判成「已显示」，使左键点击变成隐藏
+/// （表现为窗口闪一下又消失）。与 `Ctrl+Alt+Space` 的判定口径保持一致：
+/// 只有窗口已经位于桌面最前层时才隐藏，其余情况统一唤出。
+pub fn tray_left_click_event(window_in_front: bool) -> TrayEvent {
+    if window_in_front {
+        TrayEvent::HideWindow
+    } else {
+        TrayEvent::ShowWindow
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,10 +240,21 @@ unsafe extern "system" fn tray_wnd_proc(
             let mouse_msg = (lparam & 0xFFFF) as u32;
             match mouse_msg {
                 WM_LBUTTONUP => {
-                    log::info!("[托盘] 左键点击 → 切换窗口");
+                    // 关键顺序：先采样窗口是否已在最前层，再投递事件并唤醒窗口。
+                    // wake_main_window 只在消息层面唤醒事件循环，不再改变窗口可见性，
+                    // 因此这里采样到的就是用户点击瞬间的真实状态。
+                    let in_front = is_main_window_in_front();
+                    let event = tray_left_click_event(in_front);
+                    log::info!(
+                        "[托盘] 左键点击 → {}（点击时窗口在最前层={in_front}）",
+                        match event {
+                            TrayEvent::HideWindow => "隐藏窗口",
+                            TrayEvent::ShowWindow => "显示窗口",
+                        }
+                    );
                     // SAFETY: 托盘回调与全局事件发送器均在主线程中使用。
                     unsafe {
-                        send_event(TrayEvent::ToggleVisible);
+                        send_event(event);
                     }
                 }
                 WM_RBUTTONUP => {
@@ -311,7 +338,12 @@ unsafe fn send_event(event: TrayEvent) {
             match tx.send(event) {
                 Ok(()) => {
                     log::debug!("[托盘] 事件发送成功");
-                    wake_main_window();
+                    // 按意图选择唤醒方式：显示意图需要真正显示窗口才能唤醒事件循环，
+                    // 隐藏意图绝不能显示窗口（否则切换判定会把刚显示的窗口误判成「已显示」）。
+                    match event {
+                        TrayEvent::ShowWindow => wake_main_window(),
+                        TrayEvent::HideWindow => nudge_main_window(),
+                    }
 
                     // 原生窗口消息是主要唤醒手段，egui 重绘请求作为可见窗口的补充。
                     if let Some(ref ctx) = GLOBAL_EGUI_CTX {
@@ -352,6 +384,12 @@ pub fn is_icon_registered() -> bool {
 /// 托盘事件和全局热键事件均可调用此函数，不依赖 eframe 后续重绘。
 /// 最小化到任务栏的窗口也在此还原：`IsWindowVisible` 对最小化窗口仍返回可见，
 /// 仅判断可见性会漏掉该状态，导致热键唤出时窗口停留在任务栏。
+/// 唤醒主窗口事件循环，必要时把隐藏/最小化的窗口显示出来
+///
+/// **只可用于"唤出窗口"的意图**：窗口隐藏时 `WM_PAINT` 之类的重绘请求不会产生帧，
+/// 必须真正显示窗口才能唤醒事件循环（这是热键唤出、托盘"显示窗口"赖以为生的机制）。
+/// "隐藏窗口"的意图必须改用 [`nudge_main_window`]，否则会把刚隐藏的窗口显示出来，
+/// 使切换判定误判成「已显示」——用户看到的现象就是窗口闪一下又消失。
 pub fn wake_main_window() {
     let hwnd = main_window_handle();
     if hwnd.is_null() {
@@ -372,6 +410,26 @@ pub fn wake_main_window() {
 
         if ShowWindowAsync(hwnd, command) == 0 {
             log::error!("异步唤醒主窗口失败: command={command}");
+        }
+    }
+}
+
+/// 仅唤醒消息循环，**不改变窗口可见性**
+///
+/// 供"隐藏窗口"意图使用：窗口此时是可见的、事件循环本来就在运行，
+/// 只需一条空消息 + 上层调用方的重绘请求即可，绝不能顺手显示窗口。
+pub fn nudge_main_window() {
+    let hwnd = main_window_handle();
+    if hwnd.is_null() {
+        log::debug!("[托盘] 主窗口句柄尚未登记，跳过消息循环唤醒");
+        return;
+    }
+
+    // SAFETY: hwnd 由主窗口在运行期间登记，主窗口生命周期覆盖托盘和热键管理器。
+    // PostMessage 线程安全，可在任意线程调用。
+    unsafe {
+        if PostMessageW(hwnd, WM_NULL, 0, 0) == 0 {
+            log::warn!("唤醒主窗口消息循环失败: {}", GetLastError());
         }
     }
 }
@@ -844,6 +902,78 @@ mod tests {
         assert_eq!(manager.poll_events(), vec![TrayEvent::ShowWindow]);
     }
 
+    /// 等待一小段时间后断言窗口仍处于隐藏状态
+    ///
+    /// 供"隐藏意图"的唤醒使用：唤醒消息循环不得改变窗口可见性。
+    fn assert_window_stays_hidden(hwnd: HWND) {
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        // SAFETY: 仅查询窗口状态，不解引用任何指针。
+        assert_eq!(
+            unsafe { IsWindowVisible(hwnd) },
+            0,
+            "隐藏意图的唤醒不应显示已隐藏的窗口"
+        );
+    }
+
+    #[test]
+    fn test_tray_left_click_event_follows_window_front_state() {
+        assert_eq!(
+            tray_left_click_event(true),
+            TrayEvent::HideWindow,
+            "窗口已在最前层时，左键点击应隐藏"
+        );
+        assert_eq!(
+            tray_left_click_event(false),
+            TrayEvent::ShowWindow,
+            "窗口隐藏 / 被覆盖时，左键点击应唤出"
+        );
+    }
+
+    #[test]
+    fn test_nudge_keeps_hidden_window_hidden() {
+        let _guard = lock_main_window_tests();
+        let window = TestMainWindow::new();
+
+        // SAFETY: 句柄在测试期间有效，并由 TestMainWindow 保持存活。
+        unsafe {
+            ShowWindow(window.0, SW_SHOW);
+        }
+        set_main_window_handle(window.0);
+
+        // SAFETY: 句柄在测试期间有效，并由 TestMainWindow 保持存活。
+        unsafe {
+            ShowWindow(window.0, SW_HIDE);
+            assert_eq!(IsWindowVisible(window.0), 0, "测试窗口应处于隐藏状态");
+        }
+
+        nudge_main_window();
+        assert_window_stays_hidden(window.0);
+    }
+
+    #[test]
+    fn test_nudge_does_not_restore_minimized_window() {
+        let _guard = lock_main_window_tests();
+        let window = TestMainWindow::new();
+
+        // SAFETY: 句柄在测试期间有效，并由 TestMainWindow 保持存活。
+        unsafe {
+            ShowWindow(window.0, SW_SHOW);
+            ShowWindow(window.0, SW_MINIMIZE);
+            assert_ne!(IsIconic(window.0), 0, "测试窗口应处于最小化状态");
+        }
+        set_main_window_handle(window.0);
+
+        nudge_main_window();
+
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        // SAFETY: 仅查询窗口状态，不解引用任何指针。
+        assert_ne!(
+            unsafe { IsIconic(window.0) },
+            0,
+            "隐藏意图的唤醒不应还原最小化窗口（还原由 show_window 负责）"
+        );
+    }
+
     #[test]
     fn test_show_event_wakes_hidden_main_window() {
         let _guard = lock_main_window_tests();
@@ -864,7 +994,7 @@ mod tests {
         wake_main_window();
         assert!(
             wait_for_window_visible(window.0),
-            "托盘事件应原生唤醒隐藏窗口"
+            "显示意图的唤醒必须恢复隐藏窗口（否则事件循环不会跑帧）"
         );
     }
 
@@ -904,7 +1034,7 @@ mod tests {
         wake_main_window();
         assert!(
             wait_for_window_restored(window.0),
-            "唤醒应还原最小化到任务栏的主窗口"
+            "显示意图的唤醒应还原最小化到任务栏的主窗口"
         );
     }
 

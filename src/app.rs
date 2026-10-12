@@ -385,13 +385,9 @@ impl App {
     fn process_tray_events(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         for event in self.tray_manager.poll_events() {
             match event {
-                TrayEvent::ToggleVisible => {
-                    log::info!("[托盘事件] 切换窗口可见性，当前={}", self.window_visible);
-                    if self.window_visible {
-                        self.hide_window(frame);
-                    } else {
-                        self.show_window(ctx, frame);
-                    }
+                TrayEvent::HideWindow => {
+                    log::info!("[托盘事件] 隐藏窗口");
+                    self.hide_window(frame);
                 }
                 TrayEvent::ShowWindow => {
                     log::info!("[托盘事件] 显示窗口");
