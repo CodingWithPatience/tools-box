@@ -30,6 +30,8 @@ const MIN_EDITOR_ROWS: f32 = 6.0;
 const MAX_EDITOR_ROWS: f32 = 400.0;
 /// 参与语法着色的最大文本长度（字节）：超过后按纯文本布局，避免拖慢输入
 const HIGHLIGHT_MAX_BYTES: usize = 128 * 1024;
+/// 单帧最多高亮的匹配数量（极端情况下避免绘制过多矩形）
+const MAX_HIGHLIGHTED_MATCHES: usize = 1000;
 
 /// 当前打开的弹窗
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,59 +184,38 @@ fn match_at(text: &str, byte: usize, query_chars: &[char], match_case: bool) -> 
     Some(end)
 }
 
-/// 由字节区间构造命中位置（附带字符区间）
+/// 收集文本中的全部命中（按出现顺序，不重叠）
 ///
-/// `start_byte` / `end_byte` 必须是字符边界。
-fn match_range(text: &str, start_byte: usize, end_byte: usize) -> MatchRange {
-    MatchRange {
-        start_byte,
-        end_byte,
-        start_char: text[..start_byte].chars().count(),
-        end_char: text[..end_byte].chars().count(),
-    }
-}
-
-/// 从 `from_byte` 向后查找，到达末尾后回到开头继续（环绕查找）
-fn find_next(text: &str, query: &str, from_byte: usize, match_case: bool) -> Option<MatchRange> {
+/// 查找栏需要"匹配总数"与"高亮所有匹配"，因此一次扫描出全部命中并缓存；
+/// 命中区间与 [`match_at`] 使用同一套比较规则，保证与替换行为一致。
+///
+/// 字符下标在扫描过程中**递推**得到（`char_index`）：若对每个命中回头执行
+/// `text[..byte].chars().count()`，复杂度会退化为 O(命中数 × 文本长度)，
+/// 在 2 MB 文本 + 单字符查询下会造成秒级卡顿。
+fn find_all(text: &str, query: &str, match_case: bool) -> Vec<MatchRange> {
     if query.is_empty() {
-        return None;
+        return Vec::new();
     }
     let query_chars: Vec<char> = query.chars().collect();
+    let mut matches = Vec::new();
+    let mut cursor = 0;
 
-    let search = |start: usize| -> Option<MatchRange> {
-        text.char_indices()
-            .filter(|(byte, _)| *byte >= start)
-            .find_map(|(byte, _)| {
-                match_at(text, byte, &query_chars, match_case)
-                    .map(|end| match_range(text, byte, end))
-            })
-    };
-
-    search(from_byte.min(text.len())).or_else(|| search(0))
-}
-
-/// 从 `before_byte` 向前查找最近的一个命中，没有则环绕到文末的最后一个命中
-fn find_prev(text: &str, query: &str, before_byte: usize, match_case: bool) -> Option<MatchRange> {
-    if query.is_empty() {
-        return None;
-    }
-    let query_chars: Vec<char> = query.chars().collect();
-    let limit = before_byte.min(text.len());
-
-    let mut before: Option<MatchRange> = None;
-    let mut last: Option<MatchRange> = None;
-    for (byte, _) in text.char_indices() {
-        let Some(end) = match_at(text, byte, &query_chars, match_case) else {
-            continue;
-        };
-        let found = match_range(text, byte, end);
-        if end <= limit {
-            before = Some(found);
+    for (char_index, (byte, _)) in text.char_indices().enumerate() {
+        if byte >= cursor
+            && let Some(end) = match_at(text, byte, &query_chars, match_case)
+        {
+            matches.push(MatchRange {
+                start_byte: byte,
+                end_byte: end,
+                start_char: char_index,
+                // 一次命中恰好覆盖查询的字符数
+                end_char: char_index + query_chars.len(),
+            });
+            cursor = end;
         }
-        last = Some(found);
     }
 
-    before.or(last)
+    matches
 }
 
 /// 全部替换（不重叠），返回新文本与替换次数
@@ -349,6 +330,24 @@ fn plain_layout_job(text: &str, font_size: f32) -> LayoutJob {
     job
 }
 
+/// `Ctrl+F` 是否应由本插件接管
+///
+/// 该组合键同时是 app 级的"聚焦插件搜索框"快捷键，约定：
+/// - 编辑器有焦点（正在编辑文件）或查找栏已打开时由本插件接管；
+/// - 焦点在**其它文本输入框**（全局搜索框、别的插件的输入框）时不接管，留给全局搜索；
+/// - 焦点不在任何输入上（例如刚点过左侧文件列表）时也接管——此时用户显然在本插件里操作。
+///
+/// `editor_had_focus` 必须传**上一帧**的状态：app 的 `handle_shortcuts` 在本插件之前执行，
+/// 且 egui 的 `request_focus` 当帧立即生效——按 Ctrl+F 的那一帧，焦点已被全局搜索框抢走，
+/// 用当帧状态判断会永远判否，查找栏就打不开了。
+fn should_capture_find_shortcut(
+    editor_had_focus: bool,
+    find_visible: bool,
+    other_text_input_focused: bool,
+) -> bool {
+    editor_had_focus || find_visible || !other_text_input_focused
+}
+
 /// 一次布局除文本内容外的参数（与文本内容一起构成缓存键）
 ///
 /// 编辑器不做自动换行（长行交给横向滚动条），因此布局宽度恒为无穷大、无需入键。
@@ -458,6 +457,8 @@ impl HighlightJobCache {
 
 /// 编辑器的固定标识（查找替换需要读写它的光标状态）
 const EDITOR_ID_SALT: &str = "file_editor_editor";
+/// 查找输入框的固定标识（需要在渲染它之前判断焦点并消费 ↑/↓/回车）
+const FIND_QUERY_ID_SALT: &str = "file_editor_find_query";
 /// 查找命中高亮的底色
 ///
 /// 用低透明度底色 + 描边：高亮叠在语法着色文字之上，
@@ -476,6 +477,15 @@ fn find_highlight_stroke(dark: bool) -> egui::Color32 {
         egui::Color32::from_rgb(0xE0, 0xC0, 0x40)
     } else {
         egui::Color32::from_rgb(0xA0, 0x6A, 0x00)
+    }
+}
+
+/// 非当前命中项的底色（比当前项更淡，用于"高亮所有匹配"）
+fn find_other_fill(dark: bool) -> egui::Color32 {
+    if dark {
+        egui::Color32::from_rgba_unmultiplied(0xE0, 0xC0, 0x40, 0x1F)
+    } else {
+        egui::Color32::from_rgba_unmultiplied(0xB0, 0x7A, 0x00, 0x1A)
     }
 }
 
@@ -508,8 +518,59 @@ struct FindState {
     pending_selection: Option<(usize, usize)>,
     /// 是否需要把选区滚动到可见区域（egui 只在交互改变选区时自动滚动）
     pending_scroll: bool,
+    /// 是否需要把键盘焦点交给查找输入框（Ctrl+F 打开或工具条打开时置位）
+    focus_requested: bool,
     /// 结果提示
     message: String,
+    /// 全部命中（按出现顺序），用于匹配总数、序号与高亮所有匹配
+    matches: Vec<MatchRange>,
+    /// 命中列表对应的查找内容
+    matches_query: String,
+    /// 命中列表对应的大小写规则
+    matches_match_case: bool,
+    /// 命中列表是否已失效（文本被编辑、替换、重载后置位）
+    matches_stale: bool,
+}
+
+impl FindState {
+    /// 按需重算命中列表（文本、查找内容或大小写规则变化时）
+    fn ensure_matches(&mut self, text: &str) {
+        if !self.matches_stale
+            && self.matches_query == self.query
+            && self.matches_match_case == self.match_case
+        {
+            return;
+        }
+
+        self.matches = find_all(text, &self.query, self.match_case);
+        self.matches_query.clear();
+        self.matches_query.push_str(&self.query);
+        self.matches_match_case = self.match_case;
+        self.matches_stale = false;
+    }
+
+    /// 把命中列表标记为失效（下一次查找时重算）
+    fn invalidate_matches(&mut self) {
+        self.matches_stale = true;
+    }
+
+    /// 当前命中在命中列表中的序号（从 1 开始）
+    ///
+    /// 命中列表按位置有序，用二分查找避免每帧线性扫描。
+    fn ordinal(&self) -> Option<usize> {
+        self.index_of(self.current?).map(|index| index + 1)
+    }
+
+    /// 命中在列表中的下标（列表有序，二分查找）
+    fn index_of(&self, range: MatchRange) -> Option<usize> {
+        let index = self
+            .matches
+            .partition_point(|found| found.start_char < range.start_char);
+        self.matches
+            .get(index)
+            .filter(|found| found.start_char == range.start_char)
+            .map(|_| index)
+    }
 }
 
 /// 常用文件编辑器界面状态
@@ -552,6 +613,8 @@ pub struct FileEditorUi {
     find: FindState,
     /// 编辑器的持久 Id（查找结果要读写它的光标状态；同时便于测试断言）
     editor_id: Option<egui::Id>,
+    /// 上一帧编辑器是否持有键盘焦点（Ctrl+F 判定必须用它，见 `should_capture_find_shortcut`）
+    editor_had_focus: bool,
     /// 列表是否按最近打开时间排序
     sort_by_recent: bool,
     /// 上一帧窗口是否处于焦点（用于重新获得焦点时检查外部修改）
@@ -583,6 +646,7 @@ impl FileEditorUi {
             highlight_job_cache: HighlightJobCache::default(),
             find: FindState::default(),
             editor_id: None,
+            editor_had_focus: false,
             sort_by_recent: false,
             was_focused: false,
             initialized: false,
@@ -628,6 +692,32 @@ impl FileEditorUi {
         if self.can_save_active_tab() && self.save_shortcut_pressed(ui.ctx()) {
             actions.push(Action::SaveActive);
         }
+
+        // Ctrl+F：与 app 级"聚焦插件搜索框"共用该快捷键。
+        // 判定用**上一帧**的编辑器焦点：app 的 handle_shortcuts 在本插件之前执行，
+        // 且 egui 的 request_focus 当帧立即生效——按键这一帧焦点已被搜索框抢走。
+        // 接管后把焦点请求交给查找输入框（本插件渲染更晚，最后一次请求生效）。
+        let editor_focused_now = self
+            .editor_id
+            .is_some_and(|id| ui.ctx().memory(|memory| memory.has_focus(id)));
+        let other_text_input_focused =
+            ui.ctx().wants_keyboard_input() && !self.editor_had_focus && !self.find.visible;
+        if should_capture_find_shortcut(
+            self.editor_had_focus,
+            self.find.visible,
+            other_text_input_focused,
+        ) && ui
+            .ctx()
+            .input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::F))
+        {
+            self.find.visible = true;
+            self.find.focus_requested = true;
+            log::info!(
+                "常用文件编辑器：Ctrl+F 打开查找栏（上一帧编辑器焦点={}, 其它输入框焦点={other_text_input_focused}）",
+                self.editor_had_focus
+            );
+        }
+        self.editor_had_focus = editor_focused_now;
 
         self.render_toolbar(ui, &mut actions);
         ui.separator();
@@ -1036,14 +1126,20 @@ impl FileEditorUi {
 
                 if response.changed() {
                     tab.dirty = true;
-                    // 文本被编辑后原命中位置失效，需重新查找
+                    // 文本被编辑后原命中位置与命中列表都失效，需重新查找
                     find.current = None;
                     find.pending_selection = None;
+                    find.invalidate_matches();
                 }
 
                 // 命中高亮：egui 只在编辑器获得焦点时绘制自身选区（builder.rs:723-730），
-                // 而查找时焦点在查找框里，所以这里在文本之上自绘一层高亮。
-                if let Some(range) = find.current {
+                // 而查找时焦点在查找框里，所以这里在文本之上自绘：
+                // 先铺所有匹配（淡色），再把当前选中项画在最上层（浓色 + 描边）。
+                // 关栏后不绘制；绘制前按当前文本校正命中列表（命中缓存时为 O(1)）。
+                if find.visible {
+                    find.ensure_matches(&tab.text);
+                }
+                if find.visible && !find.matches.is_empty() {
                     let job = cache.job(
                         highlighter,
                         &tab.text,
@@ -1054,15 +1150,31 @@ impl FileEditorUi {
                         },
                     );
                     let galley = ui.fonts(|fonts| fonts.layout_job(job));
-                    let rect = match_rect(&galley, range).translate(response.rect.min.to_vec2());
-                    if ui.is_rect_visible(rect) {
-                        ui.painter().rect(
-                            rect.expand(1.0),
-                            egui::CornerRadius::same(2),
-                            find_highlight_fill(dark),
-                            egui::Stroke::new(1.0, find_highlight_stroke(dark)),
-                            egui::StrokeKind::Inside,
-                        );
+                    let origin = response.rect.min.to_vec2();
+                    let painter = ui.painter();
+                    let other_fill = find_other_fill(dark);
+
+                    for found in find.matches.iter().take(MAX_HIGHLIGHTED_MATCHES) {
+                        if Some(*found) == find.current {
+                            continue; // 当前项用浓色单独画，避免两层底色叠加
+                        }
+                        let rect = match_rect(&galley, *found).translate(origin);
+                        if ui.is_rect_visible(rect) {
+                            painter.rect_filled(rect, egui::CornerRadius::same(2), other_fill);
+                        }
+                    }
+
+                    if let Some(current) = find.current {
+                        let rect = match_rect(&galley, current).translate(origin);
+                        if ui.is_rect_visible(rect) {
+                            painter.rect(
+                                rect.expand(1.0),
+                                egui::CornerRadius::same(2),
+                                find_highlight_fill(dark),
+                                egui::Stroke::new(1.0, find_highlight_stroke(dark)),
+                                egui::StrokeKind::Inside,
+                            );
+                        }
                     }
                 }
 
@@ -1098,23 +1210,71 @@ impl FileEditorUi {
             .and_then(|index| self.tabs.get(index))
             .is_some_and(|tab| tab.read_only);
 
+        // 让"匹配总数 / 当前序号"随输入即时更新
+        if let Some(index) = self.active_tab.filter(|index| *index < self.tabs.len()) {
+            let (tabs, find) = (&self.tabs, &mut self.find);
+            find.ensure_matches(&tabs[index].text);
+        }
+
         ui.horizontal_wrapped(|ui| {
             ui.label("🔍");
 
+            let query_id = ui.make_persistent_id(egui::Id::new(FIND_QUERY_ID_SALT));
+
+            // 跳转键必须在渲染查找框**之前**消费：单行输入框自己会吃掉回车并主动失焦，
+            // 若等控件处理完再判断，回车已经被消费、焦点也已交还，后续按键就失效了。
+            // 约定（类似 IDEA）：↓ / 回车 = 下一个，↑ / Shift+回车 = 上一个；
+            // 只在查找框持有焦点时处理，编辑器里的 ↑/↓ 仍然是移动光标。
+            if ui.ctx().memory(|memory| memory.has_focus(query_id)) {
+                let (previous, next) = ui.input_mut(|input| {
+                    let previous = input.consume_key(egui::Modifiers::SHIFT, egui::Key::Enter)
+                        || input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp);
+                    let next = input.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
+                        || input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown);
+                    (previous, next)
+                });
+
+                if previous {
+                    actions.push(Action::FindPrev);
+                } else if next {
+                    actions.push(Action::FindNext);
+                }
+            }
+
             let query = ui.add(
                 egui::TextEdit::singleline(&mut self.find.query)
+                    .id(query_id)
                     .desired_width(180.0)
-                    .hint_text("查找内容"),
+                    .hint_text("查找内容（↑/↓ 跳转，回车=下一个）"),
             );
-            if query.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+            if self.find.focus_requested {
+                query.request_focus();
+                self.find.focus_requested = false;
+            }
+            if query.changed() {
+                self.find.invalidate_matches();
+            }
+
+            if ui.button("↑").on_hover_text("上一个匹配（↑ 键）").clicked() {
+                actions.push(Action::FindPrev);
+            }
+            if ui
+                .button("↓")
+                .on_hover_text("下一个匹配（↓ 键或回车）")
+                .clicked()
+            {
                 actions.push(Action::FindNext);
             }
 
-            if ui.button("↑ 上一个").clicked() {
-                actions.push(Action::FindPrev);
+            let total = self.find.matches.len();
+            let ordinal = self.find.ordinal().unwrap_or(0);
+            if total > 0 {
+                ui.label(format!("{ordinal}/{total}"));
+            } else if !self.find.query.is_empty() {
+                ui.weak("0/0");
             }
-            if ui.button("↓ 下一个").clicked() {
-                actions.push(Action::FindNext);
+            if total > MAX_HIGHLIGHTED_MATCHES {
+                ui.weak(format!("仅高亮前 {MAX_HIGHLIGHTED_MATCHES} 处"));
             }
 
             if ui
@@ -1124,6 +1284,7 @@ impl FileEditorUi {
                 // 匹配规则变了，旧命中作废
                 self.find.current = None;
                 self.find.anchor = None;
+                self.find.invalidate_matches();
             }
             ui.separator();
 
@@ -1178,9 +1339,13 @@ impl FileEditorUi {
         self.find.anchor = None;
         self.find.pending_selection = None;
         self.find.pending_scroll = false;
+        self.find.invalidate_matches();
     }
 
     /// 在当前标签中查找下一个 / 上一个匹配
+    ///
+    /// 命中列表由 [`FindState::ensure_matches`] 缓存，导航只在列表内移动下标并环绕，
+    /// 因此可以同时给出"匹配总数"和"当前序号"。
     fn find_in_active(&mut self, forward: bool) {
         let Some(index) = self.active_tab.filter(|index| *index < self.tabs.len()) else {
             return;
@@ -1192,44 +1357,56 @@ impl FileEditorUi {
 
         let (tabs, find) = (&self.tabs, &mut self.find);
         let text = &tabs[index].text;
-        let anchor = find
-            .anchor
-            .unwrap_or(if forward { 0 } else { text.len() })
-            .min(text.len());
+        find.ensure_matches(text);
 
-        let found = if forward {
-            find_next(text, &find.query, anchor, find.match_case)
-        } else {
-            find_prev(text, &find.query, anchor, find.match_case)
+        if find.matches.is_empty() {
+            find.message = if find.replaced_once {
+                "已替换 1 处 · 未找到更多匹配".to_string()
+            } else {
+                "未找到匹配".to_string()
+            };
+            find.replaced_once = false;
+            find.current = None;
+            return;
+        }
+
+        let total = find.matches.len();
+        let current_index = find.current.and_then(|current| find.index_of(current));
+        let anchor = find.anchor.unwrap_or(if forward { 0 } else { text.len() });
+
+        let next_index = match (current_index, forward) {
+            (Some(index), true) => (index + 1) % total,
+            (Some(index), false) => (index + total - 1) % total,
+            (None, true) => {
+                // 锚点之后的第一处；锚点在文末时环绕到第一处
+                find.matches
+                    .partition_point(|found| found.start_byte < anchor)
+                    % total
+            }
+            (None, false) => {
+                // 锚点之前的最后一处；锚点在开头时环绕到最后一处
+                let before = find
+                    .matches
+                    .partition_point(|found| found.end_byte <= anchor);
+                if before == 0 { total - 1 } else { before - 1 }
+            }
         };
 
-        match found {
-            Some(found) => {
-                let line = line_number(text, found.start_byte);
-                find.message = if find.replaced_once {
-                    format!("已替换 1 处 · 下一处第 {line} 行")
-                } else {
-                    format!("第 {line} 行命中")
-                };
-                find.replaced_once = false;
-                find.anchor = Some(if forward {
-                    found.end_byte
-                } else {
-                    found.start_byte
-                });
-                find.current = Some(found);
-                find.pending_selection = Some((found.start_char, found.end_char));
-            }
-            None => {
-                find.message = if find.replaced_once {
-                    "已替换 1 处 · 未找到更多匹配".to_string()
-                } else {
-                    "未找到匹配".to_string()
-                };
-                find.replaced_once = false;
-                find.current = None;
-            }
-        }
+        let found = find.matches[next_index];
+        let line = line_number(text, found.start_byte);
+        find.message = if find.replaced_once {
+            format!("已替换 1 处 · 下一处第 {line} 行")
+        } else {
+            format!("第 {line} 行")
+        };
+        find.replaced_once = false;
+        find.anchor = Some(if forward {
+            found.end_byte
+        } else {
+            found.start_byte
+        });
+        find.current = Some(found);
+        find.pending_selection = Some((found.start_char, found.end_char));
     }
 
     /// 替换当前匹配，并把查找起点移到替换内容之后
@@ -1272,6 +1449,7 @@ impl FileEditorUi {
         find.current = None;
         find.pending_selection = None;
         find.replaced_once = true;
+        find.invalidate_matches();
         find.message = "已替换 1 处".to_string();
         log::info!("常用文件编辑器替换一处: {}", tab.path.display());
     }
@@ -1310,6 +1488,7 @@ impl FileEditorUi {
         find.anchor = None;
         find.pending_selection = None;
         find.replaced_once = false;
+        find.invalidate_matches();
         find.message = format!("已替换 {count} 处");
         log::info!("常用文件编辑器替换全部: {} 处", count);
     }
@@ -1833,7 +2012,18 @@ impl FileEditorUi {
                         self.reload_tab(index);
                     }
                 }
-                Action::ToggleFind => self.find.visible = !self.find.visible,
+                Action::ToggleFind => {
+                    let closing = self.find.visible;
+                    self.find.visible = !closing;
+                    if closing {
+                        // 关栏即结束查找：清掉命中，避免高亮残留或画在旧位置上
+                        self.clear_find_match();
+                        self.find.matches.clear();
+                    } else {
+                        // 打开查找栏时把输入焦点交给查找框
+                        self.find.focus_requested = true;
+                    }
+                }
                 Action::FindNext => self.find_in_active(true),
                 Action::FindPrev => self.find_in_active(false),
                 Action::ReplaceOne => {
@@ -2163,9 +2353,9 @@ impl FileEditorUi {
 mod tests {
     use super::{
         EDITOR_DESIRED_ROWS, FileEditorUi, HIGHLIGHT_MAX_BYTES, HighlightJobCache, LayoutParams,
-        active_after_close, apply_saved_as, editor_rows, find_highlight_fill, find_next, find_prev,
-        line_number, replace_all, should_highlight_text, should_persist_width,
-        sort_files_by_recent,
+        active_after_close, apply_saved_as, editor_rows, find_all, find_highlight_fill,
+        find_other_fill, line_number, replace_all, should_capture_find_shortcut,
+        should_highlight_text, should_persist_width, sort_files_by_recent,
     };
     use crate::plugins::file_editor::store;
     use crate::utils::highlight::SyntaxHighlighter;
@@ -2403,43 +2593,329 @@ mod tests {
     }
 
     #[test]
-    fn finds_matches_with_and_without_case() {
+    fn finds_all_matches_with_and_without_case() {
         let text = "Name = a\nname = b\n";
 
-        let first = find_next(text, "name", 0, false).expect("不区分大小写应命中第一处");
-        assert_eq!(&text[first.start_byte..first.end_byte], "Name");
+        let insensitive = find_all(text, "name", false);
+        assert_eq!(insensitive.len(), 2, "不区分大小写应命中两处");
+        assert_eq!(
+            &text[insensitive[0].start_byte..insensitive[0].end_byte],
+            "Name"
+        );
+        assert_eq!(
+            &text[insensitive[1].start_byte..insensitive[1].end_byte],
+            "name"
+        );
 
-        let second = find_next(text, "name", 0, true).expect("区分大小写应跳过 Name");
-        assert_eq!(&text[second.start_byte..second.end_byte], "name");
+        let sensitive = find_all(text, "name", true);
+        assert_eq!(sensitive.len(), 1, "区分大小写只命中一处");
+        assert_eq!(
+            &text[sensitive[0].start_byte..sensitive[0].end_byte],
+            "name"
+        );
 
-        assert!(find_next(text, "missing", 0, true).is_none());
-        assert!(find_next(text, "", 0, true).is_none(), "空查询不应命中");
+        assert!(find_all(text, "missing", true).is_empty());
+        assert!(find_all(text, "", true).is_empty(), "空查询不应命中");
     }
 
     #[test]
-    fn find_next_wraps_around_and_reports_char_indices() {
+    fn find_all_reports_char_indices_and_skips_overlaps() {
         let text = "配置 = 1\n键 = 2\n";
 
-        let found = find_next(text, "键", 0, true).expect("应命中中文");
-        assert_eq!(found.start_byte, 11, "字节偏移");
-        assert_eq!(found.start_char, 7, "字符下标（供编辑器选区使用）");
-        assert_eq!(&text[found.start_byte..found.end_byte], "键");
+        let matches = find_all(text, "键", true);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].start_byte, 11, "字节偏移");
+        assert_eq!(matches[0].start_char, 7, "字符下标（供编辑器选区使用）");
 
-        let wrapped = find_next(text, "配置", found.end_byte, true).expect("应环绕回到开头");
-        assert_eq!(wrapped.start_char, 0);
+        let overlaps = find_all("aaa", "aa", true);
+        assert_eq!(overlaps.len(), 1, "命中之间不重叠");
     }
 
     #[test]
-    fn find_prev_returns_nearest_before_and_wraps() {
-        let text = "a\nb\na\n";
+    fn captures_find_shortcut_only_in_editor_context() {
+        assert!(
+            should_capture_find_shortcut(true, false, true),
+            "编辑器聚焦时接管"
+        );
+        assert!(
+            should_capture_find_shortcut(false, true, true),
+            "查找栏已打开时接管"
+        );
+        assert!(
+            should_capture_find_shortcut(false, false, false),
+            "焦点不在任何输入框（例如刚点过文件列表）时也接管"
+        );
+        assert!(
+            !should_capture_find_shortcut(false, false, true),
+            "焦点在其它输入框（全局搜索框、别的插件）时留给全局搜索"
+        );
+    }
 
-        let found = find_prev(text, "a", 3, true).expect("应命中前面的 a");
-        assert_eq!(found.start_byte, 0);
+    #[test]
+    fn editor_widget_holds_keyboard_focus_with_recorded_id() {
+        let conn = test_connection();
+        let ctx = egui::Context::default();
+        let path = temp_file("focus-id.toml");
+        fs::write(&path, "key = 1\n").expect("写入测试文件失败");
 
-        let wrapped = find_prev(text, "a", 0, true).expect("应环绕命中文末的 a");
-        assert_eq!(wrapped.start_byte, 4);
+        let mut state = FileEditorUi::new();
+        state.init(&conn);
+        let id = store::insert_file(&conn, None, &path.display().to_string(), None)
+            .expect("新增条目失败");
+        state.reload_data(&conn);
+        state.open_file(&conn, id, &path, "focus-id.toml".to_string());
 
-        assert!(find_prev(text, "zz", 4, true).is_none());
+        render_frame(&ctx, &mut state, &conn);
+        let editor_id = state.editor_id.expect("应记录编辑器 id");
+        ctx.memory_mut(|memory| memory.request_focus(editor_id));
+        assert!(ctx.memory(|memory| memory.has_focus(editor_id)));
+
+        // 注入文本事件：只有记录下来的 Id 与控件真实 Id 一致时，输入才会落到编辑器上
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000.0, 700.0),
+            )),
+            events: vec![egui::Event::Text("x".to_string())],
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                state.render(ui, &conn);
+            });
+        });
+
+        assert!(
+            state.tabs[0].text.contains('x'),
+            "编辑器控件应使用记录下来的 Id 接收键盘输入，实际文本={:?}",
+            state.tabs[0].text
+        );
+        assert!(state.tabs[0].dirty, "输入后应标记未保存");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ctrl_f_opens_find_bar_when_editor_focused() {
+        let conn = test_connection();
+        let ctx = egui::Context::default();
+        let path = temp_file("find-shortcut.toml");
+        fs::write(&path, "key = 1\n").expect("写入测试文件失败");
+
+        let mut state = FileEditorUi::new();
+        state.init(&conn);
+        let id = store::insert_file(&conn, None, &path.display().to_string(), None)
+            .expect("新增条目失败");
+        state.reload_data(&conn);
+        state.open_file(&conn, id, &path, "find-shortcut.toml".to_string());
+
+        // 先渲染一帧拿到编辑器 id，再让它获得焦点，并再渲染一帧记录该状态
+        render_frame(&ctx, &mut state, &conn);
+        let editor_id = state.editor_id.expect("应记录编辑器 id");
+        ctx.memory_mut(|memory| memory.request_focus(editor_id));
+        render_frame(&ctx, &mut state, &conn);
+        assert!(state.editor_had_focus, "应记录到编辑器持有焦点");
+
+        // 模拟 app 的 handle_shortcuts 在本帧抢先聚焦全局搜索框
+        // （egui 的 request_focus 当帧立即生效，此时编辑器已不再持有焦点）
+        let search_box_id = egui::Id::new("global_search_box");
+        ctx.memory_mut(|memory| memory.request_focus(search_box_id));
+
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000.0, 700.0),
+            )),
+            events: vec![egui::Event::Key {
+                key: egui::Key::F,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                // Windows 下真实事件带 command（随 ctrl 一起置位）
+                modifiers: egui::Modifiers::CTRL | egui::Modifiers::COMMAND,
+            }],
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                state.render(ui, &conn);
+            });
+        });
+
+        assert!(
+            state.find.visible,
+            "上一帧编辑器有焦点时 Ctrl+F 必须打开查找栏（即使本帧焦点已被搜索框抢走）"
+        );
+        assert!(!state.find.focus_requested, "渲染查找栏时应消费掉焦点请求");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// 构造一个按键事件
+    fn key_event(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    /// 渲染一帧并注入单个按键事件
+    fn run_key_frame(
+        ctx: &egui::Context,
+        state: &mut FileEditorUi,
+        conn: &Connection,
+        event: egui::Event,
+    ) -> egui::FullOutput {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000.0, 700.0),
+            )),
+            events: vec![event],
+            ..Default::default()
+        };
+
+        ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                state.render(ui, conn);
+            });
+        })
+    }
+
+    #[test]
+    fn find_shortcuts_keep_focus_and_jump_repeatedly() {
+        let conn = test_connection();
+        let ctx = egui::Context::default();
+        let path = temp_file("find-keys.toml");
+        fs::write(&path, "key = 1\nkey = 2\nkey = 3\n").expect("写入测试文件失败");
+
+        let mut state = FileEditorUi::new();
+        state.init(&conn);
+        let id = store::insert_file(&conn, None, &path.display().to_string(), None)
+            .expect("新增条目失败");
+        state.reload_data(&conn);
+        state.open_file(&conn, id, &path, "find-keys.toml".to_string());
+        state.find.query = "key".to_string();
+
+        // 让编辑器先持焦，再用 Ctrl+F 打开查找栏（查找框会请求焦点）
+        render_frame(&ctx, &mut state, &conn);
+        let editor_id = state.editor_id.expect("应记录编辑器 id");
+        ctx.memory_mut(|memory| memory.request_focus(editor_id));
+        render_frame(&ctx, &mut state, &conn);
+        let _ = run_key_frame(
+            &ctx,
+            &mut state,
+            &conn,
+            key_event(egui::Key::F, egui::Modifiers::CTRL),
+        );
+        assert!(state.find.visible, "Ctrl+F 应打开查找栏");
+
+        // 回车 = 下一个：连续按三次必须依次命中 1/2/3（焦点留在查找框，否则后续按键会失效）
+        for expected in 1..=3 {
+            let _ = run_key_frame(
+                &ctx,
+                &mut state,
+                &conn,
+                key_event(egui::Key::Enter, egui::Modifiers::NONE),
+            );
+            assert_eq!(
+                state.find.ordinal(),
+                Some(expected),
+                "回车应连续跳到下一个匹配（第 {expected} 次）"
+            );
+        }
+
+        // ↓ 与回车一致（末尾环绕到第 1 个），↑ 回到上一个（开头环绕到最后一个）
+        let _ = run_key_frame(
+            &ctx,
+            &mut state,
+            &conn,
+            key_event(egui::Key::ArrowDown, egui::Modifiers::NONE),
+        );
+        assert_eq!(state.find.ordinal(), Some(1), "↓ 应跳到下一个并环绕");
+
+        let _ = run_key_frame(
+            &ctx,
+            &mut state,
+            &conn,
+            key_event(egui::Key::ArrowUp, egui::Modifiers::NONE),
+        );
+        assert_eq!(state.find.ordinal(), Some(3), "↑ 应跳到上一个并环绕");
+
+        // 跳转不应把焦点交给编辑器
+        let focused = ctx.memory(|memory| memory.focused());
+        assert!(focused.is_some(), "跳转后应有控件保持焦点");
+        assert_ne!(focused, Some(editor_id), "跳转不应把焦点移到编辑器");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn find_all_recurses_char_indices_across_many_matches() {
+        // 中等规模输入：断言递推得到的字符下标正确（不依赖时间断言，避免 CI 抖动）
+        let text = "key = 1\n".repeat(2_000);
+        let matches = find_all(&text, "key", true);
+        assert_eq!(matches.len(), 2_000);
+        assert_eq!(matches[1].start_byte, 8);
+        assert_eq!(matches[1].start_char, 8);
+        assert_eq!(&text[matches[1].start_byte..matches[1].end_byte], "key");
+
+        // 中文混排：字节与字符下标必须同步递推
+        let mixed = "配置 = 1\n".repeat(100);
+        let matches = find_all(&mixed, "配置", true);
+        assert_eq!(matches.len(), 100);
+        assert_eq!(matches[1].start_byte, 11);
+        assert_eq!(matches[1].start_char, 7);
+    }
+
+    #[test]
+    fn closing_find_bar_clears_highlights() {
+        let conn = test_connection();
+        let ctx = egui::Context::default();
+        let path = temp_file("find-close.toml");
+        fs::write(&path, "key = 1\nkey = 2\n").expect("写入测试文件失败");
+
+        let mut state = FileEditorUi::new();
+        state.init(&conn);
+        let id = store::insert_file(&conn, None, &path.display().to_string(), None)
+            .expect("新增条目失败");
+        state.reload_data(&conn);
+        state.open_file(&conn, id, &path, "find-close.toml".to_string());
+
+        state.find.visible = true;
+        state.find.query = "key".to_string();
+        state.find_in_active(true);
+
+        let dark_mode = ctx.style().visuals.dark_mode;
+        let current_fill = find_highlight_fill(dark_mode);
+        let other_fill = find_other_fill(dark_mode);
+        let count_highlights = |output: &egui::FullOutput| {
+            output
+                .shapes
+                .iter()
+                .filter(|clipped| {
+                    matches!(&clipped.shape, egui::Shape::Rect(rect)
+                        if rect.fill == current_fill || rect.fill == other_fill)
+                })
+                .count()
+        };
+
+        let output = render_frame_output(&ctx, &mut state, &conn);
+        assert!(count_highlights(&output) > 0, "查找栏可见时应绘制高亮");
+
+        // 关栏后：命中清空、编辑文本、再次渲染都不应出现高亮（否则会残留在错误位置）
+        state.apply_actions(vec![super::Action::ToggleFind], &conn);
+        assert!(!state.find.visible);
+        assert!(state.find.matches.is_empty(), "关栏应清空命中列表");
+        state.tabs[0].text.push('x');
+
+        let output = render_frame_output(&ctx, &mut state, &conn);
+        assert_eq!(count_highlights(&output), 0, "关闭查找栏后不应再绘制高亮");
+
+        let _ = fs::remove_file(&path);
     }
 
     #[test]
@@ -2483,6 +2959,15 @@ mod tests {
         state.find_in_active(true);
         let first = state.find.current.expect("应命中第一处");
         assert_eq!(first.start_byte, 0);
+        assert_eq!(state.find.matches.len(), 2, "应统计出全部匹配");
+        assert_eq!(state.find.ordinal(), Some(1), "当前为第 1 处");
+        assert!(state.find.message.contains("第 1 行"));
+
+        // 再按"下一个"应移动到第 2 处，再按一次环绕回第 1 处
+        state.find_in_active(true);
+        assert_eq!(state.find.ordinal(), Some(2));
+        state.find_in_active(true);
+        assert_eq!(state.find.ordinal(), Some(1), "到末尾后应环绕");
 
         render_frame(&ctx, &mut state, &conn);
         assert!(
@@ -2503,14 +2988,27 @@ mod tests {
             "命中区间必须写入编辑器状态（否则只是滚动、没有选中）"
         );
 
-        // 命中高亮必须真的画出来：焦点在查找框时 egui 不会绘制编辑器自身选区
+        // 命中高亮必须真的画出来：焦点在查找框时 egui 不会绘制编辑器自身选区；
+        // 非当前匹配用淡色铺底、当前匹配用浓色 + 描边，两种颜色都要出现
         let output = render_frame_output(&ctx, &mut state, &conn);
-        let fill = find_highlight_fill(ctx.style().visuals.dark_mode);
-        let painted = output
-            .shapes
-            .iter()
-            .any(|clipped| matches!(&clipped.shape, egui::Shape::Rect(rect) if rect.fill == fill));
-        assert!(painted, "命中处应绘制高亮底色");
+        let dark_mode = ctx.style().visuals.dark_mode;
+        let current_fill = find_highlight_fill(dark_mode);
+        let other_fill = find_other_fill(dark_mode);
+        let count_fill = |wanted: egui::Color32| {
+            output
+                .shapes
+                .iter()
+                .filter(|clipped| {
+                    matches!(&clipped.shape, egui::Shape::Rect(rect) if rect.fill == wanted)
+                })
+                .count()
+        };
+        assert_eq!(count_fill(current_fill), 1, "当前匹配应有一个浓色高亮");
+        assert_eq!(
+            count_fill(other_fill),
+            state.find.matches.len().min(super::MAX_HIGHLIGHTED_MATCHES) - 1,
+            "其余匹配应用淡色高亮区分"
+        );
 
         // 替换当前匹配后应自动跳到下一处
         state.find.replace = "param".to_string();
@@ -2522,6 +3020,7 @@ mod tests {
             &state.tabs[0].text[second.start_byte..second.end_byte],
             "key"
         );
+        assert_eq!(state.find.matches.len(), 1, "替换后命中列表应重算");
 
         state.replace_all_in_active();
         assert_eq!(state.tabs[0].text, "param = 1\nother = 2\nparam = 3\n");

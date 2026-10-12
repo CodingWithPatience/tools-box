@@ -33,7 +33,7 @@
 ```
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │  📄 常用文件编辑器  [ ＋ 添加文件 ] [ 🗂 目录管理 ] [ 💾 保存 ] [ ⟳ 重载 ] [ 📄 另存为 ] [ ⇅ 最近打开 ] │
-│  🔍 [key] [↑上一个] [↓下一个]  ☐区分大小写  替换为 [param]  [替换] [全部替换]  第 3 行命中           │
+│  🔍 [key] [↑] [↓]  3/17  ☐区分大小写  替换为 [param]  [替换] [全部替换]  第 10 行            │
 ├────────────────────┬─────────────────────────────────────────────────────────┤
 │  目录 / 文件列表     │  ┌─ 标签栏 ───────────────────────────────────────────┐  │
 │                    │  │ .gitconfig ✕ │ config.toml ● │ settings.json ✕    │  │
@@ -423,21 +423,44 @@ src/plugins/file_editor/
     编辑区始终占满可见区域；布局不做自动换行（`job.wrap.max_width = f32::INFINITY`），
     长行保持单行、宽度随内容增长，由外层 `ScrollArea::both()` 提供横向滚动条，
     窗口缩窄时不会自动折行改变行高。
-15. **查找 / 替换**：查找栏由工具条「🔍 查找」切换（**不绑定 Ctrl+F**，该组合键保留给 app 级插件搜索）；
-    查找按字符比较、可区分大小写（ASCII 走 `eq_ignore_ascii_case` 快路径，其余按 `to_lowercase` 折叠），
-    向下查找到达末尾后环绕、向上查找到达开头后环绕；
+15. **查找 / 替换**：查找栏由工具条「🔍 查找」或 **Ctrl+F** 打开；
+    跳转键（类似 IDEA）：查找框内 **↑ / ↓ = 上一个 / 下一个**，**回车 = 下一个（与 ↓ 一致）**，
+    Shift+回车 = 上一个；工具条上的跳转按钮为纯图标 `↑` / `↓`（悬停显示说明与对应按键）。
+    跳转键在**渲染查找框之前**消费（`FIND_QUERY_ID_SALT` 记录的固定 Id 判断焦点）：
+    单行输入框自己会吃掉回车并主动失焦，等控件处理完再判断就会导致"跳转一次后按键失效"；
+    由于按键在控件之前被消费，跳转后焦点始终留在查找框，可以连续按 ↑/↓/回车逐处浏览。
+    编辑器里的 ↑/↓ 不受影响（仍用于移动光标），因为查找框没有焦点时不做处理。
+    查找按字符比较、可区分大小写（ASCII 走 `eq_ignore_ascii_case` 快路径，其余按 `to_lowercase` 折叠）。
+    命中列表由 `find_all()` 一次扫描得出并由 `FindState::ensure_matches()` 缓存，
+    仅在**文本 / 查找内容 / 大小写规则**变化时重算（编辑、替换、重载、切换标签都会置失效）；
+    扫描过程中**递推**字符下标（`char_index`），不对每个命中回头做 `chars().count()`——
+    否则复杂度会退化成 O(命中数 × 文本长度)，2 MB 文本 + 单字符查询可达秒级卡顿；
+    关闭查找栏时会清空命中列表，之后既不高亮也不再扫描。
+    导航只在列表中移动下标并环绕（末尾下一个回到第一个、开头上一个回到最后一个），
+    因此查找栏可以同时显示 **「当前序号 / 匹配总数」**（如 `3/17`，未定位时显示 `0/总数`），
+    命中数超过高亮上限时提示「仅高亮前 1000 处」。
     命中位置同时换算为**字符下标**（egui 选区按字符计数）与字节下标，前者写入 `TextEditState` 的选区，
     后者用于文本替换；egui 只在"本帧交互改变选区"时自动滚动，因此外部设置的查找选区需要用
     `galley.pos_from_ccursor()` 自行滚动到可见区域。
     编辑器使用显式 `Id`（`ui.make_persistent_id(Id::new(...))` + `TextEdit::id()`），
     状态读写的 Id 必须与控件实际使用的完全一致，否则选区会写到别的内存槽（`id_salt(&str)` 与
     `make_persistent_id(&str)` 得到的 Id 并不相同）。
+    **Ctrl+F 冲突处理**：该组合键同时是 app 级"聚焦插件搜索框"的快捷键，约定为——
+    编辑器（上一帧）有焦点、查找栏已打开、或焦点不在任何输入框时由本插件接管
+    （`should_capture_find_shortcut()`：消费按键 + 打开查找栏 + 请求聚焦查找框）；
+    焦点在**其它文本输入框**（全局搜索框、别的插件的输入框）时不消费，仍归全局搜索。
+    判定必须使用**上一帧**的编辑器焦点状态：app 的 `handle_shortcuts` 在本插件之前执行，
+    而 egui 的 `Memory::request_focus` 当帧立即生效——按 Ctrl+F 的那一帧焦点已被搜索框抢走，
+    用当帧状态判断会永远判否（表现为"Ctrl+F 打不开查找栏，只有已打开时才聚焦查找框"）。
+    本插件在 app 之后渲染，请求聚焦查找框的调用更晚，因此最终焦点落在查找框。
     只读预览（>2 MB）不允许替换；替换当前匹配后会继续查找下一处，并在提示中同时给出替换结果与下一处位置；
     文本被手动编辑、切换标签、重新打开文件、重载都会清空旧命中。
-16. **命中高亮**：命中处由插件**自绘**（`ui.painter().rect()`：低透明度底色 + 1px 描边，
-    暗色/亮色主题各一套，见 `find_highlight_fill()` / `find_highlight_stroke()`），
-    矩形由 `galley.pos_from_ccursor()` 求得。原因：egui 只在 `TextEdit` **获得焦点**时才绘制自身选区
-    （`text_edit/builder.rs:723-730`），而查找时焦点在查找框内，只写 `TextEditState` 用户看不到高亮——
+16. **命中高亮**：插件自绘**所有匹配**：非当前项用淡色铺底（`find_other_fill()`，每帧最多
+    `MAX_HIGHLIGHTED_MATCHES = 1000` 个，避开当前项以免两层底色叠加），
+    当前项用浓色 + 1px 描边画在最上层（`find_highlight_fill()` / `find_highlight_stroke()`），
+    二者颜色明显区分（如 `3/17` 中被定位的那一处）。矩形由 `galley.pos_from_ccursor()` 求得。
+    原因：egui 只在 `TextEdit` **获得焦点**时才绘制自身选区（`text_edit/builder.rs:723-730`），
+    而查找时焦点在查找框内，只写 `TextEditState` 用户看不到高亮——
     选区仍会写入（编辑器一旦获得焦点即可直接编辑命中内容），可见性由自绘保证。
     底色必须用**非预乘** alpha 且保持低透明度：高亮叠在语法着色文字之上，底色太实会把正文压得看不清。
     多行命中的高亮为两端光标的包围盒（跨行时是整块区域），不做逐行拆分。
@@ -778,6 +801,8 @@ cargo clippy --all-targets # file_editor 相关 0 条告警
 `replaces_all_matches_without_overlap`、`counts_lines_for_match_position`、
 `find_and_replace_flow_updates_tab`（打开 → 查找 → 渲染应用选区 → **断言 `TextEditState` 真收到选区** →
 替换并跳下一处 → 全部替换）、`read_only_tab_refuses_replace`、`replaces_multibyte_match_and_advances_anchor`。
+（其中 `find_next_wraps_around_and_reports_char_indices`、`find_prev_returns_nearest_before_and_wraps`
+两个用例在 §12.9 改为命中列表后由 `find_all` 系列用例取代。）
 
 代码审查修复（同一轮）：
 
@@ -816,3 +841,133 @@ cargo clippy --all-targets # file_editor 相关 0 条告警
 
 至此阶段五（P2）的三项全部完成，插件功能面覆盖阶段一~五；
 剩余为工程性优化项，见 §12.6 待办清单与 §12.7 的极长单行说明。
+
+### 12.9 查找体验优化（2026-10-12）
+
+需求：显示匹配总数与当前选中的序号；高亮**所有**匹配项，并与当前选中项用不同颜色区分。
+
+实现：
+
+1. **命中列表**：新增 `find_all(text, query, match_case) -> Vec<MatchRange>`（一次扫描、命中不重叠），
+   取代原先"每次查找重新扫描到下一个命中"的 `find_next` / `find_prev`；
+   结果由 `FindState::ensure_matches()` 缓存，仅在文本 / 查找内容 / 大小写规则变化时重算
+   （编辑、替换、重载、切换标签都会 `invalidate_matches()`）。
+2. **序号与总数**：导航改为在命中列表内移动下标并环绕（`(i + 1) % total`、`(i + len - 1) % total`），
+   未定位时按锚点选择起点（替换后从替换内容之后继续）；
+   查找栏新增 `当前序号/匹配总数` 标签（如 `3/17`，无命中时显示 `0/0`），输入即时更新。
+3. **高亮所有匹配**：非当前项用淡色铺底（`find_other_fill()`：暗色 `0xE0C040@9%`、亮色 `0xB07A00@7%`），
+   当前项用浓色 + 描边画在最上层，两层颜色明显区分；单帧最多绘制 `MAX_HIGHLIGHTED_MATCHES`（1000）个匹配。
+
+测试更新：`find_all` 覆盖大小写与字符/字节下标（含中文）、命中不重叠；
+流程测试新增断言——命中总数为 2、序号依次为 1→2→环绕回 1、
+本帧图元中恰好有 **1 个浓色高亮 + (匹配数 − 1) 个淡色高亮**、替换后命中列表重算为 1。
+
+代码审查修复（同一轮）：
+
+1. **阻塞项：`find_all` 的复杂度退化**。原先每个命中都调用 `match_range()` →
+   `text[..byte].chars().count()`，整体 O(命中数 × 文本长度)：审查实测 240 KB / 4 万命中已需 317 ms，
+   外推到 2 MB + 单字符查询是秒级同步冻结（而查找栏输入即时统计，每敲一个字符触发一次）。
+   现改为**扫描时递推字符下标**（`start_char = char_index`、`end_char = char_index + 查询字符数`），
+   复杂度回到 O(文本长度)，并删除不再使用的 `match_range()`；
+   新增 `find_all_recurses_char_indices_across_many_matches` 用 2000 处命中与中文混排固化递推结果。
+2. **重要项：关栏后高亮残留且会画在旧位置**。绘制入口原先只看 `matches` 非空，而 `matches`
+   只在查找栏可见时刷新 → 关栏后编辑/切换标签会按旧下标在新布局上画高亮且永不消失。
+   现改为：绘制条件加 `find.visible`，绘制前用当前文本 `ensure_matches()` 校正（命中缓存时 O(1)），
+   关栏时清空命中列表；新增 `closing_find_bar_clears_highlights` 断言"关栏 → 编辑 → 无高亮图元"。
+3. 序号/下标查询由线性 `position` 改为按有序列表 `partition_point` 二分（每帧与每次导航各一次）；
+   淡色高亮透明度略微上调（暗色 12%、亮色 10%）以保证亮色主题下可见；
+   命中数超过上限时提示"仅高亮前 1000 处"；测试期望值按"实际绘制窗口"计算。
+
+验证：
+
+```text
+cargo test                 # 282 通过 / 1 忽略（file_editor 47 项）
+cargo build                # 无新增告警
+cargo build --release      # 仅 api_tester 既有 7 项告警
+cargo clippy --all-targets # file_editor 相关 0 条告警
+```
+
+### 12.10 查找交互精简与 Ctrl+F 接管（2026-10-12）
+
+需求：上一个 / 下一个按钮只保留图标；用 ↑ / ↓ 图标按钮跳转；支持 Ctrl+F 打开查找，
+并处理好与 app 级"聚焦插件搜索框"共用该快捷键的冲突。
+
+实现：
+
+1. **按钮图标化**：`[↑ 上一个]` / `[↓ 下一个]` → 纯图标 `↑` / `↓`，说明文字移到悬停提示
+   （`on_hover_text("上一个匹配")` / `("下一个匹配（回车）")`），查找栏更紧凑。
+2. **键盘跳转**：查找输入框内 `回车` = 下一个、`Shift+回车` = 上一个（提示文案同步更新）。
+3. **Ctrl+F 接管**：新增 `should_capture_find_shortcut(editor_focused, find_visible)`——
+   只有**编辑器有焦点或查找栏已打开**时才由本插件接管（`input.consume_key(CTRL, F)` →
+   打开查找栏 → 请求聚焦查找框）；焦点在侧栏 / 搜索框 / 其他插件时不消费，仍归 app 级全局搜索。
+   本插件在 `App::handle_shortcuts` 之后渲染，egui 的焦点以**最后一次请求**为准，
+   因此同一帧内 app 先请求聚焦搜索框、插件随后请求聚焦查找框，最终焦点落在查找框（无闪烁）。
+   工具条「🔍 查找」打开时同样请求聚焦查找框。
+
+测试（新增 2 项）：`captures_find_shortcut_only_in_editor_context`（接管条件）、
+`ctrl_f_opens_find_bar_when_editor_focused`（真实注入 `Ctrl+F` 按键事件，
+断言查找栏打开且焦点请求被消费）。
+
+验证：
+
+```text
+cargo test                 # 284 通过 / 1 忽略（file_editor 49 项）
+cargo build                # 无新增告警
+cargo build --release      # 仅 api_tester 既有 7 项告警
+cargo clippy --all-targets # file_editor 相关 0 条告警
+```
+
+### 12.11 Ctrl+F 打不开查找栏的修复（2026-10-12）
+
+界面实测反馈：编辑器有焦点时 Ctrl+F **打不开**查找栏，而查找栏已打开时 Ctrl+F 能聚焦到查找框。
+
+原因：`App::handle_shortcuts` 在本插件之前执行，它一看到 Ctrl+F 就把焦点交给全局搜索框；
+egui 的 `Memory::request_focus` 是**当帧立即生效**的（`focus.focused_widget = Some(...)`），
+所以轮到本插件渲染时 `has_focus(编辑器)` 已经是 false → 接管判定失败。
+查找栏已打开时之所以还能聚焦，是因为判定里的 `find_visible` 命中了。
+
+修复：新增 `FileEditorUi::editor_had_focus` 记录**上一帧**的编辑器焦点状态，
+接管判定改用该值；同时把"焦点在其它文本输入框时不接管"的条件改为基于
+`ctx.wants_keyboard_input()` 与上一帧状态组合，避免把"刚被搜索框抢走焦点"误判成"用户正在搜索框里输入"。
+测试 `ctrl_f_opens_find_bar_when_editor_focused` 升级为**复现该场景**：先让编辑器获得焦点并渲染一帧，
+再模拟 app 抢先聚焦搜索框，然后注入 `Ctrl+F`（含 Windows 真实的 `CTRL|COMMAND` 修饰键），
+断言查找栏必须打开——修复前该用例失败。
+
+同时新增 `editor_widget_holds_keyboard_focus_with_recorded_id`：给记录的编辑器 Id 聚焦后注入文本事件，
+断言输入确实落到编辑器上，用以固化"记录的 Id 与控件真实 Id 一致"这一前提。
+
+验证：
+
+```text
+cargo test                 # 285 通过 / 1 忽略（file_editor 50 项）
+cargo build                # 无新增告警
+cargo build --release      # 仅 api_tester 既有 7 项告警
+cargo clippy --all-targets # file_editor 相关 0 条告警
+```
+
+### 12.12 查找跳转改为 ↑/↓ 键并保持焦点（2026-10-12）
+
+界面实测反馈：跳转键应为**键盘 ↑/↓**（而非回车 / Shift+回车）；且回车跳转后查找框**失去焦点**，
+再按任何键都无效，必须重新点击查找框。
+
+原因：原实现用 `query.lost_focus() && key_pressed(Enter)` 判定——单行 `TextEdit` 处理回车时
+会**消费该事件并主动交还焦点**，因此判定只在"已经失焦"的那一帧成立，跳转一次后焦点就不在查找框里了。
+
+修复：跳转键改为在**渲染查找框之前**处理——用 `FIND_QUERY_ID_SALT` 的固定 Id 判断查找框是否持有焦点，
+是则先 `consume_key` 掉 `↑`/`↓`/`回车`/`Shift+回车`（控件因此看不到这些键，不会再失焦），
+再投递上/下跳转动作；查找框自身用 `.id(query_id)` 固定 Id。
+约定与 IDEA 一致：**↓ / 回车 = 下一个，↑ / Shift+回车 = 上一个**；焦点全程留在查找框，可连续按键逐处浏览。
+编辑器里的 ↑/↓ 不受影响（查找框无焦点时不处理）。
+
+测试（新增 1 项）：`find_shortcuts_keep_focus_and_jump_repeatedly` —— Ctrl+F 打开查找栏后
+**连续三次回车**依次命中 1/2/3（同时验证了"焦点没有丢"），再用 `↓` 环绕到第 1 个、`↑` 环绕到最后一个，
+并断言跳转后焦点没有跑到编辑器。修复前该用例在第一次回车后即失败。
+
+验证：
+
+```text
+cargo test                 # 286 通过 / 1 忽略（file_editor 51 项）
+cargo build                # 无新增告警
+cargo build --release      # 仅 api_tester 既有 7 项告警
+cargo clippy --all-targets # file_editor 相关 0 条告警
+```
