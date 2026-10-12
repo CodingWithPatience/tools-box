@@ -536,3 +536,36 @@ windows-sys = { version = "0.60", features = [
 ```
 
 部署：`C:\Program Files\Tools-box\tools-box.exe`（哈希 AF34621E…）已重启验证。
+
+#### 10.3.1 审查反馈修复（同轮）
+
+`11140ed` 的 code review 结论为"无阻塞"，其中两条重要项已在同轮修正：
+
+1. **注释与实现自相矛盾**：回调里的注释写成"`wake_main_window` 不再改变窗口可见性"，
+   而它实际上仍会 `ShowWindowAsync(SW_SHOW/SW_RESTORE)`。已改写为准确表述：
+   正确性来自**按意图分派唤醒方式**（新增 `WakeKind` + `wake_kind(event)`，Show → `wake_main_window`、
+   Hide → `nudge_main_window`），"先采样再投递"是防御性顺序；两者缺一都会重现本 Bug。
+2. **"左键隐藏"实际不可达**：原判据 `is_main_window_in_front()` 含 `GetForegroundWindow() == hwnd`，
+   而点击托盘图标本身常把前台交给任务栏 → 真实点击时几乎总是判成"未在最前层"→ 只会唤出、不会隐藏，
+   与本文档 §一「左键切换显示/隐藏」不符。已改为传统托盘语义：新增
+   `is_main_window_on_screen()`（可见且未最小化）作为左键判据；`is_main_window_in_front()` 仅保留给热键。
+
+同时落实的审查建议：
+
+- `wake_main_window` 的重复文档块合并为一段，并保留"仅用于唤出意图"的告警；
+- 负向断言改为 **400ms 内轮询**（`assert_window_stays_hidden` / `assert_window_stays_minimized`），
+  避免异步显示调用造成假通过；
+- `tray_left_click_event` / `nudge_main_window` 收窄为模块内私有（`wake_main_window` 仍需 `pub` 供热键使用）；
+- 新增 `test_wake_kind_matches_event_intent` 覆盖"事件 → 唤醒方式"映射；
+  `is_main_window_in_front()` 文档补充调用方与前台判定的边界。
+
+验证（`cargo test` 290 通过 / 1 忽略，tray 模块 20 项；实机注入托盘消息）：
+
+```text
+场景 A：隐藏 → 左键 → 1 秒、2.2 秒后均可见      ✅ 恢复后不再闪退
+场景 B：可见 → 左键 → 1 秒、2.2 秒后均隐藏      ✅ 左键隐藏可达且稳定（旧判据下不可达）
+日志：  [托盘] 左键点击 → 显示窗口（点击时窗口在桌面上=false）→ [托盘事件] 显示窗口 → 已恢复到桌面最前层
+        [托盘] 左键点击 → 隐藏窗口（点击时窗口在桌面上=true） → [托盘事件] 隐藏窗口 → 已 SW_HIDE
+```
+
+部署：`C:\Program Files\Tools-box\tools-box.exe`（哈希 D90A42BB…）已重启验证。
