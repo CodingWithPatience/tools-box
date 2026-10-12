@@ -12,6 +12,12 @@ pub struct AppSettings {
     pub theme: String,
     /// 字体大小（10.0 ~ 24.0）
     pub font_size: f32,
+    /// 界面字体名（`None` 表示使用内置默认字体）
+    ///
+    /// 存字体名而不是文件路径：应用时按名重新解析路径，字体卸载或换目录后能自动跟随。
+    pub ui_font: Option<String>,
+    /// 代码字体名（`None` 表示使用内置默认等宽字体；只允许等宽字体）
+    pub code_font: Option<String>,
     /// 侧边栏宽度
     pub sidebar_width: f32,
     /// 各工具的自定义热键（插件索引 → 虚拟键码字符，如 '1', 'a' 等）
@@ -25,6 +31,8 @@ impl Default for AppSettings {
         Self {
             theme: "dark".to_string(),
             font_size: 14.0,
+            ui_font: None,
+            code_font: None,
             sidebar_width: 200.0,
             tool_hotkeys: vec!['1', '2', '3', '4', '5', '6', '7', '8'],
             auto_start: false,
@@ -36,7 +44,8 @@ impl AppSettings {
     /// 从数据库加载设置，如果不存在则返回默认值
     pub fn load(conn: &Connection) -> Result<Self> {
         let result = conn.query_row(
-            "SELECT theme, font_size, sidebar_width, tool_hotkeys, auto_start FROM app_settings WHERE id = 1",
+            "SELECT theme, font_size, sidebar_width, tool_hotkeys, auto_start, ui_font, code_font
+             FROM app_settings WHERE id = 1",
             [],
             |row| {
                 let hotkeys_str: String = row.get(3)?;
@@ -44,6 +53,8 @@ impl AppSettings {
                 Ok(Self {
                     theme: row.get(0)?,
                     font_size: row.get(1)?,
+                    ui_font: row.get(5)?,
+                    code_font: row.get(6)?,
                     sidebar_width: row.get(2)?,
                     tool_hotkeys: hotkeys,
                     auto_start: row.get(4)?,
@@ -90,17 +101,28 @@ impl AppSettings {
     pub fn save(&self, conn: &Connection) -> Result<()> {
         let hotkeys_str: String = self.tool_hotkeys.iter().collect();
         log::info!(
-            "保存设置: theme={}, font_size={}, sidebar_width={}, hotkeys={}, auto_start={}",
+            "保存设置: theme={}, font_size={}, sidebar_width={}, hotkeys={}, auto_start={}, ui_font={:?}, code_font={:?}",
             self.theme,
             self.font_size,
             self.sidebar_width,
             hotkeys_str,
-            self.auto_start
+            self.auto_start,
+            self.ui_font,
+            self.code_font
         );
         conn.execute(
-            "INSERT OR REPLACE INTO app_settings (id, theme, font_size, sidebar_width, tool_hotkeys, auto_start, updated_at)
-             VALUES (1, ?1, ?2, ?3, ?4, ?5, CURRENT_TIMESTAMP)",
-            rusqlite::params![self.theme, self.font_size, self.sidebar_width, hotkeys_str, self.auto_start],
+            "INSERT OR REPLACE INTO app_settings
+                (id, theme, font_size, sidebar_width, tool_hotkeys, auto_start, ui_font, code_font, updated_at)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, CURRENT_TIMESTAMP)",
+            rusqlite::params![
+                self.theme,
+                self.font_size,
+                self.sidebar_width,
+                hotkeys_str,
+                self.auto_start,
+                self.ui_font,
+                self.code_font
+            ],
         )
         .map_err(|e| {
             log::error!("SQL 执行失败: {}", e);

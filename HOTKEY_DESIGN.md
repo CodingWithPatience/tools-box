@@ -40,6 +40,9 @@
 |------|------|--------|
 | 主题设置 | 亮色/暗色主题切换 | P0 |
 | 字体大小设置 | 字体大小调节 (10-24) | P0 |
+| 界面字体设置 | 从系统已安装字体中选择全局界面字体，带预览行，选中即时生效 | P1 |
+| 代码字体设置 | 从系统已安装的**等宽**字体中选择代码字体（编辑器 / 终端 / 代码块） | P1 |
+| 字体列表刷新 | 运行期间新装的字体点「刷新列表」即可出现，无需重启 | P2 |
 | 快捷键配置 | 修饰键和工具快捷键字母自定义 | P0 |
 | 设置持久化 | SQLite 存储，重启后保持 | P0 |
 | 恢复默认 | 一键恢复所有设置为默认值 | P1 |
@@ -569,3 +572,68 @@ windows-sys = { version = "0.60", features = [
 ```
 
 部署：`C:\Program Files\Tools-box\tools-box.exe`（哈希 D90A42BB…）已重启验证。
+
+### 10.4 全局字体选择（界面字体 + 代码字体，2026-10-12）
+
+需求：设置面板中增加全局字体选择，插件沿用全局字体；范围经确认为**界面 + 代码**两个选择器，
+代码字体**限等宽**、字体来自**系统已安装字体**、**带预览行**、只做**手动刷新**（不每次打开设置页重新枚举）。
+
+实现：
+
+- `src/utils/fonts.rs`（新增）：
+  - `enumerate_system_fonts()`：读注册表 `HKLM` / `HKCU` 的
+    `SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts`（值名=字体名、值数据=文件名），
+    文件名在 `%SystemRoot%\Fonts`、`%LOCALAPPDATA%\Microsoft\Windows\Fonts` 中解析（写绝对路径时直接用）；
+  - 等宽判定读**字体文件头**：`post.isFixedPitch`，为 0 时再看 `OS/2` 的 Panose 比例字段（==9）；
+    `.ttc` 集合按 TTC 头取第 0 个 face（表偏移是相对文件起点的绝对值）；解析拆成
+    `(Read + Seek)` 纯函数，用 `Cursor` 单测；
+  - `build_font_definitions()` / `setup_fonts()`：保留既有行为（微软雅黑作中文字形来源、
+    Segoe UI Emoji 作 Emoji 兜底），把用户选择的界面/代码字体插到 `Proportional` / `Monospace` 的**首位**，
+    缺字自动回退；字体文件读取失败时**不写入**该键（避免 egui 缺字形）；
+  - `resolve_selected_fonts()`：两个字体名**一次枚举**解析完（两者都未选择时不枚举，默认配置启动零开销）；
+  - `font_revision()`：每次应用字体自增的版本号，供插件排版缓存做键。
+- 设置：`app_settings` 增加 `ui_font` / `code_font`（NULL=内置默认，存**字体名**、
+  应用时重新解析路径，字体卸载后自动回退并告警）+ `user_version 4` 迁移
+  （新增 `Database::ensure_column()` 通用补列helper）；设置页新增两个下拉框（界面字体全部、
+  代码字体只列等宽并在界面字体列表里标注「等宽」）、预览行（分别按 Proportional / Monospace 渲染）
+  与「↻ 刷新列表」按钮；字体列表**首次进入设置页枚举一次**，之后仅手动刷新；
+  点击已选中项不算变更（避免无谓地让全插件排版缓存失效一次）。
+- 生效链路：`App::apply_fonts()` 在首帧与 `SettingsChange::font_changed` 时调用
+  （与字体大小一样即时生效，`ctx.set_fonts` 在下一帧开头重建字体图集，galleys 自动失效）。
+- 插件侧：**只**需要让"自己缓存的 `LayoutJob`"随字体版本失效——`file_editor` 的
+  `LayoutParams`、`diff_viewer` 的两处高亮 hash、`note_taker` 的代码高亮缓存条目与
+  `InlineLayoutContext` 各加入 `font_revision`；`diff_viewer` 的行号列宽度由"字号×0.6 估算"
+  改为 `glyph_width('0'..='9')` 实测步进（换字体不再裁最高位）。SSH 终端每帧从实际字体取
+  字形度量、文件编辑器行号列本就按度量计算，二者无需改动。
+
+测试（新增 11 项 `utils::fonts` + 1 项设置面板渲染）：注册表值名解析（含 `A & B` 别名只保留第一个）、
+`post` 表判定等宽 / 非等宽、`.ttc` 集合判定、无可用表时返回不可判定、
+对真实系统字体（Consolas / Times New Roman）抽样判定、字体路径解析、
+用户字体装配（family 首位 + 兜底保留）、坏字体文件不写入 family、
+**端到端度量**（应用自定义字体后等宽文本排版宽度确实变化）、
+`resolve_selected_fonts` 的一次枚举与空选择短路；
+`file_editor` 的缓存用例追加"字体版本变化必须重新高亮"断言。
+
+验证：
+
+```text
+cargo test                 # 309 通过 / 1 忽略（utils::fonts 11 项；file_editor 59 项）
+cargo build                # 无新增告警
+cargo build --release      # 仍为基线 7 项告警
+cargo clippy --all-targets # utils/fonts.rs 0 条告警；本次改动未引入新告警
+```
+
+实机验证（直接写库模拟用户在设置页选择，验完已恢复为默认）：
+
+```text
+写入 ui_font=Consolas, code_font=Consolas → 重启
+日志：已枚举系统字体 385 个 → 已加载中文字体 msyh.ttc → 已加载 Emoji 字体 seguiemj.ttf
+      → 界面字体已设置为: Consolas（C:\Windows\Fonts\consola.ttf）
+      → 代码字体已设置为: Consolas（C:\Windows\Fonts\consola.ttf）→ 全局字体已应用（版本 2）
+```
+
+已知限制：字体列表在运行期间不自动感知新装字体（按需求只做手动刷新）；
+个别字体装完需重新登录才可用（会列出但加载失败时回退默认并告警）；
+`WM_FONTCHANGE` 实时刷新未实现；`REG_EXPAND_SZ` 登记的环境变量路径未展开
+（字体登记几乎总是纯文件名，已在代码注释标注）；
+首帧会先用内置字体、再应用用户字体（约多一次 20 MB 定义比较，可接受）。

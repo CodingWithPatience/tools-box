@@ -5,6 +5,7 @@
 use std::path::Path;
 
 use super::models::AppSettings;
+use crate::utils::fonts::{SystemFont, enumerate_system_fonts};
 use windows_sys::Win32::Foundation::ERROR_SUCCESS;
 use windows_sys::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE, REG_SZ, RegCloseKey, RegDeleteValueW,
@@ -21,6 +22,14 @@ const MIN_SIDEBAR_WIDTH: u16 = 150;
 const MAX_SIDEBAR_WIDTH: u16 = 400;
 /// 侧边栏宽度输入框 ID。
 const SIDEBAR_WIDTH_INPUT_ID: &str = "settings_sidebar_width_input";
+/// 界面字体下拉框 ID。
+const UI_FONT_COMBO_ID: &str = "settings_ui_font_combo";
+/// 代码字体下拉框 ID。
+const CODE_FONT_COMBO_ID: &str = "settings_code_font_combo";
+/// 字体下拉框宽度。
+const FONT_COMBO_WIDTH: f32 = 260.0;
+/// 未选择自定义字体时下拉框显示的文案
+const DEFAULT_FONT_LABEL: &str = "默认（内置字体）";
 
 /// 可用于热键的字符列表（大写字母 + 数字）
 const HOTKEY_CHARS: &[char] = &[
@@ -33,6 +42,8 @@ const HOTKEY_CHARS: &[char] = &[
 pub struct SettingsChange {
     pub theme_changed: bool,
     pub font_size_changed: bool,
+    /// 全局字体（界面字体 / 代码字体）发生变化，需要重新装载字体
+    pub font_changed: bool,
     pub sidebar_width_changed: bool,
     pub hotkeys_changed: bool,
     pub save_requested: bool,
@@ -49,6 +60,10 @@ pub struct SettingsUi {
     dirty: bool,
     /// 插件名称列表（用于热键配置显示）
     plugin_names: Vec<String>,
+    /// 系统字体列表（首次渲染设置面板时枚举，可手动刷新）
+    system_fonts: Vec<SystemFont>,
+    /// 系统字体列表是否已枚举
+    fonts_loaded: bool,
 }
 
 impl SettingsUi {
@@ -59,6 +74,8 @@ impl SettingsUi {
             sidebar_width_input,
             dirty: false,
             plugin_names,
+            system_fonts: Vec::new(),
+            fonts_loaded: false,
         }
     }
 
@@ -113,13 +130,16 @@ impl SettingsUi {
             if ui.button("🔄 恢复默认").clicked() {
                 let default = AppSettings::default();
                 let theme_changed = self.settings.theme != default.theme;
-                let font_changed = self.settings.font_size != default.font_size;
+                let font_size_changed = self.settings.font_size != default.font_size;
+                let font_changed = self.settings.ui_font != default.ui_font
+                    || self.settings.code_font != default.code_font;
                 let width_changed = self.settings.sidebar_width != default.sidebar_width;
                 self.sidebar_width_input = format_sidebar_width(default.sidebar_width);
                 self.settings = default;
                 self.dirty = true;
                 change.theme_changed = theme_changed;
-                change.font_size_changed = font_changed;
+                change.font_size_changed = font_size_changed;
+                change.font_changed = font_changed;
                 change.sidebar_width_changed = width_changed;
                 change.hotkeys_changed = true;
                 change.reset_requested = true;
@@ -180,6 +200,11 @@ impl SettingsUi {
 
             ui.add_space(4.0);
 
+            // 全局字体（界面 + 代码）
+            self.render_font_section(ui, change);
+
+            ui.add_space(4.0);
+
             // 侧边栏宽度
             ui.horizontal(|ui| {
                 ui.label("侧边栏宽度：");
@@ -197,6 +222,147 @@ impl SettingsUi {
                 }
             });
         });
+    }
+
+    /// 渲染全局字体选择区域
+    ///
+    /// 界面字体可选全部系统字体，代码字体只列**等宽**字体（行号对齐、代码观感都依赖等宽）；
+    /// 选中即生效（与字体大小一致），预览行直接显示当前实际渲染效果。
+    fn render_font_section(&mut self, ui: &mut egui::Ui, change: &mut SettingsChange) {
+        self.ensure_fonts_loaded();
+
+        // 下拉框闭包内同时借用 settings（可写）与 system_fonts（只读），
+        // 因此变更只记标志，循环结束后再写 dirty / change
+        let mut selection_changed = false;
+
+        ui.horizontal(|ui| {
+            ui.label("界面字体：");
+            let selected = self
+                .settings
+                .ui_font
+                .clone()
+                .unwrap_or_else(|| DEFAULT_FONT_LABEL.to_owned());
+            egui::ComboBox::from_id_salt(UI_FONT_COMBO_ID)
+                .selected_text(selected)
+                .width(FONT_COMBO_WIDTH)
+                .show_ui(ui, |ui| {
+                    let none_selected = self.settings.ui_font.is_none();
+                    if ui
+                        .selectable_label(none_selected, DEFAULT_FONT_LABEL)
+                        .clicked()
+                        && !none_selected
+                    {
+                        self.settings.ui_font = None;
+                        selection_changed = true;
+                    }
+                    for font in &self.system_fonts {
+                        // 已选中项点击不算变更：否则会白白让所有插件的排版缓存失效一次
+                        let selected = self.settings.ui_font.as_deref() == Some(font.name.as_str());
+                        let label = if font.monospace {
+                            format!("{}（等宽）", font.name)
+                        } else {
+                            font.name.clone()
+                        };
+                        if ui.selectable_label(selected, label).clicked() && !selected {
+                            self.settings.ui_font = Some(font.name.clone());
+                            selection_changed = true;
+                        }
+                    }
+                });
+        });
+
+        ui.add_space(4.0);
+
+        ui.horizontal(|ui| {
+            ui.label("代码字体：");
+            let selected = self
+                .settings
+                .code_font
+                .clone()
+                .unwrap_or_else(|| DEFAULT_FONT_LABEL.to_owned());
+            egui::ComboBox::from_id_salt(CODE_FONT_COMBO_ID)
+                .selected_text(selected)
+                .width(FONT_COMBO_WIDTH)
+                .show_ui(ui, |ui| {
+                    let none_selected = self.settings.code_font.is_none();
+                    if ui
+                        .selectable_label(none_selected, DEFAULT_FONT_LABEL)
+                        .clicked()
+                        && !none_selected
+                    {
+                        self.settings.code_font = None;
+                        selection_changed = true;
+                    }
+
+                    let mut has_monospace = false;
+                    for font in &self.system_fonts {
+                        if !font.monospace {
+                            continue;
+                        }
+                        has_monospace = true;
+
+                        let selected =
+                            self.settings.code_font.as_deref() == Some(font.name.as_str());
+                        if ui.selectable_label(selected, &font.name).clicked() && !selected {
+                            self.settings.code_font = Some(font.name.clone());
+                            selection_changed = true;
+                        }
+                    }
+
+                    if !has_monospace {
+                        ui.weak("未找到等宽字体");
+                    }
+                });
+
+            if ui.small_button("↻ 刷新列表").clicked() {
+                self.reload_fonts();
+            }
+        });
+
+        if selection_changed {
+            self.dirty = true;
+            change.font_changed = true;
+            log::info!("字体选择已变更，等待应用");
+        }
+
+        ui.add_space(4.0);
+
+        // 预览：直接按两个 family 渲染，选中后即时可见
+        let font_size = self.settings.font_size;
+        ui.label(
+            egui::RichText::new("预览（界面）：字体预览 Aa Bb Cc 中文示例 0123")
+                .font(egui::FontId::new(font_size, egui::FontFamily::Proportional)),
+        );
+        ui.label(
+            egui::RichText::new("预览（代码）：fn main() { let value = 0; } // 中文 0123")
+                .font(egui::FontId::new(font_size, egui::FontFamily::Monospace)),
+        );
+
+        if self.system_fonts.is_empty() {
+            ui.weak("字体列表为空：可能是读取系统字体注册表失败，见日志");
+        } else {
+            ui.weak(format!(
+                "系统字体 {} 个（其中等宽 {} 个）；新装字体请点「刷新列表」",
+                self.system_fonts.len(),
+                self.system_fonts
+                    .iter()
+                    .filter(|font| font.monospace)
+                    .count()
+            ));
+        }
+    }
+
+    /// 首次进入设置页时枚举系统字体（避免启动时多花时间）
+    fn ensure_fonts_loaded(&mut self) {
+        if !self.fonts_loaded {
+            self.reload_fonts();
+        }
+    }
+
+    /// 重新枚举系统字体（新装字体后可点刷新按钮）
+    fn reload_fonts(&mut self) {
+        self.system_fonts = enumerate_system_fonts();
+        self.fonts_loaded = true;
     }
 
     /// 渲染快捷键设置区域
@@ -374,6 +540,50 @@ mod tests {
         assert_eq!(
             auto_start_value(path),
             "\"C:\\Program Files\\Tools-box\\tools-box.exe\""
+        );
+    }
+
+    /// 渲染设置面板一帧：字体区域不应 panic，首次渲染即枚举系统字体，默认不产生字体变更
+    #[test]
+    fn renders_font_section_and_loads_system_fonts() {
+        let ctx = egui::Context::default();
+        let mut settings_ui = SettingsUi::new(AppSettings::default(), vec!["工具".to_string()]);
+
+        assert!(!settings_ui.fonts_loaded, "渲染前不应枚举字体");
+
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        let mut change = SettingsChange::default();
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                change = settings_ui.render(ui);
+            });
+        });
+
+        assert!(
+            !change.font_changed,
+            "仅渲染不应报告字体变更（未点选任何字体）"
+        );
+        assert!(settings_ui.fonts_loaded, "首次渲染设置面板应枚举系统字体");
+        assert!(
+            !settings_ui.system_fonts.is_empty(),
+            "Windows 环境应至少枚举到一个系统字体"
+        );
+        assert!(
+            settings_ui.system_fonts.iter().any(|font| font.monospace),
+            "应至少识别出一个等宽字体（代码字体下拉需要）"
+        );
+        assert!(
+            settings_ui
+                .system_fonts
+                .iter()
+                .all(|font| font.path.is_absolute()),
+            "枚举结果必须带绝对路径"
         );
     }
 

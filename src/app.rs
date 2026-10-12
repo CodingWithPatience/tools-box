@@ -169,80 +169,13 @@ pub struct App {
     db: Database,
 }
 
-/// 配置中文字体和 Emoji 字体
+/// 配置中文字体和 Emoji 字体（首帧调用，尚未读取用户字体设置）
 ///
 /// 从 Windows 系统字体目录加载 Microsoft YaHei（中文）和 Segoe UI Emoji（表情符号），
-/// 确保中文和 Emoji 图标正常显示。
+/// 确保中文和 Emoji 图标正常显示。用户选择的全局字体在首帧 `update` 里由
+/// [`App::apply_fonts`] 追加到 family 首位。
 pub fn setup_chinese_fonts(ctx: &egui::Context) {
-    let mut fonts = egui::FontDefinitions::default();
-
-    // 尝试加载 Microsoft YaHei 字体（中文支持）
-    let chinese_font_paths = [
-        r"C:\Windows\Fonts\msyh.ttc",
-        r"C:\Windows\Fonts\msyhbd.ttc",
-        r"C:\Windows\Fonts\simhei.ttf",
-        r"C:\Windows\Fonts\simsun.ttc",
-    ];
-
-    let mut chinese_loaded = false;
-    for path in &chinese_font_paths {
-        if let Ok(font_data) = std::fs::read(path) {
-            fonts.font_data.insert(
-                "chinese".to_owned(),
-                egui::FontData::from_owned(font_data).into(),
-            );
-
-            // 将中文字体设为 Proportional 和 Monospace 的首选 fallback
-            if let Some(family) = fonts.families.get_mut(&FontFamily::Proportional) {
-                family.insert(0, "chinese".to_owned());
-            }
-            if let Some(family) = fonts.families.get_mut(&FontFamily::Monospace) {
-                family.push("chinese".to_owned());
-            }
-
-            log::info!("已加载中文字体: {}", path);
-            chinese_loaded = true;
-            break;
-        }
-    }
-
-    if !chinese_loaded {
-        log::warn!("未找到中文字体，中文可能显示为乱码");
-    }
-
-    // 尝试加载 Emoji 字体（支持 Unicode 表情符号）
-    let emoji_font_paths = [
-        r"C:\Windows\Fonts\seguiemj.ttf", // Segoe UI Emoji
-        r"C:\Windows\Fonts\seguisym.ttf", // Segoe UI Symbol
-    ];
-
-    let mut emoji_loaded = false;
-    for path in &emoji_font_paths {
-        if let Ok(font_data) = std::fs::read(path) {
-            fonts.font_data.insert(
-                "emoji".to_owned(),
-                egui::FontData::from_owned(font_data).into(),
-            );
-
-            // 将 Emoji 字体添加为 fallback
-            if let Some(family) = fonts.families.get_mut(&FontFamily::Proportional) {
-                family.push("emoji".to_owned());
-            }
-            if let Some(family) = fonts.families.get_mut(&FontFamily::Monospace) {
-                family.push("emoji".to_owned());
-            }
-
-            log::info!("已加载 Emoji 字体: {}", path);
-            emoji_loaded = true;
-            break;
-        }
-    }
-
-    if !emoji_loaded {
-        log::warn!("未找到 Emoji 字体，部分图标可能显示为方框");
-    }
-
-    ctx.set_fonts(fonts);
+    crate::utils::fonts::setup_fonts(ctx, None, None);
 }
 
 impl App {
@@ -552,6 +485,20 @@ impl App {
         bindings
     }
 
+    /// 应用全局字体（界面字体 + 代码字体）
+    ///
+    /// 设置里存的是字体名：每次应用都按名重新解析路径（一次枚举同时解析两个），
+    /// 字体被卸载/换目录后能自动跟随；找不到时回退内置默认字体（`setup_fonts` 内部记录告警）。
+    fn apply_fonts(&self, ctx: &egui::Context) {
+        let settings = self.settings_plugin.settings();
+        let (ui_font, code_font) = crate::utils::fonts::resolve_selected_fonts(
+            settings.ui_font.as_deref(),
+            settings.code_font.as_deref(),
+        );
+
+        crate::utils::fonts::setup_fonts(ctx, ui_font.as_ref(), code_font.as_ref());
+    }
+
     /// 应用字体大小设置
     fn apply_font_size(&self, ctx: &egui::Context) {
         let mut style = (*ctx.style()).clone();
@@ -712,6 +659,11 @@ impl App {
                 self.apply_font_size(ui.ctx());
             }
 
+            // 处理全局字体变更（即时生效，重建字体图集）
+            if change.font_changed {
+                self.apply_fonts(ui.ctx());
+            }
+
             // 处理侧边栏宽度变更（即时生效）
             if change.sidebar_width_changed {
                 apply_sidebar_width(
@@ -778,8 +730,9 @@ impl eframe::App for App {
         // 即使窗口最小化/隐藏，eframe 仍会持续调用 update()
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
 
-        // 1. 首次运行时应用字体大小和主题
+        // 1. 首次运行时应用字体（中文字体 + 用户选择的全局字体）、字号与主题
         if !self.font_applied {
+            self.apply_fonts(ctx);
             self.apply_font_size(ctx);
             // 应用保存的主题
             match self.theme {

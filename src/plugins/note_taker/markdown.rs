@@ -976,6 +976,8 @@ struct InlineLayoutContext {
     available_width_bits: u32,
     body_font_size_bits: u32,
     monospace_font_size_bits: u32,
+    /// 全局字体版本（换字体后行内布局必须重排）
+    font_revision: u64,
     text_color: [u8; 4],
     strong_text_color: [u8; 4],
     hyperlink_color: [u8; 4],
@@ -1007,6 +1009,8 @@ struct CodeHighlightCacheEntry {
     language: Option<String>,
     font_size_bits: u32,
     is_dark_mode: bool,
+    /// 全局字体版本（换字体后代码块必须重排）
+    font_revision: u64,
     job: LayoutJob,
 }
 
@@ -1022,6 +1026,7 @@ impl CodeHighlightCacheEntry {
             && self.language.as_deref() == language
             && self.font_size_bits == font_size.to_bits()
             && self.is_dark_mode == is_dark_mode
+            && self.font_revision == crate::utils::fonts::font_revision()
     }
 }
 
@@ -1591,6 +1596,7 @@ impl MarkdownRenderer {
                 language: language.map(str::to_owned),
                 font_size_bits: font_size.to_bits(),
                 is_dark_mode,
+                font_revision: crate::utils::fonts::font_revision(),
                 job: job.clone(),
             },
         );
@@ -1653,6 +1659,7 @@ fn code_highlight_cache_key(
     language.hash(&mut hasher);
     font_size.to_bits().hash(&mut hasher);
     is_dark_mode.hash(&mut hasher);
+    crate::utils::fonts::font_revision().hash(&mut hasher);
     hasher.finish()
 }
 
@@ -1678,6 +1685,7 @@ fn inline_layout_context(ui: &Ui) -> InlineLayoutContext {
         available_width_bits: ui.available_width().to_bits(),
         body_font_size_bits: body_font_size(ui).to_bits(),
         monospace_font_size_bits: monospace_font_size(ui).to_bits(),
+        font_revision: crate::utils::fonts::font_revision(),
         text_color: visuals.text_color().to_array(),
         strong_text_color: visuals.strong_text_color().to_array(),
         hyperlink_color: visuals.hyperlink_color.to_array(),
@@ -1947,6 +1955,7 @@ mod tests {
             available_width_bits: 800.0_f32.to_bits(),
             body_font_size_bits: 14.0_f32.to_bits(),
             monospace_font_size_bits: 14.0_f32.to_bits(),
+            font_revision: 0,
             text_color: [220, 220, 220, 255],
             strong_text_color: [255, 255, 255, 255],
             hyperlink_color: [90, 170, 255, 255],

@@ -191,6 +191,8 @@ impl Database {
                 sidebar_width   REAL NOT NULL DEFAULT 200.0,
                 tool_hotkeys    TEXT NOT NULL DEFAULT '1234567',
                 auto_start      BOOLEAN NOT NULL DEFAULT 0,
+                ui_font         TEXT,
+                code_font       TEXT,
                 updated_at      DATETIME DEFAULT CURRENT_TIMESTAMP
             );",
         )?;
@@ -236,6 +238,10 @@ impl Database {
             log::info!("app_settings 表已迁移：添加 auto_start 列");
         }
 
+        // 迁移：全局字体选择（NULL 表示使用内置默认字体，字体名在应用时重新解析路径）
+        self.ensure_column("app_settings", "ui_font", "ui_font TEXT")?;
+        self.ensure_column("app_settings", "code_font", "code_font TEXT")?;
+
         // 常用文件编辑器 - 自定义目录表
         self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS file_editor_directories (
@@ -278,7 +284,43 @@ impl Database {
             log::info!("数据库已迁移到 v3（常用文件编辑器表）");
         }
 
+        // 数据库迁移：全局字体选择列（v4）
+        if db_version < 4 {
+            self.conn
+                .pragma_update(None, "user_version", 4)
+                .context("更新数据库版本号失败")?;
+            log::info!("数据库已迁移到 v4（全局字体选择）");
+        }
+
         log::info!("数据库表初始化完成");
+        Ok(())
+    }
+
+    /// 确保指定表存在某列，不存在时按 `definition` 添加
+    ///
+    /// 用于新增设置项的增量迁移：老数据库补列、新数据库在 `CREATE TABLE` 里已带该列。
+    fn ensure_column(&self, table: &str, column: &str, definition: &str) -> Result<()> {
+        let exists = self
+            .conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .with_context(|| format!("查询 {table} 表结构失败"))?
+            .query_map([], |row| {
+                let col_name: String = row.get(1)?;
+                Ok(col_name)
+            })
+            .with_context(|| format!("读取 {table} 列信息失败"))?
+            .filter_map(|r| r.ok())
+            .any(|col| col == column);
+
+        if exists {
+            return Ok(());
+        }
+
+        self.conn
+            .execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {definition}"))
+            .with_context(|| format!("添加 {column} 列失败"))?;
+        log::info!("{table} 表已迁移：添加 {column} 列");
+
         Ok(())
     }
 

@@ -2,11 +2,24 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
-use egui::{text::LayoutJob, Color32, RichText};
+use egui::{Color32, RichText, text::LayoutJob};
 
 use super::differ;
 use super::models::{DiffHunk, DiffResult, DiffType, SplitLine, TextSegment, ViewMode};
 use crate::utils::highlight::SyntaxHighlighter;
+
+/// 行号列宽度：字符数 × 等宽数字的实际步进，并保证不小于 `min_width`
+///
+/// 不用"字号 × 0.6"估算：不同等宽字体的步进差异明显，估算偏小会把行号最高位裁掉。
+fn gutter_width_for_chars(ui: &egui::Ui, char_count: usize, font_size: f32, min_width: f32) -> f32 {
+    let font_id = egui::FontId::monospace(font_size);
+    let char_width = ('0'..='9')
+        .map(|digit| ui.fonts(|fonts| fonts.glyph_width(&font_id, digit)))
+        .fold(0.0_f32, f32::max);
+    let char_count = f32::from(u16::try_from(char_count).unwrap_or(u16::MAX));
+
+    (char_count * char_width).max(min_width)
+}
 
 const SUPPORTED_LANGUAGES: &[(&str, &str)] = &[
     ("自动检测", ""),
@@ -144,7 +157,7 @@ impl DiffViewerUi {
         let max_lines = left_lines.max(right_lines);
         let line_num_digits = format!("{}", max_lines).len().max(3);
         let gutter_char_count = line_num_digits + 3;
-        let gutter_width = gutter_char_count as f32 * font_size * 0.6;
+        let gutter_width = gutter_width_for_chars(ui, gutter_char_count, font_size, 0.0);
         let mono_font_id = egui::FontId::monospace(font_size);
         let raw_line_height = ui.fonts(|f| f.row_height(&mono_font_id));
         let pixels_per_point = ui.pixels_per_point();
@@ -449,7 +462,7 @@ impl DiffViewerUi {
                 .max()
                 .unwrap_or(1);
             let num_digits = format!("{}", max_left_num.max(max_right_num)).len().max(3);
-            let gutter_w = ((num_digits + 3) as f32 * font_size * 0.6).max(40.0);
+            let gutter_w = gutter_width_for_chars(ui, num_digits + 3, font_size, 40.0);
 
             const SPLIT_PANEL_HEADER_HEIGHT: f32 = 30.0;
             let available_size = ui.available_size_before_wrap();
@@ -1558,7 +1571,7 @@ impl DiffViewerUi {
                 .unwrap_or(1);
             let num_digits = format!("{}", max_left_num.max(max_right_num)).len().max(3);
             // 双行号 + 分隔符的宽度
-            let gutter_w = ((num_digits * 2 + 4) as f32 * font_size * 0.6).max(80.0);
+            let gutter_w = gutter_width_for_chars(ui, num_digits * 2 + 4, font_size, 80.0);
 
             let available_height = ui.available_height() - 10.0;
             let available_width = ui.available_width();
@@ -1983,6 +1996,8 @@ impl DiffViewerUi {
         syntax_name.hash(&mut hasher);
         is_dark_mode.hash(&mut hasher);
         font_size.to_bits().hash(&mut hasher);
+        // 全局字体版本：换字体后必须重新排版，否则沿用旧字体的字形与步进
+        crate::utils::fonts::font_revision().hash(&mut hasher);
         hasher.finish()
     }
 
@@ -2064,6 +2079,8 @@ impl DiffViewerUi {
         syntax_name.hash(&mut hasher);
         is_dark_mode.hash(&mut hasher);
         font_size.to_bits().hash(&mut hasher);
+        // 全局字体版本：换字体后必须重新排版
+        crate::utils::fonts::font_revision().hash(&mut hasher);
         for seg in segments {
             seg.text.hash(&mut hasher);
             seg.diff_type.hash(&mut hasher);

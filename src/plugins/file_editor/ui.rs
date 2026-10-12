@@ -369,6 +369,8 @@ struct LayoutParams<'a> {
     font_size: f32,
     /// 是否暗色主题
     dark: bool,
+    /// 全局字体版本（换字体后必须重新排版）
+    font_revision: u64,
 }
 
 /// 编辑器语法高亮缓存
@@ -403,6 +405,8 @@ struct LayoutParamsOwned {
     font_size: f32,
     /// 是否暗色主题
     dark: bool,
+    /// 全局字体版本
+    font_revision: u64,
 }
 
 impl LayoutParamsOwned {
@@ -411,6 +415,7 @@ impl LayoutParamsOwned {
         self.language.as_deref() == params.language
             && (self.font_size - params.font_size).abs() <= f32::EPSILON
             && self.dark == params.dark
+            && self.font_revision == params.font_revision
     }
 }
 
@@ -455,6 +460,7 @@ impl HighlightJobCache {
             language: params.language.map(str::to_string),
             font_size: params.font_size,
             dark: params.dark,
+            font_revision: params.font_revision,
         });
         #[cfg(test)]
         {
@@ -1306,6 +1312,8 @@ impl FileEditorUi {
                     );
 
                     let language_ref = language.as_deref();
+                    // 全局字体版本：换字体后高亮缓存必须失效（否则沿用旧字体的排版）
+                    let font_revision = crate::utils::fonts::font_revision();
                     let mut layouter =
                         |ui: &Ui, text: &str, _wrap_width: f32| -> Arc<egui::Galley> {
                             let job = cache.job(
@@ -1315,6 +1323,7 @@ impl FileEditorUi {
                                     language: language_ref,
                                     font_size,
                                     dark,
+                                    font_revision,
                                 },
                             );
 
@@ -1358,6 +1367,7 @@ impl FileEditorUi {
                                 language: language_ref,
                                 font_size,
                                 dark,
+                                font_revision,
                             },
                         );
                         let galley = ui.fonts(|fonts| fonts.layout_job(job));
@@ -1400,6 +1410,7 @@ impl FileEditorUi {
                                     language: language_ref,
                                     font_size,
                                     dark,
+                                    font_revision,
                                 },
                             );
                             let galley = ui.fonts(|fonts| fonts.layout_job(job));
@@ -2779,6 +2790,7 @@ mod tests {
             language,
             font_size: 14.0,
             dark: true,
+            font_revision: 0,
         };
         let long_text = "x".repeat(400);
 
@@ -2828,6 +2840,25 @@ mod tests {
             galley_width > 1000.0,
             "长行不应自动换行（否则不会出现横向滚动条），实际宽度 {galley_width}"
         );
+
+        // 全局字体版本变化（换字体）也必须重新高亮，否则沿用旧字体的排版结果
+        let revision_params = |revision: u64| LayoutParams {
+            language: Some("TOML"),
+            font_size: 14.0,
+            dark: true,
+            font_revision: revision,
+        };
+        let before = cache.highlights;
+        let _ = cache.job(&highlighter, &long_text, revision_params(1));
+        assert_eq!(
+            cache.highlights,
+            before + 1,
+            "字体版本变化后必须重新高亮（换字体要重新排版）"
+        );
+        let _ = cache.job(&highlighter, &long_text, revision_params(1));
+        assert_eq!(cache.highlights, before + 1, "字体版本不变时应命中缓存");
+        let _ = cache.job(&highlighter, &long_text, revision_params(2));
+        assert_eq!(cache.highlights, before + 2, "字体版本再次变化应重新高亮");
     }
 
     #[test]
