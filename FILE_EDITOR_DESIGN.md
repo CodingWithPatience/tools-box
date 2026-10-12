@@ -61,6 +61,8 @@
 - 标签栏中脏标签在文件名后显示圆点（`●`），未保存状态一眼可见。
 - 左列表条目右键菜单：打开、重命名显示名、从列表移除、在资源管理器中显示。
 - 列表底部状态栏显示打开数量与未保存数量；编辑区底部显示文件路径、磁盘修改时间、最近保存时间。
+- 编辑区左侧有固定宽度的**行号列**（宽度按实际行数位数自适应、颜色取主题弱化色、不带分隔符），
+  与文本滚动区并排 ⇒ 横向滚动长行时行号保持钉住；实现细节见 §8 技术要点 17。
 
 ### 2.2 添加 / 编辑文件条目弹窗
 
@@ -464,6 +466,41 @@ src/plugins/file_editor/
     选区仍会写入（编辑器一旦获得焦点即可直接编辑命中内容），可见性由自绘保证。
     底色必须用**非预乘** alpha 且保持低透明度：高亮叠在语法着色文字之上，底色太实会把正文压得看不清。
     多行命中的高亮为两端光标的包围盒（跨行时是整块区域），不做逐行拆分。
+17. **行号列（一期）**：编辑器左侧固定宽度行号列（`LineNumberGutter`），
+    做法与文本对比插件一致——行号列是文本滚动区的**兄弟节点**（`ui.horizontal_top` +
+    `ui.allocate_space([gutter_width, editor_height])`），因此横向滚动长行时行号保持钉住；
+    `TextEdit` 使用固定 `EDITOR_MARGIN = Margin::symmetric(4, 2)`（行号纵向对齐按它换算），
+    同一帧用 **`ScrollArea::show` 的返回值**驱动：`state.offset.y` 是本次绘制文本所用的偏移，
+    `inner_rect` 是文本视口（比滚动区外框准确——滚动条改成占位样式时外框会比视口高一截），
+    因此不再手拼 `Id` 读 `scroll_area::State`，也就没有"Id 对不上导致偏移恒为 0"的隐患；
+    行号只绘制可见行（`visible_line_range()`，上万行也只画可见部分）；
+    行高按 `pixels_per_point` 取整（`monospace_row_height()`，与 epaint 对每行 y 的取整一致），
+    且与 `desired_rows` 共用同一个值；行号列宽度用 `Fonts::glyph_width(&FontId::monospace(size), '0'..='9')`
+    **实测字符步进**（不用"字号 × 0.6"估算，估算偏小会裁掉最高位）；
+    宽度 = **左侧留白 + 位数 × 步进 + 右侧内缩** `LINE_NUMBER_INSET = 4.0`，
+    其中左侧留白取 `内缩 + item_spacing.x`——因为数字右对齐到「列右边界 − 内缩」后，
+    它与正文之间还有一条 `item_spacing`，左侧按同一数值留白，两侧看起来才一样宽（§12.13.4）；
+    位数按实际行数（`line_number_digits()`，不设最小值）、颜色取主题弱化色、**不带分隔符**。
+    行高有两个值，**用途不能混**：`TextEdit` 的 `desired_height = 行数 × row_height` 用的是
+    **原始（未取整）值**（`builder.rs:540`），行号列逐行绘制必须用**按像素取整值**
+    （epaint 把每行 y 对齐到整像素，`text_layout.rs:608/627-633`）。混用会让算出的行数偏多一行、
+    内容比视口高（实测：视口 825、原始行高 16.313 ⇒ 51 行占 831.9 > 825，出现多余滚动条）；
+    实现见 `monospace_row_heights()`（同时返回两个值）。
+    行数用 `split('\n')` 统计（结尾换行之后的空行同样可以放光标，`lines()` 会漏掉它）。
+    **行数换算还必须扣除 `TextEdit` 的上下内边距**（`editor_content_height()`）：控件外高是
+    `max(文本高, 行数 × 行高) + 内边距`，直接按视口高度整除会让控件高出内边距之和
+    （`Margin::symmetric(4, 2)` ⇒ 4px）。
+    方向约定与 egui 自身一致：egui 在宽度方向就是 `available_width - margin.sum().x`
+    （`builder.rs:512`），本项目只在高度方向补扣 `top + bottom`，宽度方向无需处理。
+    边界说明：视口高度小于 `MIN_EDITOR_ROWS × 行高`（6 行）时最小行数下限会让内容仍然溢出，
+    这是有意取舍——窗口太矮本来就该出现滚动条。
+    **前提**：编辑器关闭了自动换行 ⇒ 文本行与排版行一一对应；若将来加入软折行，
+    行号必须改为按 `galley.rows` 把视觉行映射回文本行。
+    另一个已知前提是**等宽字体覆盖**：epaint 的行距取该行所有字形 `line_height` 的最大值
+    （`text_layout.rs:605-606`），若某行含等宽字体缺字的字符（CJK / Emoji 走回退字体），
+    该行行距会大于 `取整(等宽行高)` ⇒ 行号列从该行之后错位、内容也会略高于 `行数 × 行高`。
+    当前配置下日常文本未出现该情况，若将来支持含 CJK 的大文件编辑，需要改为按 `galley.rows` 计算行位。
+    当前行高亮与"点击行号选中整行"留待二期。
 
 ---
 
@@ -971,3 +1008,129 @@ cargo build                # 无新增告警
 cargo build --release      # 仅 api_tester 既有 7 项告警
 cargo clippy --all-targets # file_editor 相关 0 条告警
 ```
+
+### 12.13 行号列（一期，2026-10-12）
+
+需求与已确认的设计点：编辑器左侧显示行号；**不带 `│` 分隔符**；宽度**按实际位数**（不设最小值）；
+**当前行高亮放到二期**；与查找序号无冲突（两套绘制互不干扰）。
+
+实现（复用文本对比插件已跑通的做法，见 §8 技术要点 17）：
+与文本滚动区并排的行号列（横向滚动时钉住）、固定 `EDITOR_MARGIN`、同一帧读回滚动偏移、
+等行高只画可见行、行高按像素密度取整、行号用主题弱化色、行数按 `split('\n')` 统计。
+
+测试（新增 5 项）：`counts_lines_including_trailing_empty_line`、
+`line_number_digits_use_actual_count`、`gutter_width_grows_with_digits`、
+`visible_line_range_only_covers_visible_rows`（含 NaN / 零行高 / 零高度 / 滚过末尾等边界）、
+`renders_line_numbers_for_open_tab`（渲染一帧后断言图元里确实画出了 `1`/`2`/`3`/`4` 号行号，且正文仍在）。
+
+验证：
+
+```text
+cargo test                 # 295 通过 / 1 忽略（file_editor 56 项）
+cargo build                # 无新增告警
+cargo build --release      # 仅 api_tester 既有 7 项告警
+cargo clippy --all-targets # file_editor 相关 0 条告警
+```
+
+遗留（二期）：当前行高亮、点击行号选中整行、相对行号；以及"未来若加入软折行需改按 `galley.rows` 映射"。
+
+#### 12.13.1 审查反馈修复（同轮）
+
+code review 结论为"可提交，无阻塞"，其中重要项与若干建议已在同轮落实：
+
+1. **重要项：补"行号与文本对齐"的位置断言**。原用例只断言图元里出现行号文本，不断言坐标，
+   三类真实缺陷会静默通过（滚动偏移没用上、内边距不一致、行高未取整导致逐行漂移）。
+   现断言：行号 `1` 与正文首行 y 相差 ≤1px、行号 x 在正文左侧、相邻行号间距完全一致。
+   **反证检查**：把行号顶部偏移故意改成 `6.0` 后该用例立刻失败
+   （`行号与正文首行必须对齐：行号 y=95, 正文 y=91`），确认断言不是空断言。
+2. **改用 `ScrollArea::show` 的返回值**驱动行号（`state.offset.y` + `inner_rect`），
+   删掉手拼 `Id` 读 `scroll_area::State` 与"用滚动区外框高度"的隐含前提——
+   一旦滚动条改成占位样式（`solid()/thin()`），外框会比文本视口高一截、在滚动条区域多画一条行号。
+3. 横向布局改为显式 `ui.horizontal_top`（原来靠子项恰好等高才等价于顶对齐）。
+4. 行号列宽度改用 `Fonts::glyph_width` 实测字符步进（原 0.6 估算偏小会裁掉最高位）。
+5. `LINE_NUMBER_GAP` 改名 `LINE_NUMBER_RIGHT_INSET = 4.0`（原注释说"间隙 8px"却只用了一半）
+   ——该常量后续又改名为 `LINE_NUMBER_INSET`（左右各留一份），见 §12.13.3。
+6. 浮点上限常量由整数上限派生（`MAX_REASONABLE_LINES as f32`），避免两个常量失配。
+7. 行高只算一次，供行号列与 `desired_rows` 共用（原来分别用了取整/未取整两个值）。
+
+未采纳：行数每帧全文扫描（2 MB 只读预览约 1ms/帧）暂未缓存，列为本插件后续可选优化。
+
+验证：
+
+```text
+cargo test                 # 295 通过 / 1 忽略（file_editor 56 项；新增能力补齐在既有用例内）
+cargo build                # 无新增告警
+cargo clippy --all-targets # file_editor 相关 0 条告警
+```
+
+#### 12.13.2 修复内容高度多出内边距导致的常驻滚动条（2026-10-12）
+
+界面实测反馈：**内容明显没占满时，编辑区右侧仍常驻一条纵向滚动条**。
+
+原因：`editor_rows()` 按视口高度整除得到行数，而 `TextEdit` 的控件外高是
+`max(文本高, 行数 × 行高) + 内边距`（`egui-0.31.1/src/widgets/text_edit/builder.rs:540-543`），
+于是控件每帧都比视口高出一个内边距之和（`EDITOR_MARGIN = Margin::symmetric(4, 2)` ⇒ 4px），
+滚动区据此判定"内容超高"，滚动条因此常驻（文本很短时滑块几乎占满轨道）。
+该问题与行号无关且早于行号改动存在（`Margin::symmetric(4, 2)` 本就是 egui 的默认内边距），
+只是行号列上线后被一并观察到。
+
+修复分两步（实测确认第二步才是决定性的）：
+
+1. **扣除上下内边距**：新增 `editor_content_height(viewport_height, margin)`，行数换算改用
+   扣除上下内边距后的高度；
+2. **行数换算改用 `TextEdit` 内部的原始行高**：实测日志（1920×1080@100%，编辑器视口 825）：
+
+   ```text
+   [编辑器] editor_height=825.0 inner_available=825.0 row_height=16.000 rows=51
+            content=1495.4x835.9 viewport=1495.4x825.0 行数=25
+   ```
+
+   内容高 835.9 − 4(内边距) = 831.9 = **51 × 16.313**——即 `TextEdit` 的
+   `desired_height = 行数 × row_height` 用的是**未取整**的 16.313，而项目里按像素取整成 16.0 算行数，
+   于是 51 行实际占 831.9 > 825，滚动条常驻。现改为 `monospace_row_heights()` 同时返回两个值，
+   行数换算取**两者的较大者**（`TextEdit` 的 desired_height 用原始值、实际排版行距是取整值，
+   两者都要受控），行号列逐行绘制固定用取整值。这也解释了"默认高度没事、最大化后出现"：
+   只有视口高度落在 `行数 × 取整行高 < 视口 < 行数 × 原始行高` 这个窗口时才会溢出。
+   反向窗口（原始行高小数 ≥ 0.5，取整值更大）同样被"取较大者"覆盖。
+
+测试（新增 2 项）：`editor_content_height_reserves_text_edit_margin`（正常值、恰好等于内边距、
+小于内边距、`NaN`、负值归零）、`editor_rows_with_margin_never_overflows_viewport`
+（回归断言：`行数 × 行高 + 内边距 ≤ 视口高度`，含用户机器的真实参数 `视口 825 / 行高 16.313`
+与行高整数倍视口 `561 = 17 × 33`，后者可捕获"忘记扣除内边距"的回退）。
+
+验证：
+
+```text
+cargo test                 # 297 通过 / 1 忽略（file_editor 58 项）
+cargo build                # 无新增告警
+cargo clippy --all-targets # file_editor 相关 0 条告警
+```
+
+已部署（`C:\Program Files\Tools-box\tools-box.exe`），**最大化的目视确认待用户反馈**；
+底部留白可接受：用户参数下行数 50 ⇒ 内容 819.65 vs 视口 825，余量不足一行。
+
+#### 12.13.3 行号列左侧补留白（2026-10-12）
+
+界面反馈（滚动条问题解决后）：行号数字**紧贴左侧分割线**，左侧没有留白。
+
+修复：`LINE_NUMBER_RIGHT_INSET` 改为 `LINE_NUMBER_INSET = 4.0` 并在**列宽左右各用一份**
+（`gutter_width = 内缩 × 2 + 位数 × 字符步进`），数字仍右对齐到「列右边界 − 内缩」，
+左侧因此获得与右侧相同的 4px 留白。测试断言同步更新为"一位数字时宽度 = 步进 + 左右各一份内缩"。
+
+验证：`cargo test` 297 通过 / 1 忽略（file_editor 58 项）、`cargo clippy --all-targets`
+file_editor 相关 0 条告警、`cargo build` 无新增告警。
+
+#### 12.13.4 行号列左侧留白改为与"数字到正文的间距"等宽（2026-10-12）
+
+界面反馈（§12.13.3 之后）：左侧留白看起来仍比右侧窄——数字与分割线的距离明显小于数字到正文的距离。
+
+原因：§12.13.3 只让**数字自身**左右各留 4px，但数字右边缘与**正文**之间还有一条
+`item_spacing.x`（默认 8px），因此视觉上"右侧间距"是 `4 + 8 = 12px`，左侧只有 4px。
+
+修复：`line_number_gutter_width(digits, char_width, item_spacing_x)` 的左侧留白改为
+`LINE_NUMBER_INSET + item_spacing_x`（数字右对齐落点不变，仍为「列右边界 − 内缩」），
+使**左侧留白 == 数字到正文的视觉间距**，两侧看起来一样宽；`line_number_x()` 与
+`line_number_x_keeps_symmetric_inset` 测试同步按该口径断言。
+
+验证：`cargo test` 298 通过 / 1 忽略（file_editor 59 项）、`cargo clippy --all-targets`
+file_editor 相关 0 条告警、`cargo build` 无新增告警。

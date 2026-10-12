@@ -282,6 +282,16 @@ fn editor_rows(available_height: f32, row_height: f32) -> usize {
     rows
 }
 
+/// 编辑区可用的内容高度：从视口高度中扣除 `TextEdit` 的上下内边距
+///
+/// `TextEdit` 的控件外高 = `max(文本高, 行数 × 行高) + 内边距`
+/// （`egui-0.31.1/src/widgets/text_edit/builder.rs:540-543`）。
+/// 行数换算若直接用视口高度，控件就会比视口高出上下内边距之和（`Margin::symmetric(4, 2)` 时为 4px），
+/// 滚动区因此永远认为内容超高，常驻一条其实不需要的纵向滚动条。
+fn editor_content_height(viewport_height: f32, margin: egui::Margin) -> f32 {
+    (viewport_height - f32::from(margin.top) - f32::from(margin.bottom)).max(0.0)
+}
+
 /// 按最近打开时间排序（未打开过的排在最后，其次按路径排序保证稳定）
 fn sort_files_by_recent(files: &mut [models::FavoriteFile]) {
     files.sort_by(
@@ -459,6 +469,174 @@ impl HighlightJobCache {
 const EDITOR_ID_SALT: &str = "file_editor_editor";
 /// 查找输入框的固定标识（需要在渲染它之前判断焦点并消费 ↑/↓/回车）
 const FIND_QUERY_ID_SALT: &str = "file_editor_find_query";
+/// 编辑器滚动区的固定标识（行号列要读回它的滚动偏移）
+const EDITOR_SCROLL_ID_SALT: &str = "file_editor_scroll";
+/// 编辑器文本内边距（行号对齐依赖它，必须与 `TextEdit::margin` 设置的一致）
+const EDITOR_MARGIN: egui::Margin = egui::Margin::symmetric(4, 2);
+/// 行号列左右内缩（像素）：数字右对齐到「列右边界 − 内缩」，列宽左右各留一份，
+/// 避免数字紧贴左侧分割线
+const LINE_NUMBER_INSET: f32 = 4.0;
+/// 文本行数的合理上限（用于下标转浮点时的夹取，远大于任何真实文本）
+const MAX_REASONABLE_LINES: usize = 10_000_000;
+/// 与 [`MAX_REASONABLE_LINES`] 等值的浮点上限（由前者派生，避免两个常量失配）
+#[allow(clippy::cast_precision_loss)]
+const MAX_REASONABLE_LINES_F32: f32 = MAX_REASONABLE_LINES as f32;
+
+/// 文本行数
+///
+/// 结尾换行符之后的空行也算一行（编辑器里那一行同样可以放光标），
+/// 因此用 `split('\n')` 而不是 `lines()`。
+fn text_line_count(text: &str) -> usize {
+    text.split('\n').count().max(1)
+}
+
+/// 行号位数（按实际行数，不设最小值）
+fn line_number_digits(line_count: usize) -> usize {
+    line_count.max(1).to_string().len()
+}
+
+/// 行号列宽度：左侧留白 + 位数 × 等宽字符实际步进 + 右侧内缩
+///
+/// 字符步进用 `Fonts::glyph_width` 实测（见调用处的 `'0'..='9'` 取最大值），
+/// 不用"字号 × 0.6"估算：估算偏小会把右对齐数字的最高位裁掉。
+/// **左侧留白 = 右侧留白**：数字右对齐到「列右边界 − [`LINE_NUMBER_INSET`]」，
+/// 而列右边界与正文之间还有一条 `item_spacing`，所以数字到正文的视觉间距是
+/// `内缩 + item_spacing`；左侧按同一数值留白，两侧看起来才一样宽。
+fn line_number_gutter_width(digits: usize, char_width: f32, item_spacing_x: f32) -> f32 {
+    (LINE_NUMBER_INSET + item_spacing_x) + lines_to_f32(digits) * char_width + LINE_NUMBER_INSET
+}
+
+/// 行号数字的右对齐落点 x
+///
+/// 与 [`line_number_gutter_width`] 配合保证数字左右留白一致：
+/// 左侧余量 = 列宽 − 内缩 − 位数 × 步进 = 内缩 + `item_spacing`，
+/// 正好等于数字右边缘到正文的视觉间距。
+fn line_number_x(gutter_right: f32) -> f32 {
+    gutter_right - LINE_NUMBER_INSET
+}
+
+/// `usize → f32`：`f32` 没有 `From<usize>` 实现，先夹取再显式转换
+///
+/// 夹取上限（10^7）远小于 `f32` 可精确表示的 2^24，因此转换不会丢精度。
+fn lines_to_f32(value: usize) -> f32 {
+    #[allow(clippy::cast_precision_loss)]
+    let converted = value.min(MAX_REASONABLE_LINES) as f32;
+
+    converted
+}
+
+/// `f32 → usize`：先夹取到 `[0, MAX_REASONABLE_LINES]` 再转换
+///
+/// `usize` 没有 `TryFrom<f32>` 实现，这里是唯一的浮点转下标入口：
+/// 夹取之后不存在截断出异常值的可能，NaN / 负数 / 无穷都归零。
+fn float_to_line_index(value: f32) -> usize {
+    if !value.is_finite() || value <= 0.0 {
+        return 0;
+    }
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let index = value.min(MAX_REASONABLE_LINES_F32) as usize;
+
+    index
+}
+
+/// 可见行区间（按下标升序，左闭右开）
+///
+/// 等行高换算：只画可见行，行数上万时也不会每帧绘制全部行号。
+fn visible_line_range(
+    offset_y: f32,
+    height: f32,
+    row_height: f32,
+    line_count: usize,
+) -> std::ops::Range<usize> {
+    if line_count == 0 || row_height <= 0.0 || height <= 0.0 || !offset_y.is_finite() {
+        return 0..0;
+    }
+
+    let first = float_to_line_index((offset_y / row_height).floor());
+    let visible = float_to_line_index((height / row_height).ceil()) + 1;
+    let start = first.min(line_count);
+    let end = start.saturating_add(visible).min(line_count);
+
+    start..end
+}
+
+/// 等宽行高：返回 `(TextEdit 内部使用的原始值, 按像素取整值)`
+///
+/// 两个值都必需，混用会让内容比视口高出一条滚动条（用户实测：视口 825、原始行高 16.313）：
+/// - `TextEdit` 的 `desired_height = 行数 × row_height` 用的是**原始值**
+///   （`egui-0.31.1/src/widgets/text_edit/builder.rs:540`，不做像素取整）；
+/// - epaint 排版时把每行 y 对齐到整像素（`text_layout.rs:608/627-633`），
+///   行号列逐行绘制必须用**取整值**才能与文本行严格对齐。
+fn monospace_row_heights(ui: &Ui, font_size: f32) -> (f32, f32) {
+    let raw = ui.fonts(|fonts| fonts.row_height(&egui::FontId::monospace(font_size)));
+    let pixels_per_point = ui.pixels_per_point();
+    let rounded = (raw * pixels_per_point).round() / pixels_per_point;
+
+    (raw, rounded)
+}
+
+/// 行号列的绘制参数
+struct LineNumberGutter {
+    /// 列左上角
+    origin: egui::Pos2,
+    /// 列宽
+    width: f32,
+    /// 列高（编辑器可见高度）
+    height: f32,
+    /// 文本总行数
+    line_count: usize,
+    /// 行号位数（右对齐宽度）
+    digits: usize,
+    /// 等宽行高
+    row_height: f32,
+    /// 编辑器滚动偏移
+    offset_y: f32,
+    /// 等宽字号
+    font_size: f32,
+    /// 文本内边距顶部（与 `TextEdit::margin` 一致）
+    margin_top: f32,
+    /// 行号颜色
+    color: egui::Color32,
+}
+
+impl LineNumberGutter {
+    /// 绘制行号（只画可见行）
+    ///
+    /// 等行高的前提是编辑器关闭了自动换行；若将来加入软折行，
+    /// 需要改为按 `galley.rows` 把视觉行映射回文本行。
+    fn paint(&self, ui: &Ui) {
+        if self.line_count == 0 || self.row_height <= 0.0 || self.width <= 0.0 || self.height <= 0.0
+        {
+            return;
+        }
+
+        let rect = egui::Rect::from_min_size(self.origin, egui::vec2(self.width, self.height));
+        let painter = ui.painter().with_clip_rect(rect);
+        let font_id = egui::FontId::monospace(self.font_size);
+        let range =
+            visible_line_range(self.offset_y, self.height, self.row_height, self.line_count);
+        let first_visible = range.start;
+
+        // 首行顶部相对可视区域顶端的偏移（滚动不足一行时保留小数偏移）
+        let first_line_offset = self.offset_y - lines_to_f32(first_visible) * self.row_height;
+        let mut y = self.origin.y + self.margin_top - first_line_offset;
+
+        for index in range {
+            if y > rect.bottom() {
+                break;
+            }
+            painter.text(
+                egui::pos2(line_number_x(rect.right()), y),
+                egui::Align2::RIGHT_TOP,
+                format!("{:>width$}", index + 1, width = self.digits),
+                font_id.clone(),
+                self.color,
+            );
+            y += self.row_height;
+        }
+    }
+}
 /// 查找命中高亮的底色
 ///
 /// 用低透明度底色 + 描边：高亮叠在语法着色文字之上，
@@ -1060,128 +1238,119 @@ impl FileEditorUi {
             .unwrap_or(14.0);
         let dark = ui.visuals().dark_mode;
         let highlighter = self.highlighter.get_or_insert_with(SyntaxHighlighter::new);
+
+        // 行号列的尺寸与样式（按实际位数、主题弱化色）；
+        // 行数必须在可变借用 self.tabs 之前算出来
+        let line_count = text_line_count(&self.tabs[active].text);
+        let digits = line_number_digits(line_count);
+        let monospace_font = egui::FontId::monospace(font_size);
+        // 等宽字符实际步进：取 0-9 的最大值，换字体时也不会裁掉最高位
+        let char_width = ('0'..='9')
+            .map(|digit| ui.fonts(|fonts| fonts.glyph_width(&monospace_font, digit)))
+            .fold(0.0_f32, f32::max);
+        // 行号列宽度：左侧留白与"数字右侧到正文的间距"取同一数值（内缩 + item_spacing）
+        let gutter_width =
+            line_number_gutter_width(digits, char_width, ui.spacing().item_spacing.x);
+        // 行高有两个用途：行号列绘制用取整后的值（与 epaint 逐行对齐），
+        // 行数换算用 TextEdit 内部的原始值（它的 desired_height 不做像素取整）
+        let (raw_row_height, row_height) = monospace_row_heights(ui, font_size);
+        let editor_height = ui.available_height();
+        let gutter_color = ui.visuals().weak_text_color();
+
         let cache = &mut self.highlight_job_cache;
         let tabs = &mut self.tabs;
         let find = &mut self.find;
         let editor_id_slot = &mut self.editor_id;
 
-        egui::ScrollArea::both()
-            .id_salt("file_editor_scroll")
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                let tab = &mut tabs[active];
-                let editable = !tab.read_only;
+        ui.horizontal_top(|ui| {
+            // 行号列与滚动区并排（兄弟节点）：横向滚动文本时行号保持钉住
+            let gutter_origin = ui.cursor().left_top();
+            ui.allocate_space(egui::vec2(gutter_width, editor_height));
 
-                // 应用查找结果：设置编辑器选区（egui 的选区按字符下标计算）
-                //
-                // 这里算出的 Id 必须与下面 `TextEdit::id(...)` 使用的一致：
-                // `TextEdit::id_salt(s)` 内部把 salt 包成 `Id::new(s)` 再经 `Ui::make_persistent_id`，
-                // 直接传 `&str` 会得到另一个 Id，于是选区被写到别的状态槽位（编辑器读不到）。
-                let editor_id = ui.make_persistent_id(egui::Id::new(EDITOR_ID_SALT));
-                *editor_id_slot = Some(editor_id);
-                if let Some((start, end)) = find.pending_selection.take() {
-                    let mut text_state = egui::text_edit::TextEditState::load(ui.ctx(), editor_id)
-                        .unwrap_or_default();
-                    text_state
-                        .cursor
-                        .set_char_range(Some(egui::text::CCursorRange::two(
-                            egui::text::CCursor::new(start),
-                            egui::text::CCursor::new(end),
-                        )));
-                    text_state.store(ui.ctx(), editor_id);
-                    find.pending_scroll = true;
-                }
+            let scroll_output = egui::ScrollArea::both()
+                .id_salt(EDITOR_SCROLL_ID_SALT)
+                .max_height(editor_height)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    let tab = &mut tabs[active];
+                    let editable = !tab.read_only;
 
-                // 编辑区占满可见高度：行数按可用高度换算，长文本继续往下滚
-                let row_height =
-                    ui.fonts(|fonts| fonts.row_height(&egui::FontId::monospace(font_size)));
-                let desired_rows = editor_rows(ui.available_height(), row_height);
-
-                let language_ref = language.as_deref();
-                let mut layouter = |ui: &Ui, text: &str, _wrap_width: f32| -> Arc<egui::Galley> {
-                    let job = cache.job(
-                        highlighter,
-                        text,
-                        LayoutParams {
-                            language: language_ref,
-                            font_size,
-                            dark,
-                        },
-                    );
-
-                    // 布局交给 egui / epaint：它会按缩放比例与字形图集的变化自行失效重建
-                    ui.fonts(|fonts| fonts.layout_job(job))
-                };
-
-                let response = ui.add(
-                    egui::TextEdit::multiline(&mut tab.text)
-                        .code_editor()
-                        // 不折行时宽度由内容决定，这里让控件至少铺满可见宽度（点击空白处也能定位光标）
-                        .desired_width(f32::INFINITY)
-                        .desired_rows(desired_rows)
-                        .interactive(editable)
-                        .id(editor_id)
-                        .layouter(&mut layouter),
-                );
-
-                if response.changed() {
-                    tab.dirty = true;
-                    // 文本被编辑后原命中位置与命中列表都失效，需重新查找
-                    find.current = None;
-                    find.pending_selection = None;
-                    find.invalidate_matches();
-                }
-
-                // 命中高亮：egui 只在编辑器获得焦点时绘制自身选区（builder.rs:723-730），
-                // 而查找时焦点在查找框里，所以这里在文本之上自绘：
-                // 先铺所有匹配（淡色），再把当前选中项画在最上层（浓色 + 描边）。
-                // 关栏后不绘制；绘制前按当前文本校正命中列表（命中缓存时为 O(1)）。
-                if find.visible {
-                    find.ensure_matches(&tab.text);
-                }
-                if find.visible && !find.matches.is_empty() {
-                    let job = cache.job(
-                        highlighter,
-                        &tab.text,
-                        LayoutParams {
-                            language: language_ref,
-                            font_size,
-                            dark,
-                        },
-                    );
-                    let galley = ui.fonts(|fonts| fonts.layout_job(job));
-                    let origin = response.rect.min.to_vec2();
-                    let painter = ui.painter();
-                    let other_fill = find_other_fill(dark);
-
-                    for found in find.matches.iter().take(MAX_HIGHLIGHTED_MATCHES) {
-                        if Some(*found) == find.current {
-                            continue; // 当前项用浓色单独画，避免两层底色叠加
-                        }
-                        let rect = match_rect(&galley, *found).translate(origin);
-                        if ui.is_rect_visible(rect) {
-                            painter.rect_filled(rect, egui::CornerRadius::same(2), other_fill);
-                        }
+                    // 应用查找结果：设置编辑器选区（egui 的选区按字符下标计算）
+                    //
+                    // 这里算出的 Id 必须与下面 `TextEdit::id(...)` 使用的一致：
+                    // `TextEdit::id_salt(s)` 内部把 salt 包成 `Id::new(s)` 再经 `Ui::make_persistent_id`，
+                    // 直接传 `&str` 会得到另一个 Id，于是选区被写到别的状态槽位（编辑器读不到）。
+                    let editor_id = ui.make_persistent_id(egui::Id::new(EDITOR_ID_SALT));
+                    *editor_id_slot = Some(editor_id);
+                    if let Some((start, end)) = find.pending_selection.take() {
+                        let mut text_state =
+                            egui::text_edit::TextEditState::load(ui.ctx(), editor_id)
+                                .unwrap_or_default();
+                        text_state
+                            .cursor
+                            .set_char_range(Some(egui::text::CCursorRange::two(
+                                egui::text::CCursor::new(start),
+                                egui::text::CCursor::new(end),
+                            )));
+                        text_state.store(ui.ctx(), editor_id);
+                        find.pending_scroll = true;
                     }
 
-                    if let Some(current) = find.current {
-                        let rect = match_rect(&galley, current).translate(origin);
-                        if ui.is_rect_visible(rect) {
-                            painter.rect(
-                                rect.expand(1.0),
-                                egui::CornerRadius::same(2),
-                                find_highlight_fill(dark),
-                                egui::Stroke::new(1.0, find_highlight_stroke(dark)),
-                                egui::StrokeKind::Inside,
+                    // 编辑区占满可见高度：行数按可用高度换算，长文本继续往下滚
+                    // 行高取"原始值与取整值的较大者"：TextEdit 的 desired_height 用原始值，
+                    // 而实际排版行距是取整值，两者都要受控，否则任一项偏大都会让内容超出视口
+                    // （实测视口 825、原始行高 16.313：按取整值 16 算得 51 行，实际占 831.9 > 825）
+                    let desired_rows = editor_rows(
+                        editor_content_height(ui.available_height(), EDITOR_MARGIN),
+                        raw_row_height.max(row_height),
+                    );
+
+                    let language_ref = language.as_deref();
+                    let mut layouter =
+                        |ui: &Ui, text: &str, _wrap_width: f32| -> Arc<egui::Galley> {
+                            let job = cache.job(
+                                highlighter,
+                                text,
+                                LayoutParams {
+                                    language: language_ref,
+                                    font_size,
+                                    dark,
+                                },
                             );
-                        }
-                    }
-                }
 
-                // egui 只在"本帧交互改变选区"时自动滚动，外部设置的查找选区需要手动滚动到可见区域
-                if find.pending_scroll {
-                    find.pending_scroll = false;
-                    if let Some(range) = find.current {
+                            // 布局交给 egui / epaint：它会按缩放比例与字形图集的变化自行失效重建
+                            ui.fonts(|fonts| fonts.layout_job(job))
+                        };
+
+                    let response = ui.add(
+                        egui::TextEdit::multiline(&mut tab.text)
+                            .code_editor()
+                            // 不折行时宽度由内容决定，这里让控件至少铺满可见宽度（点击空白处也能定位光标）
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(desired_rows)
+                            // 固定内边距：行号列的纵向对齐按它换算
+                            .margin(EDITOR_MARGIN)
+                            .interactive(editable)
+                            .id(editor_id)
+                            .layouter(&mut layouter),
+                    );
+
+                    if response.changed() {
+                        tab.dirty = true;
+                        // 文本被编辑后原命中位置与命中列表都失效，需重新查找
+                        find.current = None;
+                        find.pending_selection = None;
+                        find.invalidate_matches();
+                    }
+
+                    // 命中高亮：egui 只在编辑器获得焦点时绘制自身选区（builder.rs:723-730），
+                    // 而查找时焦点在查找框里，所以这里在文本之上自绘：
+                    // 先铺所有匹配（淡色），再把当前选中项画在最上层（浓色 + 描边）。
+                    // 关栏后不绘制；绘制前按当前文本校正命中列表（命中缓存时为 O(1)）。
+                    if find.visible {
+                        find.ensure_matches(&tab.text);
+                    }
+                    if find.visible && !find.matches.is_empty() {
                         let job = cache.job(
                             highlighter,
                             &tab.text,
@@ -1192,12 +1361,79 @@ impl FileEditorUi {
                             },
                         );
                         let galley = ui.fonts(|fonts| fonts.layout_job(job));
-                        let cursor_rect =
-                            galley.pos_from_ccursor(egui::text::CCursor::new(range.end_char));
-                        ui.scroll_to_rect(cursor_rect.translate(response.rect.min.to_vec2()), None);
+                        let origin = response.rect.min.to_vec2();
+                        let painter = ui.painter();
+                        let other_fill = find_other_fill(dark);
+
+                        for found in find.matches.iter().take(MAX_HIGHLIGHTED_MATCHES) {
+                            if Some(*found) == find.current {
+                                continue; // 当前项用浓色单独画，避免两层底色叠加
+                            }
+                            let rect = match_rect(&galley, *found).translate(origin);
+                            if ui.is_rect_visible(rect) {
+                                painter.rect_filled(rect, egui::CornerRadius::same(2), other_fill);
+                            }
+                        }
+
+                        if let Some(current) = find.current {
+                            let rect = match_rect(&galley, current).translate(origin);
+                            if ui.is_rect_visible(rect) {
+                                painter.rect(
+                                    rect.expand(1.0),
+                                    egui::CornerRadius::same(2),
+                                    find_highlight_fill(dark),
+                                    egui::Stroke::new(1.0, find_highlight_stroke(dark)),
+                                    egui::StrokeKind::Inside,
+                                );
+                            }
+                        }
                     }
-                }
-            });
+
+                    // egui 只在"本帧交互改变选区"时自动滚动，外部设置的查找选区需要手动滚动到可见区域
+                    if find.pending_scroll {
+                        find.pending_scroll = false;
+                        if let Some(range) = find.current {
+                            let job = cache.job(
+                                highlighter,
+                                &tab.text,
+                                LayoutParams {
+                                    language: language_ref,
+                                    font_size,
+                                    dark,
+                                },
+                            );
+                            let galley = ui.fonts(|fonts| fonts.layout_job(job));
+                            let cursor_rect =
+                                galley.pos_from_ccursor(egui::text::CCursor::new(range.end_char));
+                            ui.scroll_to_rect(
+                                cursor_rect.translate(response.rect.min.to_vec2()),
+                                None,
+                            );
+                        }
+                    }
+                });
+
+            // 同一帧用滚动区的返回值驱动行号：
+            // `state.offset` 就是本次绘制文本所用的偏移，`inner_rect` 是文本视口
+            // （比滚动区外框更准确——滚动条一旦改为占位，外框会比视口高出滚动条宽度）。
+            // 行号只画可见行：行数上万时也不会每帧绘制全部行号。
+            let viewport = scroll_output.inner_rect;
+            let offset_y = scroll_output.state.offset.y;
+
+            LineNumberGutter {
+                origin: egui::pos2(gutter_origin.x, viewport.top()),
+                width: gutter_width,
+                height: viewport.height(),
+                line_count,
+                digits,
+                row_height,
+                offset_y,
+                font_size,
+                margin_top: f32::from(EDITOR_MARGIN.top),
+                color: gutter_color,
+            }
+            .paint(ui);
+        });
     }
 
     /// 渲染查找 / 替换栏
@@ -2352,10 +2588,12 @@ impl FileEditorUi {
 #[cfg(test)]
 mod tests {
     use super::{
-        EDITOR_DESIRED_ROWS, FileEditorUi, HIGHLIGHT_MAX_BYTES, HighlightJobCache, LayoutParams,
-        active_after_close, apply_saved_as, editor_rows, find_all, find_highlight_fill,
-        find_other_fill, line_number, replace_all, should_capture_find_shortcut,
-        should_highlight_text, should_persist_width, sort_files_by_recent,
+        EDITOR_DESIRED_ROWS, EDITOR_MARGIN, FileEditorUi, HIGHLIGHT_MAX_BYTES, HighlightJobCache,
+        LINE_NUMBER_INSET, LayoutParams, active_after_close, apply_saved_as, editor_content_height,
+        editor_rows, find_all, find_highlight_fill, find_other_fill, line_number,
+        line_number_digits, line_number_gutter_width, line_number_x, lines_to_f32, replace_all,
+        should_capture_find_shortcut, should_highlight_text, should_persist_width,
+        sort_files_by_recent, text_line_count, visible_line_range,
     };
     use crate::plugins::file_editor::store;
     use crate::utils::highlight::SyntaxHighlighter;
@@ -2854,6 +3092,186 @@ mod tests {
     }
 
     #[test]
+    fn counts_lines_including_trailing_empty_line() {
+        assert_eq!(text_line_count(""), 1, "空文件也按 1 行算");
+        assert_eq!(text_line_count("a"), 1);
+        assert_eq!(text_line_count("a\n"), 2, "结尾换行后的空行也能放光标");
+        assert_eq!(text_line_count("a\nb"), 2);
+        assert_eq!(text_line_count("a\n\n"), 3);
+    }
+
+    #[test]
+    fn line_number_digits_use_actual_count() {
+        assert_eq!(line_number_digits(1), 1);
+        assert_eq!(line_number_digits(9), 1);
+        assert_eq!(line_number_digits(10), 2);
+        assert_eq!(line_number_digits(999), 3);
+        assert_eq!(line_number_digits(1000), 4, "按实际位数，不设最小位数");
+    }
+
+    #[test]
+    fn line_number_x_keeps_symmetric_inset() {
+        let char_width = 8.0;
+        let item_spacing_x = 8.0;
+        let digits = 3;
+        let gutter_right = 100.0;
+        let width = line_number_gutter_width(digits, char_width, item_spacing_x);
+        let x = line_number_x(gutter_right);
+
+        assert!(
+            (x - (gutter_right - LINE_NUMBER_INSET)).abs() < f32::EPSILON,
+            "数字右对齐到「列右边界 − 内缩」"
+        );
+
+        // 左侧留白（分割线 → 最宽行号左边缘）应等于数字右边缘到正文的视觉间距
+        // （列右边界 − 数字右边缘 = 内缩，再加列与正文之间的 item_spacing）
+        let number_left = x - lines_to_f32(digits) * char_width;
+        let column_left = gutter_right - width;
+        let left_blank = number_left - column_left;
+        let right_gap = (gutter_right - x) + item_spacing_x;
+        assert!(
+            (left_blank - right_gap).abs() < f32::EPSILON,
+            "左侧留白与右侧视觉间距应一致：左 {left_blank} 右 {right_gap}"
+        );
+    }
+
+    #[test]
+    fn gutter_width_grows_with_digits() {
+        // 等宽数字步进按 8.0 估算即可（真实值由 Fonts::glyph_width 提供）
+        let char_width = 8.0;
+        let item_spacing_x = 8.0;
+        let narrow = line_number_gutter_width(1, char_width, item_spacing_x);
+        let wide = line_number_gutter_width(4, char_width, item_spacing_x);
+
+        assert!(narrow > 0.0);
+        assert!(
+            (narrow - (char_width + LINE_NUMBER_INSET * 2.0 + item_spacing_x)).abs() < f32::EPSILON,
+            "一位数字时宽度 = 步进 + 右内缩 + 左侧留白（内缩 + item_spacing）"
+        );
+        assert!(wide > narrow, "位数越多行号列越宽");
+        assert!(
+            (line_number_gutter_width(0, char_width, item_spacing_x)
+                - (LINE_NUMBER_INSET * 2.0 + item_spacing_x))
+                .abs()
+                < f32::EPSILON,
+            "没有位数时只保留左右留白（正常调用会先经 line_number_digits 保证至少 1 位）"
+        );
+    }
+
+    #[test]
+    fn visible_line_range_only_covers_visible_rows() {
+        // 行高 20、可视高 100：ceil(100/20)=5，再 +1 作为余量
+        assert_eq!(visible_line_range(0.0, 100.0, 20.0, 100), 0..6);
+        assert_eq!(visible_line_range(200.0, 100.0, 20.0, 100), 10..16);
+        assert_eq!(
+            visible_line_range(200.0, 100.0, 20.0, 12),
+            10..12,
+            "末尾夹取"
+        );
+        assert_eq!(
+            visible_line_range(9_999.0, 100.0, 20.0, 12),
+            12..12,
+            "滚过末尾时为空区间"
+        );
+        assert_eq!(visible_line_range(0.0, 100.0, 0.0, 12), 0..0, "行高非法");
+        assert_eq!(
+            visible_line_range(f32::NAN, 100.0, 20.0, 12),
+            0..0,
+            "偏移非法"
+        );
+        assert_eq!(visible_line_range(0.0, 0.0, 20.0, 12), 0..0, "高度非法");
+        assert_eq!(visible_line_range(0.0, 100.0, 20.0, 0), 0..0, "无行");
+    }
+
+    #[test]
+    fn renders_line_numbers_for_open_tab() {
+        let conn = test_connection();
+        let ctx = egui::Context::default();
+        let path = temp_file("line-numbers.txt");
+        fs::write(&path, "alpha\nbeta\ngamma\n").expect("写入测试文件失败");
+
+        let mut state = FileEditorUi::new();
+        state.init(&conn);
+        let id = store::insert_file(&conn, None, &path.display().to_string(), None)
+            .expect("新增条目失败");
+        state.reload_data(&conn);
+        state.open_file(&conn, id, &path, "line-numbers.txt".to_string());
+
+        let output = render_frame_output(&ctx, &mut state, &conn);
+        let texts: Vec<String> = output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) => Some(text.galley.text().to_string()),
+                _ => None,
+            })
+            .collect();
+
+        // 4 行（结尾换行后还有一空行）→ 行号 1..=4 都应被绘制
+        for expected in ["1", "2", "3", "4"] {
+            assert!(
+                texts.iter().any(|text| text == expected),
+                "应绘制行号 {expected}，实际绘制文本={texts:?}"
+            );
+        }
+        assert!(
+            texts.iter().any(|text| text.contains("alpha")),
+            "正文仍应绘制"
+        );
+
+        // 位置断言：行号必须与正文行严格对齐、且位于正文左侧
+        // （内边距不一致、行高未取整、滚动偏移没用上都会在这里暴露）
+        let pos_of_exact = |wanted: &str| -> Option<egui::Pos2> {
+            output
+                .shapes
+                .iter()
+                .find_map(|clipped| match &clipped.shape {
+                    egui::Shape::Text(text) if text.galley.text() == wanted => Some(text.pos),
+                    _ => None,
+                })
+        };
+        let pos_containing = |needle: &str| -> Option<egui::Pos2> {
+            output
+                .shapes
+                .iter()
+                .find_map(|clipped| match &clipped.shape {
+                    egui::Shape::Text(text) if text.galley.text().contains(needle) => {
+                        Some(text.pos)
+                    }
+                    _ => None,
+                })
+        };
+
+        let first_number = pos_of_exact("1").expect("应绘制行号 1");
+        let body = pos_containing("alpha").expect("应绘制正文首行");
+        assert!(
+            (first_number.y - body.y).abs() <= 1.0,
+            "行号与正文首行必须对齐：行号 y={}, 正文 y={}",
+            first_number.y,
+            body.y
+        );
+        assert!(
+            first_number.x < body.x,
+            "行号应在正文左侧：行号 x={}, 正文 x={}",
+            first_number.x,
+            body.x
+        );
+
+        // 相邻行号间距必须一致且等于行高（取整不一致会导致逐行漂移）
+        let second_number = pos_of_exact("2").expect("应绘制行号 2");
+        let third_number = pos_of_exact("3").expect("应绘制行号 3");
+        let first_gap = second_number.y - first_number.y;
+        let second_gap = third_number.y - second_number.y;
+        assert!(first_gap > 0.0, "行号应自上而下排列");
+        assert!(
+            (first_gap - second_gap).abs() < f32::EPSILON,
+            "相邻行号间距必须一致：{first_gap} vs {second_gap}"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
     fn find_all_recurses_char_indices_across_many_matches() {
         // 中等规模输入：断言递推得到的字符下标正确（不依赖时间断言，避免 CI 抖动）
         let text = "key = 1\n".repeat(2_000);
@@ -3181,6 +3599,76 @@ mod tests {
         );
         assert_eq!(tab.display_name, "old.toml");
         assert!(!tab.dirty);
+    }
+
+    #[test]
+    fn editor_content_height_reserves_text_edit_margin() {
+        // Margin::symmetric(4, 2)：上下各 2px
+        assert_eq!(
+            editor_content_height(400.0, EDITOR_MARGIN),
+            396.0,
+            "应扣除上下内边距"
+        );
+        assert_eq!(
+            editor_content_height(4.0, EDITOR_MARGIN),
+            0.0,
+            "高度恰好等于内边距时归零"
+        );
+        assert_eq!(
+            editor_content_height(1.0, EDITOR_MARGIN),
+            0.0,
+            "高度小于内边距时夹取为 0（editor_rows 会回落到默认行数 24）"
+        );
+        assert_eq!(
+            editor_content_height(f32::NAN, EDITOR_MARGIN),
+            0.0,
+            "NaN 归零"
+        );
+        assert_eq!(
+            editor_content_height(-100.0, EDITOR_MARGIN),
+            0.0,
+            "负高度归零"
+        );
+    }
+
+    #[test]
+    fn editor_rows_with_margin_never_overflows_viewport() {
+        // 回归：控件外高 = 行数 × 行高 + 上下内边距，必须不超过视口高度，
+        // 否则滚动区会常驻一条多余的纵向滚动条（用户实测反馈）。
+        //
+        // 真实参数（用户机器：1920×1080@100%，视口 825、等宽原始行高 16.313）：
+        //   仅用原始行高 → 50 行 ⇒ max(galley 50×16, desired 50×16.313) + 4 = 819.65 ≤ 825 ✓
+        //   误用取整行高 16.0 → 51 行 ⇒ desired 51×16.313 + 4 = 835.9 > 825 ✗（用户实测到的那条滚动条）
+        // 还要覆盖"取整值 > 原始值"的反向窗口（raw 小数 ≥ 0.5 时）：
+        //   raw = 16.6 → 取整 17.0；视口 561、可用 557
+        //   只用原始值算 → 33 行 ⇒ galley 33×17 = 561 ⇒ 内容 565 > 561 ✗
+        //   取两者较大值 → 32 行 ⇒ max(32×17, 32×16.6) + 4 = 548 ≤ 561 ✓
+        let margin_height = f32::from(EDITOR_MARGIN.top) + f32::from(EDITOR_MARGIN.bottom);
+
+        for (viewport, raw_row_height) in [
+            (825.0, 16.313_f32),
+            (561.0, 16.6),
+            (561.0, 17.0),
+            (553.0, 17.0),
+            (400.0, 17.0),
+        ] {
+            // 测试按 ppp = 1 计，取整值即四舍五入到整数
+            let rounded_row_height = raw_row_height.round();
+            let rows = editor_rows(
+                editor_content_height(viewport, EDITOR_MARGIN),
+                raw_row_height.max(rounded_row_height),
+            );
+            let rows_f = lines_to_f32(rows);
+            // 内容高 = max(实际排版高, TextEdit 的 desired_height) + 上下内边距
+            let content_height =
+                (rows_f * rounded_row_height).max(rows_f * raw_row_height) + margin_height;
+
+            assert!(
+                content_height <= viewport,
+                "视口 {viewport}、原始行高 {raw_row_height}（取整 {rounded_row_height}）：\
+                 内容高 {content_height} 不应超过视口（行数 {rows}）"
+            );
+        }
     }
 
     #[test]
